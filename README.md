@@ -15,7 +15,7 @@
     ·
     <a href="https://pengsongyou.github.io/">Songyou Peng</a>
   </p>
-  <h3 align="center"><a href="https://arxiv.org/abs/2410.24207">Paper</a> | <a href="https://noposplat.github.io/">Project Page</a> | <a href="#" style="color: grey; pointer-events: none; text-decoration: none;">Online Demo (Coming Soon)</a> </h3>
+  <h3 align="center"><a href="https://arxiv.org/abs/2410.24207">Paper</a> | <a href="https://noposplat.github.io/">Project Page</a> </h3>
   <div align="center"></div>
 </p>
 <p align="center">
