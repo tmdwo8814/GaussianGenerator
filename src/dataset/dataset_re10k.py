@@ -20,6 +20,7 @@ from .shims.crop_shim import apply_crop_shim
 from .types import Stage
 from .view_sampler import ViewSampler
 from ..misc.cam_utils import camera_normalization
+import zlib
 
 
 @dataclass
@@ -33,6 +34,8 @@ class DatasetRE10kCfg(DatasetCfgCommon):
     augment: bool
     relative_pose: bool
     skip_bad_shape: bool
+
+    
 
 
 @dataclass
@@ -60,6 +63,9 @@ class DatasetRE10k(IterableDataset):
     near: float = 0.1
     far: float = 100.0
 
+    global_rank: int = 0
+    world_size: int = 1
+
     def __init__(
         self,
         cfg: DatasetRE10kCfg,
@@ -83,6 +89,13 @@ class DatasetRE10k(IterableDataset):
         if self.cfg.overfit_to_scene is not None:
             chunk_path = self.index[self.cfg.overfit_to_scene]
             self.chunks = [chunk_path] * len(self.chunks)
+
+    def _scene_belongs_to_this_rank(self, scene: str) -> bool:
+        if self.stage != "test" or self.world_size <= 1:
+            return True
+
+        owner_rank = zlib.crc32(scene.encode("utf-8")) % self.world_size
+        return owner_rank == self.global_rank
 
     def shuffle(self, lst: list) -> list:
         indices = torch.randperm(len(lst))
@@ -116,8 +129,12 @@ class DatasetRE10k(IterableDataset):
                 chunk = self.shuffle(chunk)
 
             for example in chunk:
-                extrinsics, intrinsics = self.convert_poses(example["cameras"])
                 scene = example["key"]
+
+                if not self._scene_belongs_to_this_rank(scene):
+                    continue
+
+                extrinsics, intrinsics = self.convert_poses(example["cameras"])
 
                 try:
                     context_indices, target_indices, overlap = self.view_sampler.sample(
@@ -125,6 +142,7 @@ class DatasetRE10k(IterableDataset):
                         extrinsics,
                         intrinsics,
                     )
+
                 except ValueError:
                     # Skip because the example doesn't have enough frames.
                     continue

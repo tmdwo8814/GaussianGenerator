@@ -4,10 +4,10 @@ defaults:
   - /dataset@_group_.re10k: re10k
   - override /model/encoder: noposplat
   - override /model/encoder/backbone: croco
-  - override /loss: [mse, lpips]
+  - override /loss: [mse, lpips, alpha_stats]
 
 wandb:
-  name: re10k
+  name: alpha2_L1.0screen -lists
   tags: [re10k, 256x256]
 
 model:
@@ -23,11 +23,11 @@ model:
 dataset:
   re10k:
     view_sampler:
-      warm_up_steps: 9375
+      warm_up_steps: 75000
 
 optimizer:
-  lr: 2e-4
-  warm_up_steps: 125
+  lr: 1e-4
+  warm_up_steps: 2000
   backbone_lr_multiplier: 0.1
 
 data_loader:
@@ -35,8 +35,20 @@ data_loader:
     batch_size: 16
 
 trainer:
-  max_steps: 18751
-  val_check_interval: 500
+  # max_steps: 18751
+  max_steps: 80001
+  # val_check_interval: 1500
+  val_check_interval: null
+
+  eval_every_n_steps: 20000
+
+  auto_eval: true
+  auto_eval_index_path: assets/evaluation_index_re10k.json
+  auto_eval_save_image: false  # 이미지 저장 여부
+  auto_eval_save_video: false  # 비디오 저장 여부
+  auto_eval_save_compare: false  # 비교 이미지 저장 여부
 
 checkpointing:
-  every_n_train_steps: 9375
+  # every_n_train_steps: 9375
+  every_n_train_steps: 20000
+  save_top_k: -1

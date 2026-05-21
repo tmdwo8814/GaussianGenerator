@@ -7,7 +7,7 @@ wandb:
   project: noposplat
   entity: scene-representation-group
   name: placeholder
-  mode: disabled
+  mode: online
 
 mode: train
 
@@ -57,7 +57,7 @@ test:
   rot_opt_lr:  0.005
   trans_opt_lr:  0.005
   compute_scores: true
-  save_image: true
+  save_image: false
   save_video: false
   save_compare: false
 
@@ -65,7 +65,8 @@ seed: 111123
 
 trainer:
   max_steps: -1
-  val_check_interval: 250
+  # val_check_interval: 250
+  val_check_interval: null
   gradient_clip_val: 0.5
   num_nodes: 1
 

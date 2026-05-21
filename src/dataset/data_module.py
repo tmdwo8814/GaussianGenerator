@@ -13,6 +13,8 @@ from . import DatasetCfgWrapper, get_dataset
 from .types import DataShim, Stage
 from .validation_wrapper import ValidationWrapper
 
+import torch.distributed as dist
+
 
 def get_data_shim(encoder: nn.Module) -> DataShim:
     """Get functions that modify the batch. It's sometimes necessary to modify batches
@@ -87,6 +89,16 @@ class DataModule(LightningDataModule):
         generator.manual_seed(loader_cfg.seed + self.global_rank)
         return generator
 
+    def _world_size(self) -> int:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_world_size()
+        return 1
+
+    def _attach_test_distributed_state(self, dataset: Dataset) -> Dataset:
+        setattr(dataset, "global_rank", self.global_rank)
+        setattr(dataset, "world_size", self._world_size())
+        return dataset
+
     def train_dataloader(self):
         datasets = get_dataset(self.dataset_cfgs, "train", self.step_tracker)
         data_loaders = []
@@ -127,6 +139,7 @@ class DataModule(LightningDataModule):
         data_loaders = []
         for dataset in datasets:
             dataset = self.dataset_shim(dataset, "test")
+            dataset = self._attach_test_distributed_state(dataset)
             data_loaders.append(
                 DataLoader(
                     dataset,
@@ -138,3 +151,20 @@ class DataModule(LightningDataModule):
                 )
             )
         return data_loaders if len(data_loaders) > 1 else data_loaders[0]
+
+    # def test_dataloader(self):
+    #     datasets = get_dataset(self.dataset_cfgs, "test", self.step_tracker)
+    #     data_loaders = []
+    #     for dataset in datasets:
+    #         dataset = self.dataset_shim(dataset, "test")
+    #         data_loaders.append(
+    #             DataLoader(
+    #                 dataset,
+    #                 self.data_loader_cfg.test.batch_size,
+    #                 num_workers=self.data_loader_cfg.test.num_workers,
+    #                 generator=self.get_generator(self.data_loader_cfg.test),
+    #                 worker_init_fn=worker_init_fn,
+    #                 persistent_workers=self.get_persistent(self.data_loader_cfg.test),
+    #             )
+    #         )
+    #     return data_loaders if len(data_loaders) > 1 else data_loaders[0]

@@ -34,6 +34,14 @@ class TrainerCfg:
     gradient_clip_val: int | float | None
     num_nodes: int = 1
 
+    # auto evaluation during training
+    auto_eval: bool = False
+    eval_every_n_steps: int | None = None
+    auto_eval_index_path: Optional[Path] = None
+    auto_eval_save_image: bool = False
+    auto_eval_save_video: bool = False
+    auto_eval_save_compare: bool = False
+
 
 @dataclass
 class RootCfg:

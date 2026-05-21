@@ -1,3 +1,8 @@
+# Results
+outputs/
+pretrained_weights/
+datasets/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
