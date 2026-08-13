@@ -75,7 +75,6 @@ with install_import_hook(("src",), ("beartype", "beartype")):
     from src.global_cfg import set_cfg
     from src.loss import get_losses
     from src.misc.cam_utils import update_pose
-    from src.misc.image_io import save_image
     from src.misc.step_tracker import StepTracker
     from src.misc.utils import get_overlap_tag
     from src.misc.wandb_tools import update_checkpoint_path
@@ -83,8 +82,6 @@ with install_import_hook(("src",), ("beartype", "beartype")):
     from src.model.decoder import get_decoder
     from src.model.encoder import get_encoder
     from src.model.types import Gaussians
-    from src.visualization.annotation import add_label
-    from src.visualization.layout import hcat, vcat
 
 
 @dataclass(frozen=True)
@@ -674,24 +671,51 @@ def _save_example(
     factors: Iterable[float],
     error_gain: float,
 ) -> None:
-    rows = []
-    for k in factors:
+    factors = list(factors)
+    figure, axes = plt.subplots(
+        len(factors),
+        6,
+        figsize=(18, 3.2 * len(factors)),
+        squeeze=False,
+    )
+    for row_index, k in enumerate(factors):
         scale = variants[("scale_only", float(k))]
         compensated = variants[("compensated", float(k))]
         scale_error = (scale - original).abs().mean(dim=0, keepdim=True).repeat(3, 1, 1)
         comp_error = (
             (compensated - original).abs().mean(dim=0, keepdim=True).repeat(3, 1, 1)
         )
-        row = hcat(
-            add_label(gt, "GT"),
-            add_label(original, "Original"),
-            add_label(scale, f"Scale-only k={k:g}"),
-            add_label(compensated, f"Compensated k={k:g}"),
-            add_label((scale_error * error_gain).clamp(0, 1), f"Scale error x{error_gain:g}"),
-            add_label((comp_error * error_gain).clamp(0, 1), f"Comp. error x{error_gain:g}"),
+        images = (
+            gt,
+            original,
+            scale,
+            compensated,
+            (scale_error * error_gain).clamp(0, 1),
+            (comp_error * error_gain).clamp(0, 1),
         )
-        rows.append(row)
-    save_image(vcat(*rows), output_path / f"{scene}_target_{target_index:06d}.png")
+        titles = (
+            "GT",
+            "Original",
+            f"Scale-only k={k:g}",
+            f"Compensated k={k:g}",
+            f"Scale error x{error_gain:g}",
+            f"Comp. error x{error_gain:g}",
+        )
+        for axis, image, title in zip(axes[row_index], images, titles):
+            array = image.detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+            axis.imshow(array)
+            axis.set_title(title)
+            axis.axis("off")
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    figure.suptitle(f"Scene {scene} | target {target_index}")
+    figure.tight_layout()
+    figure.savefig(
+        output_path / f"{scene}_target_{target_index:06d}.png",
+        dpi=150,
+        bbox_inches="tight",
+    )
+    plt.close(figure)
 
 
 def _plot_results(output_dir: Path, summary: list[dict[str, Any]]) -> None:
