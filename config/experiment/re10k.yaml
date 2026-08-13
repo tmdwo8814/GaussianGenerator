@@ -7,7 +7,7 @@ defaults:
   - override /loss: [mse, lpips, alpha_stats]
 
 wandb:
-  name: alpha2_L1.0screen -lists
+  name: baseline_analysis
   tags: [re10k, 256x256]
 
 model:
