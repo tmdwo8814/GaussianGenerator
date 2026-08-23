@@ -96,6 +96,13 @@ PHASES = (
     "finalize",
 )
 
+# cuSOLVER's batched symmetric eigensolver can reject a very large batch at
+# buffer-size query time.  A RE10K scene commonly contains 2 * 256 * 256 =
+# 131,072 covariance matrices, so never submit the whole scene as one batch.
+# 16,384 stays comfortably below the problematic batch-size range while keeping the
+# number of CUDA launches small.
+EIGH_CHUNK_SIZE = 16_384
+
 
 @dataclass(frozen=True)
 class CompensationAnalysisCfg:
@@ -287,6 +294,55 @@ def _axis_angle_matrix(angle: torch.Tensor) -> torch.Tensor:
     return cosine * identity + (1.0 - cosine) * outer + sine * skew
 
 
+def _eigh_3x3_chunked(
+    matrices: torch.Tensor,
+    chunk_size: int = EIGH_CHUNK_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eigendecompose a large collection of symmetric 3x3 matrices safely.
+
+    NoPoSplat emits one Gaussian per context pixel.  Flattening all context
+    views can therefore produce more matrices than cuSOLVER's batched ``eigh``
+    accepts in a single call.  Chunking changes only how the same operation is
+    scheduled; it does not change the shape perturbation definition.
+    """
+    if matrices.shape[-2:] != (3, 3):
+        raise ValueError(
+            "Expected covariance matrices with trailing shape (3, 3), got "
+            f"{tuple(matrices.shape)}"
+        )
+    if chunk_size <= 0:
+        raise ValueError(f"eigh chunk_size must be positive, got {chunk_size}")
+
+    leading_shape = matrices.shape[:-2]
+    flat = matrices.reshape(-1, 3, 3)
+    eigenvalue_chunks: list[torch.Tensor] = []
+    eigenvector_chunks: list[torch.Tensor] = []
+    for start in range(0, flat.shape[0], chunk_size):
+        stop = min(start + chunk_size, flat.shape[0])
+        chunk = flat[start:stop]
+        finite = torch.isfinite(chunk)
+        if not bool(finite.all().item()):
+            nonfinite = int((~finite).sum().item())
+            raise ValueError(
+                "Gaussian covariance contains non-finite values before the "
+                f"shape perturbation: {nonfinite} values in matrices "
+                f"[{start}:{stop}] out of {flat.shape[0]}"
+            )
+
+        # The adapter constructs symmetric covariances.  Re-symmetrizing here
+        # removes only floating-point round-off and satisfies eigh's contract.
+        chunk = 0.5 * (chunk + chunk.transpose(-1, -2))
+        values, vectors = torch.linalg.eigh(chunk)
+        eigenvalue_chunks.append(values)
+        eigenvector_chunks.append(vectors)
+
+    eigenvalues = torch.cat(eigenvalue_chunks, dim=0).reshape(*leading_shape, 3)
+    eigenvectors = torch.cat(eigenvector_chunks, dim=0).reshape(
+        *leading_shape, 3, 3
+    )
+    return eigenvalues, eigenvectors
+
+
 @torch.no_grad()
 def _apply_mode(
     gaussians: Gaussians,
@@ -310,7 +366,7 @@ def _apply_mode(
     if mode == "size":
         covariances = covariances * torch.exp(2.0 * delta)[..., None, None]
     elif mode == "shape":
-        eigenvalues, eigenvectors = torch.linalg.eigh(covariances)
+        eigenvalues, eigenvectors = _eigh_3x3_chunked(covariances)
         pattern = torch.tensor(
             [-1.0, 0.0, 1.0],
             dtype=eigenvalues.dtype,
