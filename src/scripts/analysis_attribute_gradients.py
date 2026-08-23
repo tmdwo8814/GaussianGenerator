@@ -78,8 +78,12 @@ class GradientAnalysisCfg:
     )
     bootstrap_samples: int = 2000
     seed: int = 20260823
-    identity_relative_tolerance: float = 1e-4
-    identity_absolute_tolerance: float = 1e-9
+    # The raw-channel partition is typically exact to ~1e-8 relative error.
+    # At the shared feature, however, six separately launched CUDA convolution
+    # VJPs are summed and compared with one fused VJP.  FP32 reduction order can
+    # produce ~1e-4 relative differences even when linearity holds exactly.
+    identity_relative_tolerance: float = 1e-3
+    identity_absolute_tolerance: float = 1e-12
     minimum_gradient_norm: float = 1e-20
     allow_checkpoint_mismatch: bool = False
     resume: bool = True
