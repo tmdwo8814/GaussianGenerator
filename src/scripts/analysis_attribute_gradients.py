@@ -79,6 +79,7 @@ class GradientAnalysisCfg:
     bootstrap_samples: int = 2000
     seed: int = 20260823
     identity_relative_tolerance: float = 1e-4
+    identity_absolute_tolerance: float = 1e-9
     minimum_gradient_norm: float = 1e-20
     allow_checkpoint_mismatch: bool = False
     resume: bool = True
@@ -100,6 +101,10 @@ def _gradient_cfg(cfg_dict: DictConfig) -> GradientAnalysisCfg:
     if cfg.identity_relative_tolerance <= 0:
         raise ValueError(
             "gradient_analysis.identity_relative_tolerance must be positive"
+        )
+    if cfg.identity_absolute_tolerance <= 0:
+        raise ValueError(
+            "gradient_analysis.identity_absolute_tolerance must be positive"
         )
     if cfg.minimum_gradient_norm <= 0:
         raise ValueError("gradient_analysis.minimum_gradient_norm must be positive")
@@ -542,10 +547,18 @@ def _analyze_scene(
                     )
 
             full_l2, full_rms = _norm_metrics(full_feature_gradient)
-            identity_pass = (
+            # A relative error is ill-conditioned when the complete gradient is
+            # extremely small.  Accept each identity through either a relative or
+            # an absolute numerical tolerance; both values remain recorded.
+            raw_identity_pass = (
                 raw_identity_relative <= cfg.identity_relative_tolerance
-                and feature_identity_relative <= cfg.identity_relative_tolerance
+                or raw_identity_max_abs <= cfg.identity_absolute_tolerance
             )
+            feature_identity_pass = (
+                feature_identity_relative <= cfg.identity_relative_tolerance
+                or feature_identity_max_abs <= cfg.identity_absolute_tolerance
+            )
+            identity_pass = raw_identity_pass and feature_identity_pass
             scene = _scene_name(batch)
             overlap = float(batch["context"]["overlap"].reshape(-1)[0].item())
             scene_row = {
@@ -564,14 +577,19 @@ def _analyze_scene(
                 "raw_identity_max_abs": raw_identity_max_abs,
                 "feature_identity_relative_error": feature_identity_relative,
                 "feature_identity_max_abs": feature_identity_max_abs,
+                "raw_identity_pass": raw_identity_pass,
+                "feature_identity_pass": feature_identity_pass,
                 "identity_pass": identity_pass,
             }
             if not identity_pass:
                 raise AssertionError(
                     "Attribute gradient partition identity failed: "
-                    f"raw={raw_identity_relative:.3e}, "
-                    f"feature={feature_identity_relative:.3e}, tolerance="
-                    f"{cfg.identity_relative_tolerance:.3e}"
+                    f"raw_rel={raw_identity_relative:.3e}, "
+                    f"raw_abs={raw_identity_max_abs:.3e}, "
+                    f"feature_rel={feature_identity_relative:.3e}, "
+                    f"feature_abs={feature_identity_max_abs:.3e}, tolerance="
+                    f"{cfg.identity_relative_tolerance:.3e} relative or "
+                    f"{cfg.identity_absolute_tolerance:.3e} absolute"
                 )
             return {
                 "scene": scene_row,
@@ -924,6 +942,12 @@ def main(cfg_dict: DictConfig) -> None:
     max_feature_identity = max(
         float(row["feature_identity_relative_error"]) for row in scene_rows
     )
+    max_raw_identity_abs = max(
+        float(row["raw_identity_max_abs"]) for row in scene_rows
+    )
+    max_feature_identity_abs = max(
+        float(row["feature_identity_max_abs"]) for row in scene_rows
+    )
     summary = {
         "processed_scenes": len(scene_rows),
         "overlap_counts": overlap_counts,
@@ -931,6 +955,8 @@ def main(cfg_dict: DictConfig) -> None:
         "all_identity_checks_pass": all(row["identity_pass"] for row in scene_rows),
         "max_raw_identity_relative_error": max_raw_identity,
         "max_feature_identity_relative_error": max_feature_identity,
+        "max_raw_identity_absolute_error": max_raw_identity_abs,
+        "max_feature_identity_absolute_error": max_feature_identity_abs,
         "encoder_trainable_parameters": sum(
             parameter.numel()
             for parameter in encoder.parameters()
