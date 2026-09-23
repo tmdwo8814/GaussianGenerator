@@ -4,6 +4,7 @@ from typing import Optional, Protocol, runtime_checkable, Any
 
 import moviepy.editor as mpy
 import torch
+import torch.distributed as dist
 import wandb
 from einops import pack, rearrange, repeat
 from jaxtyping import Float
@@ -129,6 +130,8 @@ class ModelWrapper(LightningModule):
 
         # This is used for testing.
         self.benchmarker = Benchmarker()
+        self._test_metric_names = ("psnr_ours", "ssim_ours", "lpips_ours")
+        self._test_overlap_tags = ("small", "medium", "large")
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -211,20 +214,102 @@ class ModelWrapper(LightningModule):
 
         return total_loss
 
+    def _eval_step(self) -> int:
+        return getattr(self, "_auto_eval_step", self.global_step)
+
+    def on_test_start(self) -> None:
+        # Each checkpoint must start with fresh metrics and timings.
+        self.benchmarker = Benchmarker()
+        self._test_metric_sums = {
+            k: torch.zeros((), device=self.device) for k in self._test_metric_names
+        }
+        self._test_metric_count = torch.zeros((), device=self.device)
+        self._test_overlap_sums = {
+            tag: {k: torch.zeros((), device=self.device) for k in self._test_metric_names}
+            for tag in self._test_overlap_tags
+        }
+        self._test_overlap_counts = {
+            tag: torch.zeros((), device=self.device) for tag in self._test_overlap_tags
+        }
+        if self.global_rank == 0 and isinstance(self.logger, WandbLogger):
+            # Accessing experiment initializes the run if the logger is still lazy.
+            run = self.logger.experiment
+            prefix = getattr(self, "_auto_eval_log_prefix", "test")
+            run.define_metric(f"{prefix}/ckpt_step")
+            run.define_metric(f"{prefix}/*", step_metric=f"{prefix}/ckpt_step")
+
+    def _update_test_metric_buffers(self, metrics, overlap_tag) -> None:
+        self._test_metric_count += 1
+        for k, value in metrics.items():
+            self._test_metric_sums[k] += value.detach()
+        if overlap_tag in self._test_overlap_sums:
+            self._test_overlap_counts[overlap_tag] += 1
+            for k, value in metrics.items():
+                self._test_overlap_sums[overlap_tag][k] += value.detach()
+
+    def _reduce_test_metric_buffers(self) -> None:
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        # Reduce sums and counts, since ranks can own different numbers of scenes.
+        dist.all_reduce(self._test_metric_count, op=dist.ReduceOp.SUM)
+        for k in self._test_metric_names:
+            dist.all_reduce(self._test_metric_sums[k], op=dist.ReduceOp.SUM)
+        for tag in self._test_overlap_tags:
+            dist.all_reduce(self._test_overlap_counts[tag], op=dist.ReduceOp.SUM)
+            for k in self._test_metric_names:
+                dist.all_reduce(self._test_overlap_sums[tag][k], op=dist.ReduceOp.SUM)
+
+    def _print_final_test_metrics(self, log_prefix="test", log_step=None) -> None:
+        if self.global_rank != 0 or not self.test_cfg.compute_scores:
+            return
+        if self._test_metric_count.item() == 0:
+            print(f"[{log_prefix}] No test metrics were accumulated.")
+            return
+
+        log_payload = {}
+
+        def summarize_group(tag, sums, count):
+            averages = {k: (sums[k] / count).item() for k in self._test_metric_names}
+            for k, value in averages.items():
+                metric = k.removesuffix("_ours")
+                log_payload[f"{log_prefix}/{tag}/{metric}"] = value
+            log_payload[f"{log_prefix}/{tag}/num_samples"] = int(count.item())
+            return [
+                tag,
+                f"{averages['psnr_ours']:.3f}",
+                f"{averages['ssim_ours']:.3f}",
+                f"{averages['lpips_ours']:.3f}",
+                int(count.item()),
+            ]
+
+        rows = [summarize_group("overall", self._test_metric_sums, self._test_metric_count)]
+        for tag in self._test_overlap_tags:
+            count = self._test_overlap_counts[tag]
+            if count.item() > 0:
+                rows.append(summarize_group(tag, self._test_overlap_sums[tag], count))
+        print(f"\n[{log_prefix} | Final Evaluation | global | all ranks]")
+        print(tabulate(rows, headers=["Group", "PSNR", "SSIM", "LPIPS", "Num Samples"]))
+
+        if wandb.run is not None:
+            log_payload[f"{log_prefix}/ckpt_step"] = (
+                self.global_step if log_step is None else log_step
+            )
+            wandb.log(log_payload)
+            for k, value in log_payload.items():
+                wandb.run.summary[k] = value
+
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
 
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
-        if batch_idx % 100 == 0:
+        if self.global_rank == 0 and batch_idx % 100 == 0:
             print(f"Test step {batch_idx:0>6}.")
 
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
-            gaussians = self.encoder(
-                batch["context"],
-                self.global_step,
-            )
+            with torch.no_grad():
+                gaussians = self.encoder(batch["context"], self._eval_step())
 
         # align the target pose
         if self.test_cfg.align_pose:
@@ -252,10 +337,7 @@ class ModelWrapper(LightningModule):
                 f"ssim_ours": compute_ssim(rgb_gt, rgb_pred).mean(),
                 f"psnr_ours": compute_psnr(rgb_gt, rgb_pred).mean(),
             }
-            methods = ['ours']
-
-            self.log_dict(all_metrics)
-            self.print_preview_metrics(all_metrics, methods, overlap_tag=overlap_tag)
+            self._update_test_metric_buffers(all_metrics, overlap_tag)
 
         # Save images.
         (scene,) = batch["scene"]
@@ -283,11 +365,6 @@ class ModelWrapper(LightningModule):
             save_image(comparison, path / f"{scene}.png")
 
     def test_step_align(self, batch, gaussians):
-        self.encoder.eval()
-        # freeze all parameters
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-
         b, v, _, h, w = batch["target"]["image"].shape
         with torch.set_grad_enabled(True):
             cam_rot_delta = nn.Parameter(torch.zeros([b, v, 3], requires_grad=True, device=self.device))
@@ -327,7 +404,7 @@ class ModelWrapper(LightningModule):
                     # Compute and log loss.
                     total_loss = 0
                     for loss_fn in self.losses:
-                        loss = loss_fn.forward(output, batch, gaussians, self.global_step)
+                        loss = loss_fn.forward(output, batch, gaussians, self._eval_step())
                         total_loss = total_loss + loss
 
                     total_loss.backward()
@@ -356,11 +433,19 @@ class ModelWrapper(LightningModule):
 
     def on_test_end(self) -> None:
         name = get_cfg()["wandb"]["name"]
-        self.benchmarker.dump(self.test_cfg.output_path / name / "benchmark.json")
-        self.benchmarker.dump_memory(
-            self.test_cfg.output_path / name / "peak_memory.json"
+        out_dir = self.test_cfg.output_path / name
+        self._reduce_test_metric_buffers()
+        self._print_final_test_metrics(
+            log_prefix=getattr(self, "_auto_eval_log_prefix", "test"),
+            log_step=getattr(self, "_auto_eval_step", None),
         )
-        self.benchmarker.summarize()
+        if self.trainer.world_size > 1:
+            self.benchmarker.dump(out_dir / f"benchmark_rank{self.global_rank}.json")
+            self.benchmarker.dump_memory(out_dir / f"peak_memory_rank{self.global_rank}.json")
+        else:
+            self.benchmarker.dump(out_dir / "benchmark.json")
+            self.benchmarker.dump_memory(out_dir / "peak_memory.json")
+            self.benchmarker.summarize()
 
     @rank_zero_only
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
