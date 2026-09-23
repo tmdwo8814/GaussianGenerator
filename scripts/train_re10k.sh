@@ -33,4 +33,4 @@ python --version
 nvidia-smi
 wandb status || true
 
-python -m "${TRAIN_MODULE:-src.main}" "+experiment=${EXPERIMENT:-re10k_moment}" wandb.mode=online "$@"
+python -m src.main "+experiment=${EXPERIMENT:-re10k_moment}" wandb.mode=online "$@"
