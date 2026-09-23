@@ -1,6 +1,7 @@
 """Cache weights/DINOv3 code and run the training matcher on one CUDA GPU.
 
-Defaults to the local RoMaV2 Toronto example pair, resized to 256px as in RE10K.
+Defaults to a generated texture matched with itself; no example files required.
+This checks execution only. Use real overlapping images to check match quality.
 Run once before DDP: python -m scripts.check_romav2
 Optional: --image-a a.png --image-b b.png
 """
@@ -15,6 +16,23 @@ import torch
 from src.model.auxiliary.roma_matching import RoMaMatcher, RoMaMatcherCfg
 
 
+def load_pair(paths):
+    if paths is None:
+        # A deterministic self-pair exercises inference without bundled assets.
+        # Synthetic input is not evidence of real-scene matching/pose quality.
+        generator = torch.Generator().manual_seed(0)
+        texture = torch.rand(1, 3, 64, 64, generator=generator)
+        texture = torch.nn.functional.interpolate(
+            texture, size=(256, 256), mode='bilinear', align_corners=False)
+        return texture.repeat(2, 1, 1, 1)
+    images = []
+    for path in paths:
+        with Image.open(path) as source:
+            rgb = ImageOps.exif_transpose(source).convert('RGB').resize((256, 256), Image.Resampling.BILINEAR)
+            images.append(torch.from_numpy(np.array(rgb)).permute(2, 0, 1).float() / 255)
+    return torch.stack(images)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', default='cuda:0')
@@ -27,15 +45,15 @@ def main():
     device = torch.device(args.device)
     if device.type != 'cuda' or not torch.cuda.is_available():
         parser.error('Run this check inside a CUDA GPU allocation')
-    assets = Path(__file__).resolve().parents[1] / 'RoMaV2/assets'
-    paths = [args.image_a, args.image_b] if args.image_a else [assets / 'toronto_A.jpg', assets / 'toronto_B.jpg']
-    images = []
-    for path in paths:
-        if not path.is_file():
-            parser.error(f'Missing image {path}; supply --image-a and --image-b')
-        with Image.open(path) as source:
-            rgb = ImageOps.exif_transpose(source).convert('RGB').resize((256, 256), Image.Resampling.BILINEAR)
-            images.append(torch.from_numpy(np.array(rgb)).permute(2, 0, 1).float() / 255)
+    synthetic = args.image_a is None
+    paths = None if synthetic else [args.image_a, args.image_b]
+    if paths is not None:
+        for path in paths:
+            if not path.is_file():
+                parser.error(f'Missing image {path}')
+    images = load_pair(paths)
+    print('Input: generated self-pair (execution check only)' if synthetic
+          else f'Input: {args.image_a}, {args.image_b}', flush=True)
 
     import torchvision
 
@@ -49,16 +67,18 @@ def main():
     try:
         # Reproduce the backbone's TF32 setting and exercise the production guard.
         torch.set_float32_matmul_precision('high')
-        matches = matcher.match(torch.stack(images).to(device))
+        matches = matcher.match(images.to(device))
         if torch.get_float32_matmul_precision() != 'high':
             raise RuntimeError('Matching changed the training matmul precision')
         torch.cuda.synchronize(device)
         count = len(matches.confidence)
-        if count == 0:
+        if count == 0 and not synthetic:
             raise RuntimeError('No reliable matches. Check input overlap and the RoMaV2 installation.')
-        print(f'PASS: {count} matches with confidence >= 0.5; precision restored.', flush=True)
+        if count == 0:
+            print('No reliable synthetic matches; correspondence sampling may have been skipped.', flush=True)
+        print(f'Execution completed: {count} matches with confidence >= 0.5; precision restored.', flush=True)
         print(f'Peak allocated CUDA memory: {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB')
-        print('Matching smoke check passed. RE10K pose acceptance and training backward still need a training run.')
+        print('RoMaV2 execution check completed. RE10K match/pose quality and training backward still need a training run.')
     finally:
         torch.set_float32_matmul_precision(previous)
         matcher.release()

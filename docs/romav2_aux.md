@@ -122,7 +122,7 @@ python -m pip install -r requirements-aux.txt
 
 # Run ON A GPU allocation, once before multi-GPU training:
 python -m scripts.check_romav2 --device cuda:0
-# Optional: replace the clone's Toronto demo pair with real overlapping images.
+# Optional: use real overlapping images instead of the generated self-pair.
 python -m scripts.check_romav2 --image-a /path/a.png --image-b /path/b.png
 ```
 
@@ -135,10 +135,13 @@ python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://down
 ```
 
 The check now performs actual matching and sampling through the training adapter,
-using `RoMaV2/assets/toronto_A.jpg` and `toronto_B.jpg` by default. It exercises the
-loaded CUDA correlation backend, checks TF32 restoration, reports reliable
-matches and peak torch memory, and downloads the model/cache on one process.
-A successful demo check does not establish RE10K pose acceptance or convergence.
+using a deterministic generated texture matched with itself by default; no
+bundled example images are required. It exercises the loaded CUDA correlation
+backend, checks TF32 restoration, reports reliable matches and peak torch memory,
+and downloads the model/cache on one process. Zero reliable synthetic matches
+do not fail this execution check (sampling may then have been skipped); explicit
+real image inputs still fail if no reliable matches are found. This check does
+not establish RE10K match quality, pose acceptance, or convergence.
 The baseline `opencv-python` dependency is also required by the auxiliary pose path.
 
 RoMaV2 initialization downloads its `romav2.0.1.pt` checkpoint and the pinned
@@ -180,7 +183,7 @@ on each server checkout; the new integration files are tracked by the parent rep
 ```bash
 # This branch's script now defaults to the auxiliary experiment:
 bash scripts/train_re10k.sh
-# First GPU run: prefetch/check in one process, then exercise auxiliary training.
+# First GPU run: prefetch/execution check in one process, then exercise auxiliary training.
 # No separate interactive GPU allocation is required.
 mkdir -p logs
 ROMA_PREFLIGHT=1 sbatch scripts/train_re10k.sh \
@@ -214,7 +217,7 @@ CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=re10k_moment_aux wandb.mod
 
 The short run must log `aux/valid_pairs > 0`, finite `aux/raw_loss`, and completed
 backward/optimizer steps on some batches; a run with every pair rejected has not
-validated auxiliary learning. The optional `ROMA_PREFLIGHT=1` performs the demo
+validated auxiliary learning. The optional `ROMA_PREFLIGHT=1` performs the execution
 check before the training process starts; the default remains direct training.
 The script inherits the active conda environment and `TORCH_HOME`.
 
