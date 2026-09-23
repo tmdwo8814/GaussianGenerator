@@ -180,3 +180,5 @@ cython_debug/
 table.tex
 /baselines
 /test/*
+# External matcher: install the pinned local clone; do not embed its Git repo.
+/RoMaV2/

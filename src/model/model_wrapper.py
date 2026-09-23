@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable, Any
 
@@ -43,6 +43,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .auxiliary.observed_color_loss import ObservedColorAuxCfg, ObservedColorAuxiliary
 
 
 @dataclass
@@ -72,6 +73,7 @@ class TrainCfg:
     print_log_every_n_steps: int
     distiller: str
     distill_max_steps: int
+    auxiliary: ObservedColorAuxCfg = field(default_factory=ObservedColorAuxCfg)
 
 
 @runtime_checkable
@@ -121,6 +123,11 @@ class ModelWrapper(LightningModule):
         self.decoder = decoder
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
+        self.auxiliary = None
+        if train_cfg.auxiliary.enabled:
+            if getattr(encoder, 'gs_params_head_type', None) != 'moment' or not encoder.pose_free:
+                raise ValueError("Observed-color auxiliary training currently requires the pose-free moment encoder")
+            self.auxiliary = ObservedColorAuxiliary(train_cfg.auxiliary)
 
         self.distiller = distiller
         self.distiller_loss = None
@@ -132,6 +139,15 @@ class ModelWrapper(LightningModule):
         self.benchmarker = Benchmarker()
         self._test_metric_names = ("psnr_ours", "ssim_ours", "lpips_ours")
         self._test_overlap_tags = ("small", "medium", "large")
+
+    def on_fit_start(self) -> None:
+        if self.auxiliary is not None:
+            # Lightning has assigned each DDP rank's CUDA device at this point.
+            self.auxiliary.initialize(self.device)
+
+    def on_train_end(self) -> None:
+        if self.auxiliary is not None:
+            self.auxiliary.release()
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -150,12 +166,16 @@ class ModelWrapper(LightningModule):
                         else:
                             raise NotImplementedError
             batch = batch_combined
+        # Match the actual context RGB before normalization/encoder activations.
+        context_rgb = batch["context"]["image"]
+        auxiliary_pairs = (self.auxiliary.prepare_pairs(context_rgb, self.global_step)
+                           if self.auxiliary is not None else [])
         batch: BatchedExample = self.data_shim(batch)
         _, _, _, h, w = batch["target"]["image"].shape
 
         # Run the model.
         visualization_dump = None
-        if self.distiller is not None:
+        if self.distiller is not None or auxiliary_pairs:
             visualization_dump = {}
         gaussians = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
         output = self.decoder.forward(
@@ -182,6 +202,17 @@ class ModelWrapper(LightningModule):
             loss = loss_fn.forward(output, batch, gaussians, self.global_step)
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
+
+        if self.auxiliary is not None:
+            auxiliary_loss, auxiliary_stats = self.auxiliary.compute(
+                gaussians, context_rgb, batch["context"]["intrinsics"],
+                visualization_dump.get("support_points") if visualization_dump is not None else None,
+                auxiliary_pairs, self.global_step, self.decoder.background_color,
+            )
+            total_loss = total_loss + auxiliary_loss
+            self.log("loss/observed_color_aux", auxiliary_loss)
+            for name, value in auxiliary_stats.items():
+                self.log(f"aux/{name}", value)
 
         # distillation
         if self.distiller is not None and self.global_step <= self.train_cfg.distill_max_steps:

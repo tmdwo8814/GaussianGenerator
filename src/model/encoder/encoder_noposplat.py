@@ -185,6 +185,8 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
             features = torch.cat((GS_res1, GS_res2), dim=1)
             gaussians = self.gaussian_decoder(points, features)
             if visualization_dump is not None:
+                # Matching pose uses raw observations, not reallocated centers.
+                visualization_dump['support_points'] = points.detach().reshape(b, v, h, w, 3)
                 means = gaussians.means.reshape(b, v, h, w, 1, 3)
                 visualization_dump['means'] = means
                 visualization_dump['depth'] = means[..., 2:3]
