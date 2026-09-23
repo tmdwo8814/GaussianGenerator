@@ -36,11 +36,12 @@ data_loader:
 
 trainer:
   # max_steps: 18751
-  max_steps: 80001
+  # max_steps: 80001
+  max_steps: 1000
   # val_check_interval: 1500
   val_check_interval: null
 
-  eval_every_n_steps: 20000
+  eval_every_n_steps: 200
 
   auto_eval: true
   auto_eval_index_path: assets/evaluation_index_re10k.json
@@ -50,5 +51,5 @@ trainer:
 
 checkpointing:
   # every_n_train_steps: 9375
-  every_n_train_steps: 20000
+  every_n_train_steps: 200
   save_top_k: -1

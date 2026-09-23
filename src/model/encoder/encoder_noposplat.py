@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
@@ -10,6 +10,8 @@ from torch import Tensor, nn
 
 from .backbone.croco.misc import transpose_to_landscape
 from .heads import head_factory
+from .heads.dpt_feature_head import create_dpt_feature_head
+from .heads.moment_gaussian_decoder import MomentDecoderCfg, MomentGaussianDecoder
 from ...dataset.shims.bounds_shim import apply_bounds_shim
 from ...dataset.shims.normalize_shim import apply_normalize_shim
 from ...dataset.shims.patch_shim import apply_patch_shim
@@ -49,6 +51,7 @@ class EncoderNoPoSplatCfg:
     input_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
     pretrained_weights: str = ""
     pose_free: bool = True
+    moment_decoder: MomentDecoderCfg = field(default_factory=MomentDecoderCfg)
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -95,7 +98,13 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         self.head2 = transpose_to_landscape(self.downstream_head2, activate=landscape_only)
 
     def set_gs_params_head(self, cfg, head_type):
-        if head_type == 'linear':
+        if head_type == 'moment':
+            if not cfg.pose_free or cfg.num_surfaces != 1 or cfg.gaussians_per_pixel != 1:
+                raise ValueError("The moment integration requires pose_free=True and one slot per pixel")
+            self.gaussian_param_head = create_dpt_feature_head(self.backbone, cfg.moment_decoder.feature_dim)
+            self.gaussian_param_head2 = create_dpt_feature_head(self.backbone, cfg.moment_decoder.feature_dim)
+            self.gaussian_decoder = MomentGaussianDecoder(cfg.moment_decoder, cfg.gaussian_adapter.sh_degree)
+        elif head_type == 'linear':
             self.gaussian_param_head = nn.Sequential(
                 nn.ReLU(),
                 nn.Linear(
@@ -144,6 +153,8 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
     ) -> Gaussians:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
+        if self.gs_params_head_type == 'moment' and v != 2:
+            raise ValueError("EncoderNoPoSplat expects two views; the moment decoder itself accepts arbitrary support counts")
 
         # Encode the context images.
         dec1, dec2, shape1, shape2, view1, view2 = self.backbone(context, return_views=True)
@@ -160,11 +171,28 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 GS_res2 = self.gaussian_param_head2([tok.float() for tok in dec2], shape2[0].cpu().tolist())
                 GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
-            elif self.gs_params_head_type == 'dpt_gs':
+            elif self.gs_params_head_type in ('dpt_gs', 'moment'):
                 GS_res1 = self.gaussian_param_head([tok.float() for tok in dec1], res1['pts3d'].permute(0, 3, 1, 2), view1['img'][:, :3], shape1[0].cpu().tolist())
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 GS_res2 = self.gaussian_param_head2([tok.float() for tok in dec2], res2['pts3d'].permute(0, 3, 1, 2), view2['img'][:, :3], shape2[0].cpu().tolist())
                 GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
+
+        if self.gs_params_head_type == 'moment':
+            # Both point maps are already in NoPoSplat's common canonical frame.
+            # Keep view-major ordering; each point carries its own pixel feature.
+            points = torch.cat((res1['pts3d'].reshape(b, h * w, 3),
+                                res2['pts3d'].reshape(b, h * w, 3)), dim=1)
+            features = torch.cat((GS_res1, GS_res2), dim=1)
+            gaussians = self.gaussian_decoder(points, features)
+            if visualization_dump is not None:
+                means = gaussians.means.reshape(b, v, h, w, 1, 3)
+                visualization_dump['means'] = means
+                visualization_dump['depth'] = means[..., 2:3]
+                visualization_dump['opacities'] = gaussians.opacities.reshape(b, v, h, w, 1, 1)
+                visualization_dump['covariances'] = gaussians.covariances
+            # The new head already returns final covariance, opacity and SH.
+            # Do not apply the baseline raw-attribute adapter a second time.
+            return gaussians
 
         pts3d1 = res1['pts3d']
         pts3d1 = rearrange(pts3d1, "b h w d -> b (h w) d")

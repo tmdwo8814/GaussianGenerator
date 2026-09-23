@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH -J Ragaussian
+#SBATCH -J GaussianGenerator
 #SBATCH --gres=gpu:high_perf:3
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
@@ -33,4 +33,4 @@ python --version
 nvidia-smi
 wandb status || true
 
-python -m src.main +experiment=re10k wandb.mode=online 
+python -m src.main "+experiment=${EXPERIMENT:-re10k_moment}" wandb.mode=online "$@"

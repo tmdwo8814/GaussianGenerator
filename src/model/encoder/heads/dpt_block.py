@@ -332,6 +332,9 @@ class DPTOutputAdapter(nn.Module):
                 nn.Conv2d(feature_dim, self.num_channels, kernel_size=1),
                 Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
             )
+        elif self.head_type == 'features':
+            # Dense DPT features for a separate, scene-level Gaussian decoder.
+            self.head = nn.Conv2d(feature_dim, self.num_channels, kernel_size=1)
         elif self.head_type == 'gs_params':
             # The "DPTSegmentationModel" head
             self.head = nn.Sequential(
@@ -342,7 +345,7 @@ class DPTOutputAdapter(nn.Module):
                 nn.Conv2d(feature_dim, self.num_channels, kernel_size=1),
             )
         else:
-            raise ValueError('DPT head_type must be "regression" or "semseg".')
+            raise ValueError(f'Unsupported DPT head_type: {self.head_type}')
 
         if self.dim_tokens_enc is not None:
             self.init(dim_tokens_enc=dim_tokens_enc)

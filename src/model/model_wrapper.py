@@ -768,7 +768,7 @@ class ModelWrapper(LightningModule):
             if not param.requires_grad:
                 continue
 
-            if "gaussian_param_head" in name or "intrinsic_encoder" in name:
+            if any(module in name for module in ("gaussian_param_head", "gaussian_decoder", "intrinsic_encoder")):
                 new_params.append(param)
                 new_param_names.append(name)
             else:

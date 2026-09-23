@@ -10,6 +10,7 @@ wandb
 einops
 colorama
 scikit-image
+scipy>=1.9
 colorspacious
 matplotlib
 moviepy

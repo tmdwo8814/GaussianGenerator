@@ -1,0 +1,28 @@
+# @package _global_
+
+defaults:
+  - re10k
+  - _self_
+
+wandb:
+  name: gaussian_decoder
+  tags: [re10k, 256x256, moment_decoder]
+
+model:
+  encoder:
+    gs_params_head_type: moment
+    moment_decoder:
+      feature_dim: 64
+      hidden_dim: 64
+      num_neighbors: 16  # Includes self; candidates span both views.
+      chunk_size: 8192
+      checkpoint_chunks: true
+      knn_workers: 1  # Per DDP rank; exact CPU cKDTree, no CUDA extension.
+      budget_max: 2.0
+      budget_init: 0.6931471805599453
+      scale_min: 1.0
+      scale_max: 3.0
+      scale_init: 1.75
+      covariance_floor: 0.0001  # Standard deviation relative to scene scale.
+      mass_epsilon: 0.000001
+      scene_epsilon: 0.000001
