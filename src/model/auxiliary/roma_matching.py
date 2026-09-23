@@ -1,10 +1,21 @@
 """Thin, frozen RoMaV2 adapter. No dependency on cameras or the Gaussian model."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
+
+
+@contextmanager
+def matching_precision():
+    """Meet RoMaV2's FP32 requirement without changing backbone/decoder TF32."""
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
 
 
 @dataclass
@@ -72,7 +83,7 @@ class RoMaMatcher:
             raise ValueError("RoMaV2 expects one pair with shape [2,3,H,W]")
         self.initialize(images.device)
         guard = torch.cuda.device(images.device) if images.is_cuda else nullcontext()
-        with guard:
+        with guard, matching_precision(), torch.autocast(images.device.type, enabled=False):
             # Upstream tensors must be BCHW, even for a single pair.
             predictions = self._model.match(images[0:1], images[1:2])
             positive = 0

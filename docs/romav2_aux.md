@@ -82,13 +82,17 @@ existing main reconstruction renderer as before.
 - One scene pair per local DDP batch, rotating through its elements; two
   auxiliary renders when both directions are valid.
 - Steps 0-100: no auxiliary matching/loss; linear weight ramp to `0.05` at step
-  300. This fits the current inherited `trainer.max_steps=1000` experiment.
-  Increase warm-up/ramp explicitly if desired for a full training run. Main
-  losses and all baseline schedules are inherited unchanged.
+  300. The main schedule now matches the optimized decoder-only branch:
+  `trainer.max_steps=80001`, evaluation/checkpoint intervals of 20000 steps.
+  Auxiliary warm-up/ramp and thresholds are unchanged experimental defaults.
 - Matching runs before the encoder so its temporary activations do not overlap
   the encoder backward graph. Matcher weights stay on each rank's GPU during
   training, are excluded from the optimizer/checkpoint/DDP, and are released at
   train end. Validation and standalone testing do not run matching.
+- RoMaV2 requires `highest` FP32 matmul precision, whereas the backbone enables
+  TF32. The adapter temporarily uses `highest` and disables outer autocast during
+  matching, then restores the training settings even on early return or error.
+  RoMaV2 still controls its own internal mixed precision.
 - Watch `aux/attempted_pairs`, `aux/valid_pairs`, `aux/inliers`,
   `aux/alignment_error`, `aux/translation_scale`, `aux/directions`,
   `aux/raw_loss`, `aux/weight`, and `loss/observed_color_aux`. These are per-rank
@@ -106,31 +110,36 @@ On skipped steps the auxiliary loss is zero (no inverse-frequency reweighting).
 Run from the repository root in the **same environment used by the Slurm script**.
 The existing NoPoSplat dependencies and CUDA rasterizer must already work.
 
+The clone is already present; do not clone it again. The integration was checked
+against commit `95c9968145c8906b7b59383258e9f73b02853d89` (RoMaV2 2.0.1).
+Use Python >=3.10; upstream reports testing Linux/Python 3.12.
+
 ```bash
-# Only if this machine does not already have the user's local clone:
-git clone https://github.com/Parskatt/RoMaV2.git RoMaV2
-
-# This integration was checked against this version of the upstream source:
-git -C RoMaV2 rev-parse HEAD
-# expected: 95c9968145c8906b7b59383258e9f73b02853d89
-# On a NEW clone, pin it with:
-git -C RoMaV2 checkout 95c9968145c8906b7b59383258e9f73b02853d89
-
-# Keep the user's requested CUDA stack and matching torchvision version:
-python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+conda activate ragaussian
+# Keep the working torch 2.11.0+cu128 environment. This also installs the exact
+# CuPy 14.2.0 requirement used by the optimized decoder.
 python -m pip install -r requirements-aux.txt
 
-# Do this ONCE before launching multi-GPU training. Downloads need network access.
+# Run ON A GPU allocation, once before multi-GPU training:
 python -m scripts.check_romav2 --device cuda:0
-# Optional real image-pair smoke check:
+# Optional: replace the clone's Toronto demo pair with real overlapping images.
 python -m scripts.check_romav2 --image-a /path/a.png --image-b /path/b.png
 ```
 
-The official PyTorch pairing is documented at
-<https://pytorch.org/get-started/previous-versions/>. RoMaV2 requires Python >=3.10;
-upstream reports testing Linux/Python 3.12. Its runtime also requires newer
-`einops`, Pillow, `rich`, and `tqdm`, installed through its package dependencies.
-This auxiliary pose path uses `opencv-python`, already in `requirements.txt`.
+`requirements-aux.txt` pins torch 2.11.0 and torchvision 0.26.0 to protect the
+working stack. Check `python -m pip show torch torchvision` first if torchvision
+has not been installed. To explicitly obtain those CUDA 12.8 wheels when needed:
+
+```bash
+python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+```
+
+The check now performs actual matching and sampling through the training adapter,
+using `RoMaV2/assets/toronto_A.jpg` and `toronto_B.jpg` by default. It exercises the
+loaded CUDA correlation backend, checks TF32 restoration, reports reliable
+matches and peak torch memory, and downloads the model/cache on one process.
+A successful demo check does not establish RE10K pose acceptance or convergence.
+The baseline `opencv-python` dependency is also required by the auxiliary pose path.
 
 RoMaV2 initialization downloads its `romav2.0.1.pt` checkpoint and the pinned
 `facebookresearch/dinov3:adc254450203739c8149213a7a69d8d905b4fcfa` torch.hub
@@ -151,16 +160,16 @@ If that dependency cannot build, upstream has a native PyTorch fallback. Install
 the same runtime dependencies and the clone without resolving the fused package:
 
 ```bash
-python -m pip install 'einops>=0.8.1' 'pillow>=12.0.0' 'rich>=14.2.0' 'tqdm>=4.67.1'
+python -m pip install -r requirements-fast.txt 'einops>=0.8.1' 'pillow>=12.0.0' 'rich>=14.2.0' 'tqdm>=4.67.1'
 # torch/torchvision and baseline opencv-python must already be installed.
 python -m pip install --no-deps -e ./RoMaV2
-python -m scripts.check_romav2 --image-a /path/a.png --image-b /path/b.png
+python -m scripts.check_romav2
 ```
 
 With this fallback `pip check` may report the missing declared Linux dependency;
-the upstream implementation uses native correlation when `local_corr` cannot be
-imported. It may be slower. A broken installed extension with loader/ABI errors
-must be fixed or uninstalled; the integration does not hide such errors.
+the upstream implementation uses native correlation when importing `local_corr`
+raises `ImportError`. It may be slower. An installed extension can still fail
+at runtime on the actual GPU; the matching smoke check exercises this path.
 
 `RoMaV2/` is ignored by this repository to avoid committing an embedded Git repo
 without a submodule configuration. Its contents are unchanged. Clone/install it
@@ -171,7 +180,15 @@ on each server checkout; the new integration files are tracked by the parent rep
 ```bash
 # This branch's script now defaults to the auxiliary experiment:
 bash scripts/train_re10k.sh
-# Or submit the existing Slurm script as usual:
+# First GPU run: prefetch/check in one process, then exercise auxiliary training.
+# No separate interactive GPU allocation is required.
+mkdir -p logs
+ROMA_PREFLIGHT=1 sbatch scripts/train_re10k.sh \
+  wandb.mode=disabled trainer.max_steps=20 trainer.auto_eval=false \
+  data_loader.train.batch_size=1 \
+  train.auxiliary.warm_up_steps=0 train.auxiliary.ramp_steps=0
+
+# Full 80001-step experiment after a successful short run:
 sbatch scripts/train_re10k.sh
 
 # Decoder-only control with the original moment settings:
@@ -194,6 +211,12 @@ CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=re10k_moment_aux wandb.mod
   data_loader.train.batch_size=1 \
   train.auxiliary.warm_up_steps=0 train.auxiliary.ramp_steps=0
 ```
+
+The short run must log `aux/valid_pairs > 0`, finite `aux/raw_loss`, and completed
+backward/optimizer steps on some batches; a run with every pair rejected has not
+validated auxiliary learning. The optional `ROMA_PREFLIGHT=1` performs the demo
+check before the training process starts; the default remains direct training.
+The script inherits the active conda environment and `TORCH_HOME`.
 
 Main training/testing may additionally need the existing data paths and model
 checkpoints configured locally.

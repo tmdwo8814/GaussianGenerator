@@ -33,4 +33,9 @@ python --version
 nvidia-smi
 wandb status || true
 
+# Optional one-process download/matching check before DDP starts.
+if [[ "${ROMA_PREFLIGHT:-0}" == "1" ]]; then
+  python -m scripts.check_romav2 --device cuda:0
+fi
+
 python -m src.main "+experiment=${EXPERIMENT:-re10k_moment_aux}" wandb.mode=online "$@"

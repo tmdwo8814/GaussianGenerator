@@ -1,0 +1,3 @@
+# CUDA 12.x wheel. Does not replace the existing torch/torchvision stack.
+# CuPy 14 introduces GPU KDTree and requires NumPy >= 2.0.
+cupy-cuda12x==14.2.0

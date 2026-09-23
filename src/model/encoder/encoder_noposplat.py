@@ -159,8 +159,16 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         # Encode the context images.
         dec1, dec2, shape1, shape2, view1, view2 = self.backbone(context, return_views=True)
         with torch.cuda.amp.autocast(enabled=False):
-            res1 = self._downstream_head(1, [tok.float() for tok in dec1], shape1)
-            res2 = self._downstream_head(2, [tok.float() for tok in dec2], shape2)
+            if self.gs_params_head_type == 'moment':
+                # Both point and feature heads consume the same FP32 tokens.
+                # Share casts and their backward instead of converting twice.
+                moment_tokens1 = [tok.float() for tok in dec1]
+                moment_tokens2 = [tok.float() for tok in dec2]
+                res1 = self._downstream_head(1, moment_tokens1, shape1)
+                res2 = self._downstream_head(2, moment_tokens2, shape2)
+            else:
+                res1 = self._downstream_head(1, [tok.float() for tok in dec1], shape1)
+                res2 = self._downstream_head(2, [tok.float() for tok in dec2], shape2)
 
             # for the 3DGS heads
             if self.gs_params_head_type == 'linear':
@@ -172,12 +180,15 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
                 GS_res2 = self.gaussian_param_head2([tok.float() for tok in dec2], shape2[0].cpu().tolist())
                 GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
             elif self.gs_params_head_type in ('dpt_gs', 'moment'):
-                GS_res1 = self.gaussian_param_head([tok.float() for tok in dec1], res1['pts3d'].permute(0, 3, 1, 2), view1['img'][:, :3], shape1[0].cpu().tolist())
+                GS_res1 = self.gaussian_param_head(moment_tokens1 if self.gs_params_head_type == 'moment' else [tok.float() for tok in dec1], res1['pts3d'].permute(0, 3, 1, 2), view1['img'][:, :3], shape1[0].cpu().tolist())
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
-                GS_res2 = self.gaussian_param_head2([tok.float() for tok in dec2], res2['pts3d'].permute(0, 3, 1, 2), view2['img'][:, :3], shape2[0].cpu().tolist())
+                GS_res2 = self.gaussian_param_head2(moment_tokens2 if self.gs_params_head_type == 'moment' else [tok.float() for tok in dec2], res2['pts3d'].permute(0, 3, 1, 2), view2['img'][:, :3], shape2[0].cpu().tolist())
                 GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
 
         if self.gs_params_head_type == 'moment':
+            # Release unused converted layers before the large decoder stage;
+            # autograd retains only tensors actually needed by the two heads.
+            del moment_tokens1, moment_tokens2
             # Both point maps are already in NoPoSplat's common canonical frame.
             # Keep view-major ordering; each point carries its own pixel feature.
             points = torch.cat((res1['pts3d'].reshape(b, h * w, 3),

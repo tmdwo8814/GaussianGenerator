@@ -174,6 +174,7 @@ class AuxiliaryTests(unittest.TestCase):
 
             @torch.inference_mode()
             def match(self, a, b):
+                assert torch.get_float32_matmul_precision() == 'highest'
                 assert a.shape == b.shape == (1, 3, 8, 8)
                 return {'warp_AB': torch.zeros(1, 8, 8, 2),
                         'overlap_AB': torch.full((1, 8, 8, 1), 0. if self.zero else .9)}
@@ -197,6 +198,31 @@ class AuxiliaryTests(unittest.TestCase):
         (parameter * result.grid_a).sum().backward()
         matcher._model.zero = True
         self.assertEqual(len(matcher.match(torch.rand(2, 3, 8, 8)).confidence), 0)
+
+    def test_matcher_restores_training_precision_on_success_and_failure(self):
+        matcher = roma.RoMaMatcher(roma.RoMaMatcherCfg())
+
+        def empty_match(*args):
+            self.assertEqual(torch.get_float32_matmul_precision(), 'highest')
+            self.assertFalse(torch.is_autocast_enabled('cpu'))
+            return {'warp_AB': torch.zeros(1, 8, 8, 2),
+                    'overlap_AB': torch.zeros(1, 8, 8, 1)}
+
+        matcher._model = SimpleNamespace(match=empty_match)
+        matcher._device = torch.device('cpu')
+        previous = torch.get_float32_matmul_precision()
+        try:
+            torch.set_float32_matmul_precision('high')
+            with torch.autocast('cpu', dtype=torch.bfloat16):
+                self.assertEqual(len(matcher.match(torch.rand(2, 3, 8, 8)).confidence), 0)
+                self.assertTrue(torch.is_autocast_enabled('cpu'))
+            self.assertEqual(torch.get_float32_matmul_precision(), 'high')
+            with patch.object(matcher._model, 'match', side_effect=RuntimeError('matching failed')):
+                with self.assertRaisesRegex(RuntimeError, 'matching failed'):
+                    matcher.match(torch.rand(2, 3, 8, 8))
+            self.assertEqual(torch.get_float32_matmul_precision(), 'high')
+        finally:
+            torch.set_float32_matmul_precision(previous)
 
     def test_aux_config_inherits_decoder_and_baseline_loss(self):
         from dacite import from_dict

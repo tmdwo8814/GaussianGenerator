@@ -12,7 +12,7 @@ train:
   auxiliary:
     enabled: true
     weight: 0.05
-    warm_up_steps: 100  # The current inherited run is only 1000 steps.
+    warm_up_steps: 100  # Main schedule is inherited; auxiliary weight reaches 0.05 at step 300.
     ramp_steps: 200
     every_n_steps: 1
     max_pairs_per_batch: 1  # Per DDP rank; rotates through batch elements.

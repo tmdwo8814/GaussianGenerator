@@ -1,14 +1,18 @@
-"""Prefetch RoMaV2/DINOv3 code and optionally smoke-test matching on one GPU.
+"""Cache weights/DINOv3 code and run the training matcher on one CUDA GPU.
 
-Run from the repository root: python -m scripts.check_romav2
+Defaults to the local RoMaV2 Toronto example pair, resized to 256px as in RE10K.
+Run once before DDP: python -m scripts.check_romav2
 Optional: --image-a a.png --image-b b.png
 """
 
 import argparse
-import importlib.util
 from pathlib import Path
 
+import numpy as np
+from PIL import Image, ImageOps
 import torch
+
+from src.model.auxiliary.roma_matching import RoMaMatcher, RoMaMatcherCfg
 
 
 def main():
@@ -22,32 +26,42 @@ def main():
         parser.error('Supply both --image-a and --image-b')
     device = torch.device(args.device)
     if device.type != 'cuda' or not torch.cuda.is_available():
-        parser.error('This training integration requires a CUDA GPU')
+        parser.error('Run this check inside a CUDA GPU allocation')
+    assets = Path(__file__).resolve().parents[1] / 'RoMaV2/assets'
+    paths = [args.image_a, args.image_b] if args.image_a else [assets / 'toronto_A.jpg', assets / 'toronto_B.jpg']
+    images = []
+    for path in paths:
+        if not path.is_file():
+            parser.error(f'Missing image {path}; supply --image-a and --image-b')
+        with Image.open(path) as source:
+            rgb = ImageOps.exif_transpose(source).convert('RGB').resize((256, 256), Image.Resampling.BILINEAR)
+            images.append(torch.from_numpy(np.array(rgb)).permute(2, 0, 1).float() / 255)
 
     import torchvision
-    from romav2 import RoMaV2
 
-    print(f'PyTorch {torch.__version__}; torchvision {torchvision.__version__}; CUDA {torch.version.cuda}')
-    print(f'GPU: {torch.cuda.get_device_name(device)}; torch.hub cache: {torch.hub.get_dir()}')
-    print(f'Fused local correlation installed: {importlib.util.find_spec("local_corr") is not None}')
-    with torch.cuda.device(device):
-        model = RoMaV2(RoMaV2.Cfg(setting=args.setting, compile=False)).to(device).eval().requires_grad_(False)
+    print(f'PyTorch {torch.__version__}; torchvision {torchvision.__version__}; CUDA {torch.version.cuda}', flush=True)
+    print(f'GPU: {torch.cuda.get_device_name(device)}; torch.hub cache: {torch.hub.get_dir()}', flush=True)
+    matcher = RoMaMatcher(RoMaMatcherCfg(setting=args.setting))
+    matcher.initialize(device)
+    from romav2.local_correlation import local_corr
+    print(f'Local correlation: {"fused CUDA" if local_corr is not None else "native PyTorch"}', flush=True)
+    previous = torch.get_float32_matmul_precision()
+    try:
+        # Reproduce the backbone's TF32 setting and exercise the production guard.
+        torch.set_float32_matmul_precision('high')
+        matches = matcher.match(torch.stack(images).to(device))
+        if torch.get_float32_matmul_precision() != 'high':
+            raise RuntimeError('Matching changed the training matmul precision')
         torch.cuda.synchronize(device)
-        print(f'RoMaV2 initialized with setting={args.setting}. Weights and DINOv3 code are cached.')
-        if args.image_a is not None:
-            with torch.inference_mode():
-                prediction = model.match(str(args.image_a), str(args.image_b))
-            warp = prediction['warp_AB']
-            confidence = prediction['overlap_AB']
-            valid = torch.isfinite(warp).all(-1) & (warp.abs().amax(-1) <= 1 - 1 / warp.shape[1])
-            count = min(2048, int(((confidence[..., 0] > 0) & valid).sum()) // 4)
-            if count:
-                with torch.no_grad():
-                    matches, overlaps, _, _ = model.sample(prediction, count)
-                print(f'Sampled {len(matches)} matches; confidence >= 0.5: {int((overlaps >= .5).sum())}')
-            else:
-                print('No valid correspondence candidates; check image overlap.')
+        count = len(matches.confidence)
+        if count == 0:
+            raise RuntimeError('No reliable matches. Check input overlap and the RoMaV2 installation.')
+        print(f'PASS: {count} matches with confidence >= 0.5; precision restored.', flush=True)
         print(f'Peak allocated CUDA memory: {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB')
+        print('Matching smoke check passed. RE10K pose acceptance and training backward still need a training run.')
+    finally:
+        torch.set_float32_matmul_precision(previous)
+        matcher.release()
 
 
 if __name__ == '__main__':

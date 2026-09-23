@@ -1,5 +1,6 @@
-# Install requirements.txt first, then the CUDA 12.8 PyTorch wheels (see docs).
+# Use the working baseline environment with CUDA 12.8 PyTorch wheels (see docs).
 # Pins prevent RoMaV2's torchvision dependency from replacing the training stack.
+-r requirements-fast.txt
 torch==2.11.0
 torchvision==0.26.0
 -e ./RoMaV2
