@@ -6,6 +6,7 @@ GPU tests execute on the training server after requirements-fast.txt is installe
 import copy
 import importlib
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -14,6 +15,7 @@ from scipy.spatial import cKDTree
 from test_moment_gaussian_decoder import Cfg, Decoder, attributes, build_knn
 
 cuda_knn = importlib.import_module('_moment_test.encoder.common.cuda_knn')
+decoder_module = importlib.import_module(Decoder.__module__)
 
 
 def original_allocation(model, points, features, neighbors):
@@ -83,6 +85,40 @@ class FastMomentTests(unittest.TestCase):
         expected = torch.tensor([[0, 2, 3], [1, 2, 3], [2, 0, 1], [3, 1, 0]])
         torch.testing.assert_close(cuda_knn.self_first(candidates), expected)
         self.assertEqual(cuda_knn.self_first(torch.zeros(4, 1, dtype=torch.long)).flatten().tolist(), [0, 1, 2, 3])
+
+    def test_self_compaction_preserves_order_for_every_self_position_and_absence(self):
+        for k in (1, 2, 16, 32):
+            count = 40
+            for position in range(k + 1):  # k means self absent.
+                rows = []
+                expected = []
+                for own in range(count):
+                    others = [i for i in torch.randperm(count).tolist() if i != own][:k]
+                    candidates = others[:]
+                    if position < k:
+                        candidates.insert(position, own)
+                        candidates = candidates[:k]
+                    rows.append(candidates)
+                    expected.append([own] + [i for i in candidates if i != own][:k - 1])
+                torch.testing.assert_close(cuda_knn.self_first(torch.tensor(rows)), torch.tensor(expected))
+
+    def test_decoder_validates_whole_batch_once_and_rejects_invalid_points_before_search(self):
+        model = Decoder(Cfg(feature_dim=5, hidden_dim=7, num_neighbors=4))
+        points, features = torch.randn(3, 11, 3), torch.randn(3, 11, 5)
+        with patch.object(decoder_module, 'validate_points', wraps=decoder_module.validate_points) as validate, \
+             patch.object(decoder_module, 'build_knn', wraps=build_knn) as search:
+            model(points, features)
+            self.assertEqual(validate.call_count, 1)
+            self.assertEqual(validate.call_args.args[0].shape, (3, 11, 3))
+            self.assertEqual(search.call_count, 3)
+            self.assertTrue(all(call.kwargs['check_finite'] is False for call in search.call_args_list))
+        for invalid in (float('nan'), float('inf')):
+            bad = points.clone()
+            bad[2, 0, 0] = invalid
+            with patch.object(decoder_module, 'build_knn') as search:
+                with self.assertRaisesRegex(ValueError, 'non-finite'):
+                    model(bad, features)
+                search.assert_not_called()
 
     def test_cpu_dispatch_stays_exact_and_invalid_backend_fails(self):
         points = torch.randn(37, 3)

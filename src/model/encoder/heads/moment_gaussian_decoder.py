@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from ...types import Gaussians
-from ..common.sparse_knn import build_knn
+from ..common.sparse_knn import build_knn, validate_points
 
 
 @dataclass
@@ -216,9 +216,13 @@ class MomentGaussianDecoder(nn.Module):
 
         scenes = []
         with torch.autocast(device_type=points.device.type, enabled=False):
-            for scene_points, scene_features in zip(points.float(), features.float()):
+            search_points = points.float()
+            # One host-visible finite check per batch, not one per scene.
+            validate_points(search_points)
+            for scene_points, scene_features in zip(search_points, features.float()):
                 neighbors = build_knn(scene_points, self.cfg.num_neighbors,
-                                      self.cfg.knn_workers, self.cfg.knn_backend)
+                                      self.cfg.knn_workers, self.cfg.knn_backend,
+                                      check_finite=False)
                 scene_scale = scene_points.detach().norm(dim=-1).median().clamp_min(
                     self.cfg.scene_epsilon
                 )

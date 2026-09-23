@@ -17,8 +17,8 @@ _validated = set()
 def self_first(candidates: Tensor) -> Tensor:
     """Reserve self, retaining the first K-1 OTHER candidates without compaction.
 
-    KD-tree ties may omit self entirely. Sorting small integer column keys moves
-    an existing self to the end without changing the order of other neighbors.
+    KD-tree ties may omit self entirely. Skip self by shifting column indices
+    after its position, retaining the order of other neighbors without sorting.
     The final output is owned by PyTorch, not the external allocator.
     """
     count, k = candidates.shape
@@ -26,8 +26,31 @@ def self_first(candidates: Tensor) -> Tensor:
     if k == 1:
         return own
     columns = torch.arange(k, device=candidates.device).expand(count, k)
-    order = (columns + (candidates == own) * k).argsort(dim=1)[:, :k - 1]
+    self_column = torch.where(candidates == own, columns, k).amin(dim=1, keepdim=True)
+    order = columns[:, :k - 1]
+    order = order + (order >= self_column)
     return torch.cat((own, candidates.gather(1, order)), dim=1)
+
+
+# Small boundaries allow the profiler to time CuPy work independently. They do
+# not synchronize; only the diagnostic stage phase wraps them with CUDA syncs.
+def prepare_coordinates(points: Tensor):
+    import cupy as cp
+    coordinates = points.detach().float().to(torch.float64).contiguous()
+    return cp.from_dlpack(coordinates)
+
+
+def build_tree(array, tree_type):
+    return tree_type(array)
+
+
+def query_tree(tree, array, k: int):
+    _, candidates = tree.query(array, k=k, eps=0.0, p=2.0)
+    return candidates
+
+
+def export_indices(candidates, count: int, k: int) -> Tensor:
+    return torch.from_dlpack(candidates).to(dtype=torch.long).reshape(count, k)
 
 
 def _validate_first_query(points: Tensor, neighbors: Tensor):
@@ -57,7 +80,7 @@ def _validate_first_query(points: Tensor, neighbors: Tensor):
 
 
 @torch.no_grad()
-def build_cuda_knn(points: Tensor, k: int) -> Tensor:
+def build_cuda_knn(points: Tensor, k: int, *, check_finite: bool = True) -> Tensor:
     if not points.is_cuda:
         raise ValueError('CuPy kNN requires CUDA points')
     try:
@@ -70,18 +93,17 @@ def build_cuda_knn(points: Tensor, k: int) -> Tensor:
             'For an explicit slow CPU fallback set model.encoder.moment_decoder.knn_backend=scipy.'
         ) from error
 
-    if not bool(torch.isfinite(points).all()):
+    if check_finite and not bool(torch.isfinite(points).all()):
         raise ValueError('Cannot build 3D neighbors from non-finite support points')
     # Match the old SciPy path: first convert to FP32, then search in FP64.
     # Search is discrete; differentiable attributes still gather original points.
     with torch.cuda.device(points.device), cp.cuda.Device(points.device.index):
         stream = torch.cuda.current_stream(points.device)
         with cp.cuda.ExternalStream(stream.cuda_stream, device_id=points.device.index):
-            coordinates = points.detach().float().to(torch.float64).contiguous()
-            array = cp.from_dlpack(coordinates)
-            tree = KDTree(array)
-            _, candidates = tree.query(array, k=k, eps=0.0, p=2.0)
-            candidates = torch.from_dlpack(candidates).to(dtype=torch.long).reshape(len(points), k)
+            array = prepare_coordinates(points)
+            tree = build_tree(array, KDTree)
+            candidates = query_tree(tree, array, k)
+            candidates = export_indices(candidates, len(points), k)
             neighbors = self_first(candidates)
         _validate_first_query(points, neighbors)
     return neighbors

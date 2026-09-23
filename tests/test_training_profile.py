@@ -20,6 +20,48 @@ spec.loader.exec_module(profile)
 
 
 class TrainingProfileTests(unittest.TestCase):
+    def test_knn_substages_are_nested_disabled_during_throughput_and_restored(self):
+        clock = [0.]
+        def timed_result(seconds, result):
+            def operation(*args):
+                clock[0] += seconds
+                return result
+            return operation
+        cuda = SimpleNamespace(
+            prepare_coordinates=timed_result(1, 'array'),
+            build_tree=timed_result(3, 'tree'),
+            query_tree=timed_result(5, 'candidates'),
+            export_indices=timed_result(1, 'indices'),
+            self_first=timed_result(2, 'neighbors'),
+        )
+        originals = vars(cuda).copy()
+        def search(points):
+            array = cuda.prepare_coordinates(points)
+            tree = cuda.build_tree(array, object)
+            result = cuda.query_tree(tree, array, 16)
+            return cuda.self_first(cuda.export_indices(result, 32, 16))
+        decoder = SimpleNamespace(__package__='_test.encoder.heads', build_knn=search,
+                                  validate_points=timed_result(.5, None))
+        timer = profile.StageTimer(lambda: None, clock=lambda: clock[0])
+        with patch.object(profile.importlib, 'import_module', return_value=cuda) as load:
+            profile.instrument_knn(timer, decoder)
+        load.assert_called_once_with('_test.encoder.common.cuda_knn')
+        self.assertEqual(decoder.build_knn('points'), 'neighbors')
+        self.assertFalse(timer.values)
+        timer.enabled = True
+        decoder.validate_points('batch')
+        for _ in range(2):
+            self.assertEqual(decoder.build_knn('points'), 'neighbors')
+        self.assertEqual(timer.values['knn_s'], 24.)
+        self.assertEqual(timer.values['knn_build_s'], 6.)
+        self.assertEqual(timer.values['knn_query_s'], 10.)
+        self.assertEqual(timer.values['knn_self_s'], 4.)
+        self.assertEqual(timer.calls['knn_validate_s'], 1)
+        self.assertEqual(timer.calls['knn_query_s'], 2)
+        timer.restore()
+        self.assertEqual(vars(cuda), originals)
+        self.assertIs(decoder.build_knn, search)
+
     def test_wrapper_preserves_forward_backward_and_restores_method(self):
         model = torch.nn.Linear(3, 2)
         values = torch.randn(4, 3)

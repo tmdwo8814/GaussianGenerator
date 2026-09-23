@@ -1,5 +1,54 @@
 # Diagnose training speed before changing the decoder
 
+## Exact GPU kNN breakdown (current moment decoder)
+
+From the repository root in the training environment, run this once after
+updating the code. The existing CuPy installation is sufficient:
+
+```bash
+TRAIN_MODULE=scripts.profile_training EXPERIMENT=re10k_moment \
+  sbatch scripts/train_re10k.sh --warmup 5 --steps 10 \
+  --output outputs/profile_knn.json
+```
+
+After **all ranks finish**, summarize the files with:
+
+```bash
+python -m scripts.summarize_speed outputs/profile_knn \
+  --baseline-seconds 2.076870 --previous-seconds 3.479
+```
+
+The reference numbers above are the previous three-GPU, batch-16-per-rank,
+256x256 measurements. They are historical references, not a new baseline run.
+Keep GPU type/count, batch size, resolution and training settings unchanged.
+Use a different output prefix for another run; do not mix old and new rank files.
+
+The diagnostic has five warm-up steps, ten throughput steps and ten synchronized
+stage steps, then stops automatically. New stage fields (seconds **summed across
+scenes in one local batch**, not seconds per scene):
+
+| Field | Region |
+| --- | --- |
+| `knn_validate_s` | Finite-value validation, once for the whole batch |
+| `knn_prepare_s` | FP32 to FP64 coordinates and DLPack import |
+| `knn_build_s` | CuPy KDTree construction |
+| `knn_query_s` | Exact K-nearest query (`eps=0`, Euclidean) |
+| `knn_export_s` | Candidate index conversion to PyTorch |
+| `knn_self_s` | Reserve self without sorting, preserve other candidate order |
+
+The five prepare/build/query/export/self regions are **inside `knn_s`**; never
+add them to that total. Batch validation is inside the decoder but outside
+`knn_s`. The remainder includes wrapper/stream/cleanup overhead and timing
+instrumentation; do not label it all GPU search time. Detailed synchronization
+also inflates enclosing stage times, so compare end-to-end speed using the
+separate `throughput.step_wall_s` phase only. Its substage timers are disabled.
+CPU SciPy search has no CuPy breakdown, reported as `n/a`, not zero.
+
+This patch keeps FP64 search, exact neighbors, K=16, checkpointing, allocation
+and moments unchanged. It removes sorting for self placement and checks the
+whole batch for invalid points before any search, rather than synchronizing
+that check once per scene. It does not introduce a new search algorithm yet.
+
 Run both heads on the **same branch**, GPU allocation, batch size, input size,
 data paths and weights. The profile entry point uses the normal `src.main` setup
 and performs ordinary forward/backward/optimizer steps. By default it runs:
@@ -45,7 +94,7 @@ checking CPU contention or DDP waiting; these are not global averaged timings.
 - `throughput.compute_step_s`: forward, loss, backward and optimizer within the
   training batch. Warm-up, startup and checkpoint loading are excluded.
 - `peak_allocated_gib.throughput`: peak live torch CUDA allocations after warm-up;
-  not total GPU memory, allocator reserved memory, or NCCL external allocations.
+  not total GPU memory, allocator reserved memory, CuPy pools or NCCL external allocations.
 - `stages.encoder_s`: whole encoder, including the moment head.
 - `stages.moment_total_s`: kNN, allocation, aggregation and final attributes for
   all scenes in one local batch.
@@ -87,7 +136,7 @@ changing neighbor count or covariance scale. A scale change alters the model,
 so it is not a pure implementation speedup. Likewise, reducing K changes the
 research setting. Preserve K=16 for the first implementation comparisons.
 
-The next implementation optimizations should follow the measured bottleneck:
-spatial GPU neighbor search for kNN, shared pointwise projections for allocation,
-or fewer scatter/chunk operations for aggregation. The profiler adds no changes
-to Gaussian equations, precision, neighborhood or gradient checkpoint settings.
+The current decoder already uses exact GPU neighbor search and shared pointwise
+projections. Further kernel specialization should follow the measured build vs.
+query breakdown above. The profiler adds no changes to Gaussian equations,
+precision, neighborhood or gradient checkpoint settings.

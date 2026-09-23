@@ -71,6 +71,22 @@ def summarize(rows):
                   'max': max(row.get(key, 0.) for row in rows)} for key in keys}
 
 
+def instrument_knn(timer, decoder_module):
+    timer.wrap(decoder_module, 'build_knn', 'knn_s')
+    timer.wrap(decoder_module, 'validate_points', 'knn_validate_s')
+    # Derive the package from the decoder, also supporting isolated test imports.
+    common = decoder_module.__package__.rsplit('.', 1)[0] + '.common'
+    cuda_knn = importlib.import_module(common + '.cuda_knn')
+    for function, metric in (
+        ('prepare_coordinates', 'knn_prepare_s'),
+        ('build_tree', 'knn_build_s'),
+        ('query_tree', 'knn_query_s'),
+        ('export_indices', 'knn_export_s'),
+        ('self_first', 'knn_self_s'),
+    ):
+        timer.wrap(cuda_knn, function, metric)
+
+
 def make_callback(callback_base, args):
     class SpeedCallback(callback_base):
         def __init__(self):
@@ -98,7 +114,7 @@ def make_callback(callback_base, args):
                 self.timer.wrap(moment, 'aggregate_moments', 'aggregation_s')
                 self.timer.wrap(moment, 'build_gaussians', 'attributes_s')
                 module = importlib.import_module(type(moment).__module__)
-                self.timer.wrap(module, 'build_knn', 'knn_s')
+                instrument_knn(self.timer, module)
 
         def on_train_batch_start(self, trainer, model, batch, batch_idx):
             phase = ('warmup' if self.completed < args.warmup else
@@ -163,6 +179,9 @@ def make_callback(callback_base, args):
                 'notes': ['Stage timings synchronize CUDA and include nested scopes; do not sum them.',
                           'Use throughput.step_wall_s for comparison, not the stage-profile total.',
                           'between_batches_s includes loader wait, transfer, and framework overhead.',
+                          'knn_prepare/build/query/export/self are nested inside knn_s.',
+                          'knn_validate_s checks the whole batch once, outside knn_s.',
+                          'Torch peak memory excludes the CuPy memory pool.',
                           'DDP backward includes communication/wait; inspect every rank.'],
             }
             path = args.output.with_name(f'{args.output.stem}.rank{trainer.global_rank}.json')
