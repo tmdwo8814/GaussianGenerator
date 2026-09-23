@@ -15,9 +15,10 @@ model:
       feature_dim: 64
       hidden_dim: 64
       num_neighbors: 16  # Includes self; candidates span both views.
-      chunk_size: 8192
+      chunk_size: 32768
       checkpoint_chunks: true
-      knn_workers: 1  # Per DDP rank; exact CPU cKDTree, no CUDA extension.
+      knn_backend: auto  # Exact CuPy GPU KD-tree on CUDA; SciPy on CPU.
+      knn_workers: 1  # Used only by the explicit SciPy backend.
       budget_max: 2.0
       budget_init: 0.6931471805599453
       scale_min: 1.0

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from math import log
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
@@ -22,8 +23,9 @@ class MomentDecoderCfg:
     feature_dim: int = 64
     hidden_dim: int = 64
     num_neighbors: int = 16
-    chunk_size: int = 8192
+    chunk_size: int = 32768
     checkpoint_chunks: bool = True
+    knn_backend: str = 'auto'
     knn_workers: int = 1
     budget_max: float = 2.0
     budget_init: float = log(2.0)
@@ -39,6 +41,8 @@ class MomentGaussianDecoder(nn.Module):
     def __init__(self, cfg: MomentDecoderCfg, sh_degree: int = 4):
         super().__init__()
         self.cfg = cfg
+        if cfg.knn_backend not in ('auto', 'cupy', 'scipy'):
+            raise ValueError('knn_backend must be auto, cupy or scipy')
         if min(cfg.feature_dim, cfg.hidden_dim, cfg.num_neighbors,
                cfg.chunk_size, cfg.knn_workers) < 1:
             raise ValueError("Feature sizes, neighbor count, chunk size and workers must be positive")
@@ -86,27 +90,35 @@ class MomentGaussianDecoder(nn.Module):
                               preserve_rng_state=False)
         return function(*args)
 
-    def _allocation_chunk(self, source_points, source_features,
-                          points, features, neighbors):
-        destination_features = features[neighbors]
-        source_features_expanded = source_features[:, None].expand_as(destination_features)
+    def _allocation_chunk(self, source_points, source_projection, budget,
+                          points, destination_projection, neighbors):
         delta = source_points[:, None] - points[neighbors]
-        pair_features = torch.cat((destination_features, source_features_expanded,
-                                   delta, delta.square().sum(-1, keepdim=True)), dim=-1)
-        logits = self.allocation_head(pair_features).squeeze(-1)
+        geometry = torch.cat((delta, delta.square().sum(-1, keepdim=True)), dim=-1)
+        first = self.allocation_head[0]
+        # W[fi,fj,g] + b = Wi fi + Wj fj + Wg g + b, BEFORE SiLU.
+        # Retain the exact same parameters/state_dict and nonlinear function.
+        hidden = (destination_projection[neighbors] + source_projection[:, None]
+                  + F.linear(geometry, first.weight[:, 2 * self.cfg.feature_dim:], first.bias))
+        logits = self.allocation_head[2](self.allocation_head[1](hidden)).squeeze(-1)
         allocation = logits.softmax(dim=-1)  # sum_k A[j, k] = 1
-        budget = self.cfg.budget_max * self.budget_head(source_features).sigmoid()
         return allocation * budget  # q[j, k] = A_ij * b_j
 
     def predict_allocation(self, points: Tensor, features: Tensor,
                            neighbors: Tensor) -> Tensor:
         """Normalized coordinates in; sparse outgoing mass q [M, K] out."""
+        # Project each support once instead of repeating a 128->64 projection
+        # for every edge. These projections remain in the autograd graph.
+        weight = self.allocation_head[0].weight
+        dim = self.cfg.feature_dim
+        destination_projection = F.linear(features, weight[:, :dim])
+        source_projection = F.linear(features, weight[:, dim:2 * dim])
+        budget = self.cfg.budget_max * self.budget_head(features).sigmoid()
         chunks = []
         for start in range(0, len(points), self.cfg.chunk_size):
             stop = start + self.cfg.chunk_size
             chunks.append(self._run_chunk(
-                self._allocation_chunk, points[start:stop], features[start:stop],
-                points, features, neighbors[start:stop],
+                self._allocation_chunk, points[start:stop], source_projection[start:stop],
+                budget[start:stop], points, destination_projection, neighbors[start:stop],
             ))
         return torch.cat(chunks, dim=0)
 
@@ -206,7 +218,7 @@ class MomentGaussianDecoder(nn.Module):
         with torch.autocast(device_type=points.device.type, enabled=False):
             for scene_points, scene_features in zip(points.float(), features.float()):
                 neighbors = build_knn(scene_points, self.cfg.num_neighbors,
-                                      self.cfg.knn_workers)
+                                      self.cfg.knn_workers, self.cfg.knn_backend)
                 scene_scale = scene_points.detach().norm(dim=-1).median().clamp_min(
                     self.cfg.scene_epsilon
                 )
