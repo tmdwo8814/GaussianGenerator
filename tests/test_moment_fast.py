@@ -125,11 +125,74 @@ class FastMomentTests(unittest.TestCase):
         torch.testing.assert_close(build_knn(points, 16), build_knn(points, 16, backend='scipy'))
         with self.assertRaises(ValueError):
             build_knn(points, backend='approximate')
+        with self.assertRaises(ValueError):
+            build_knn(points, query_backend='approximate')
         with self.assertRaisesRegex(ValueError, 'CUDA'):
             build_knn(points, backend='cupy')
         for k in (1, 16):
             with self.assertRaises(ValueError):
                 build_knn(torch.full((20, 3), float('nan')), k)
+
+    def test_query_dispatch_preserves_cupy_for_other_k_and_explicit_reference(self):
+        specialized = importlib.import_module('_moment_test.encoder.common.knn_query16')
+        from types import SimpleNamespace
+        calls = []
+        def reference(array, **kwargs):
+            calls.append(kwargs)
+            return None, 'reference'
+        tree = SimpleNamespace(query=reference)
+        with patch.object(specialized, 'query_knn16', return_value='specialized') as fast:
+            self.assertEqual(cuda_knn.query_tree(tree, np.zeros((32, 3)), 16), 'specialized')
+            self.assertEqual(cuda_knn.query_tree(tree, np.zeros((32, 3)), 16, backend='cupy'), 'reference')
+            self.assertEqual(cuda_knn.query_tree(tree, np.zeros((8, 3)), 8), 'reference')
+            self.assertEqual(fast.call_count, 1)
+        self.assertEqual(calls, [{'k': 16, 'eps': 0., 'p': 2.}, {'k': 8, 'eps': 0., 'p': 2.}])
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is required for the specialized query')
+    def test_specialized_matches_cupy_and_scipy_for_irregular_trees_and_external_queries(self):
+        import cupy as cp
+        from cupyx.scipy.spatial import KDTree
+        specialized = importlib.import_module('_moment_test.encoder.common.knn_query16')
+        rng = np.random.default_rng(19)
+        clouds = [rng.normal(size=(n, 3)).astype(np.float32).astype(np.float64)
+                  for n in (16, 17, 31, 32, 33, 129, 257, 2049)]
+        planar = clouds[-2].copy()
+        planar[:, 2] = 0
+        clouds += [planar, np.zeros((33, 3)), np.repeat(clouds[0], 3, axis=0),
+                   np.indices((4, 4, 4)).reshape(3, -1).T.astype(np.float64),
+                   clouds[4] * 1e-15, clouds[4] * 1e15]
+        for xyz in clouds:
+            queries = np.concatenate((xyz, xyz[:16] + .03 * (np.max(np.abs(xyz)) + 1e-15)))
+            array, q = cp.asarray(xyz), cp.asarray(queries)
+            tree = KDTree(array)
+            indices = cp.asnumpy(specialized.query_knn16(tree, q))
+            self.assertEqual(indices.shape, (len(queries), 16))
+            self.assertTrue((indices >= 0).all() and (indices < len(xyz)).all())
+            self.assertTrue(all(len(np.unique(row)) == 16 for row in indices))
+            actual = np.linalg.norm(xyz[indices] - queries[:, None], axis=-1)
+            cupy_distances, _ = tree.query(q, k=16, eps=0., p=2.)
+            scipy_distances, _ = cKDTree(xyz).query(queries, k=16)
+            np.testing.assert_allclose(actual, cp.asnumpy(cupy_distances), rtol=1e-10, atol=1e-28)
+            np.testing.assert_allclose(actual, scipy_distances, rtol=1e-10, atol=1e-28)
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is required for backend attribute checks')
+    def test_specialized_and_cupy_decoder_attributes_and_gradients_match(self):
+        cfg = Cfg(feature_dim=5, hidden_dim=7, num_neighbors=16, chunk_size=23)
+        fast = Decoder(cfg).cuda()
+        reference = copy.deepcopy(fast)
+        reference.cfg.knn_query_backend = 'cupy'
+        points = torch.randn(1, 199, 3, device='cuda', requires_grad=True)
+        features = torch.randn(1, 199, 5, device='cuda', requires_grad=True)
+        rp, rf = points.detach().clone().requires_grad_(), features.detach().clone().requires_grad_()
+        actual, expected = fast(points, features), reference(rp, rf)
+        for a, b in zip(attributes(actual), attributes(expected)):
+            torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)
+        sum(v.square().mean() for v in attributes(actual)).backward()
+        sum(v.square().mean() for v in attributes(expected)).backward()
+        for a, b in [(points.grad, rp.grad), (features.grad, rf.grad)]:
+            torch.testing.assert_close(a, b, rtol=3e-4, atol=3e-6)
+        for a, b in zip(fast.parameters(), reference.parameters()):
+            torch.testing.assert_close(a.grad, b.grad, rtol=3e-4, atol=3e-6)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is required for CuPy KD-tree checks')
     def test_gpu_neighbors_exact_for_random_planar_duplicate_and_small_clouds(self):

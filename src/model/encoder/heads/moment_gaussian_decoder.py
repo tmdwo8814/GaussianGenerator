@@ -16,6 +16,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ...types import Gaussians
 from ..common.sparse_knn import build_knn, validate_points
+from ..common.sparse_feature_pool import pool_features
 
 
 @dataclass
@@ -26,6 +27,7 @@ class MomentDecoderCfg:
     chunk_size: int = 32768
     checkpoint_chunks: bool = True
     knn_backend: str = 'auto'
+    knn_query_backend: str = 'specialized'
     knn_workers: int = 1
     budget_max: float = 2.0
     budget_init: float = log(2.0)
@@ -43,6 +45,8 @@ class MomentGaussianDecoder(nn.Module):
         self.cfg = cfg
         if cfg.knn_backend not in ('auto', 'cupy', 'scipy'):
             raise ValueError('knn_backend must be auto, cupy or scipy')
+        if cfg.knn_query_backend not in ('specialized', 'cupy'):
+            raise ValueError('knn_query_backend must be specialized or cupy')
         if min(cfg.feature_dim, cfg.hidden_dim, cfg.num_neighbors,
                cfg.chunk_size, cfg.knn_workers) < 1:
             raise ValueError("Feature sizes, neighbor count, chunk size and workers must be positive")
@@ -110,8 +114,12 @@ class MomentGaussianDecoder(nn.Module):
         # for every edge. These projections remain in the autograd graph.
         weight = self.allocation_head[0].weight
         dim = self.cfg.feature_dim
-        destination_projection = F.linear(features, weight[:, :dim])
-        source_projection = F.linear(features, weight[:, dim:2 * dim])
+        # One GEMM for the two independent projections; keep the original
+        # parameters and split before the geometry sum / nonlinear activation.
+        projection_weight = torch.cat((weight[:, :dim], weight[:, dim:2 * dim]), dim=0)
+        destination_projection, source_projection = F.linear(features, projection_weight).split(
+            self.cfg.hidden_dim, dim=-1
+        )
         budget = self.cfg.budget_max * self.budget_head(features).sigmoid()
         chunks = []
         for start in range(0, len(points), self.cfg.chunk_size):
@@ -123,12 +131,11 @@ class MomentGaussianDecoder(nn.Module):
         return torch.cat(chunks, dim=0)
 
     @staticmethod
-    def _pool_chunk(source_points, source_features, points, neighbors, weights):
+    def _offset_chunk(source_points, points, neighbors, weights):
         # Accumulate offsets about each slot's support to avoid subtracting
         # large global second moments. This is exactly mu_i = sum_j w_ij x_j.
         offsets = source_points[:, None] - points[neighbors]
-        return (weights[..., None] * offsets,
-                weights[..., None] * source_features[:, None])
+        return weights[..., None] * offsets
 
     @staticmethod
     def _covariance_chunk(source_points, means, neighbors, weights):
@@ -154,18 +161,16 @@ class MomentGaussianDecoder(nn.Module):
         )
 
         mean_offsets = torch.zeros_like(points)
-        pooled = torch.zeros_like(features)
         for start in range(0, count, self.cfg.chunk_size):
             stop = start + self.cfg.chunk_size
             indices = neighbors[start:stop]
-            offsets, feature_messages = self._run_chunk(
-                self._pool_chunk, points[start:stop], features[start:stop],
+            offsets = self._run_chunk(
+                self._offset_chunk, points[start:stop],
                 points, indices, weights[start:stop],
             )
             mean_offsets.index_add_(0, indices.reshape(-1), offsets.reshape(-1, 3))
-            pooled.index_add_(0, indices.reshape(-1),
-                              feature_messages.reshape(-1, features.shape[-1]))
         means = points + mean_offsets
+        pooled = pool_features(features, weights, neighbors, self.cfg.chunk_size)
 
         covariance = points.new_zeros(count, 9)
         for start in range(0, count, self.cfg.chunk_size):
@@ -181,6 +186,13 @@ class MomentGaussianDecoder(nn.Module):
         return mass, means, covariance, pooled
 
     def build_gaussians(self, mass, means, covariance, pooled, scene_scale):
+        # Accept a single scene for inspection/tests, or all scenes for training.
+        # Batch the small heads to avoid repeated GEMMs and a final SH concat.
+        if means.ndim == 2:
+            mass, means, covariance, pooled = (
+                value.unsqueeze(0) for value in (mass, means, covariance, pooled)
+            )
+        scene_scale = scene_scale.reshape(-1, 1, 1)
         coverage = self.cfg.scale_min + (self.cfg.scale_max - self.cfg.scale_min) * (
             self.scale_head(pooled).sigmoid()
         )
@@ -192,12 +204,16 @@ class MomentGaussianDecoder(nn.Module):
             covariance.diagonal(dim1=-2, dim2=-1).sum(-1).detach()
         )
         floor = self.cfg.covariance_floor**2 + roundoff
-        covariance = (covariance + floor[:, None, None] * eye) * scene_scale.square()
+        covariance = (covariance + floor[..., None, None] * eye) * scene_scale[..., None].square()
+        harmonics = self.sh_head(pooled).reshape(*means.shape[:-1], 3, self.d_sh)
+        # Linear backward saves its input/weight, not this output. Masking the
+        # fresh output in place avoids allocating another full SH tensor.
+        harmonics.mul_(self.sh_mask)
         return Gaussians(
-            means=(means * scene_scale).unsqueeze(0),
-            covariances=covariance.unsqueeze(0),
-            harmonics=(self.sh_head(pooled).reshape(-1, 3, self.d_sh) * self.sh_mask).unsqueeze(0),
-            opacities=(-torch.expm1(-mass)).unsqueeze(0),
+            means=means * scene_scale,
+            covariances=covariance,
+            harmonics=harmonics,
+            opacities=-torch.expm1(-mass),
         )
 
     def forward(self, points: Tensor, features: Tensor) -> Gaussians:
@@ -214,25 +230,24 @@ class MomentGaussianDecoder(nn.Module):
         if points.device != features.device:
             raise ValueError("points and features must share a device")
 
-        scenes = []
+        moments = []
         with torch.autocast(device_type=points.device.type, enabled=False):
             search_points = points.float()
             # One host-visible finite check per batch, not one per scene.
             validate_points(search_points)
-            for scene_points, scene_features in zip(search_points, features.float()):
+            # Same detached lower median per scene, computed in one batch.
+            scene_scales = search_points.detach().norm(dim=-1).median(dim=-1).values.clamp_min(
+                self.cfg.scene_epsilon
+            )
+            for scene_points, scene_features, scene_scale in zip(
+                    search_points, features.float(), scene_scales):
                 neighbors = build_knn(scene_points, self.cfg.num_neighbors,
                                       self.cfg.knn_workers, self.cfg.knn_backend,
-                                      check_finite=False)
-                scene_scale = scene_points.detach().norm(dim=-1).median().clamp_min(
-                    self.cfg.scene_epsilon
-                )
+                                      check_finite=False,
+                                      query_backend=self.cfg.knn_query_backend)
                 normalized = scene_points / scene_scale
                 q = self.predict_allocation(normalized, scene_features, neighbors)
-                moments = self.aggregate_moments(normalized, scene_features, neighbors, q)
-                scenes.append(self.build_gaussians(*moments, scene_scale))
-        return Gaussians(
-            means=torch.cat([g.means for g in scenes]),
-            covariances=torch.cat([g.covariances for g in scenes]),
-            harmonics=torch.cat([g.harmonics for g in scenes]),
-            opacities=torch.cat([g.opacities for g in scenes]),
-        )
+                moments.append(self.aggregate_moments(normalized, scene_features, neighbors, q))
+            batched_moments = [torch.stack(values) for values in zip(*moments)]
+            del moments
+            return self.build_gaussians(*batched_moments, scene_scales)

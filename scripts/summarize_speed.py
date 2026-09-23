@@ -54,6 +54,9 @@ def main():
     current = average(reports, 'throughput', 'step_wall_s')
     print(f'Ranks: {len(reports)}; context per rank: {reports[0]["context_shape_per_rank"]}')
     print(f'Throughput step: {current:.3f} s (mean of rank means)')
+    if all('throughput' in r.get('peak_allocated_gib', {}) for r in reports):
+        peak = max(r['peak_allocated_gib']['throughput'] for r in reports)
+        print(f'Peak torch allocated: {peak:.3f} GiB (throughput phase, max across ranks; excludes CuPy/NCCL)')
     if args.baseline_seconds is not None:
         ratio = current / args.baseline_seconds
         print(f'Historical baseline: {args.baseline_seconds:.3f} s; {ratio:.2f}x time ({(ratio - 1) * 100:+.1f}%)')
@@ -63,7 +66,7 @@ def main():
     print('Synchronized stages: seconds per local batch, mean across ranks')
     for key in ('knn_validate_s', 'knn_s', 'knn_prepare_s', 'knn_build_s',
                 'knn_query_s', 'knn_export_s', 'knn_self_s', 'allocation_s',
-                'aggregation_s', 'backward_s'):
+                'aggregation_s', 'attributes_s', 'backward_s'):
         if all(key in r['stages'] for r in reports):
             print(f'  {key:<22} {average(reports, "stages", key):.6f}')
         else:

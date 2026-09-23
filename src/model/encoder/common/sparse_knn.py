@@ -15,7 +15,8 @@ def validate_points(points: Tensor) -> None:
 
 @torch.no_grad()
 def build_knn(points: Tensor, k: int = 16, workers: int = 1,
-              backend: str = 'auto', *, check_finite: bool = True) -> Tensor:
+              backend: str = 'auto', *, check_finite: bool = True,
+              query_backend: str = 'specialized') -> Tensor:
     """Return [M, min(k, M)] candidate slot indices for ONE scene.
 
     Row j belongs to support j; column zero is always its own slot. The
@@ -32,6 +33,8 @@ def build_knn(points: Tensor, k: int = 16, workers: int = 1,
         raise ValueError("k and workers must be positive")
     if backend not in ('auto', 'cupy', 'scipy'):
         raise ValueError('knn_backend must be auto, cupy or scipy')
+    if query_backend not in ('specialized', 'cupy'):
+        raise ValueError('knn_query_backend must be specialized or cupy')
 
     count = len(points)
     k = min(k, count)
@@ -41,7 +44,8 @@ def build_knn(points: Tensor, k: int = 16, workers: int = 1,
         return torch.arange(count, device=points.device, dtype=torch.long)[:, None]
     if backend == 'cupy' or (backend == 'auto' and points.is_cuda):
         from .cuda_knn import build_cuda_knn
-        return build_cuda_knn(points, k, check_finite=check_finite)
+        return build_cuda_knn(points, k, check_finite=check_finite,
+                              query_backend=query_backend)
     own = np.arange(count, dtype=np.int64)[:, None]
     coordinates = points.detach().float().cpu().numpy()
     if not np.isfinite(coordinates).all():

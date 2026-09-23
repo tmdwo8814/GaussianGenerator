@@ -44,7 +44,13 @@ def build_tree(array, tree_type):
     return tree_type(array)
 
 
-def query_tree(tree, array, k: int):
+def query_tree(tree, array, k: int, backend: str = 'specialized'):
+    if backend not in ('specialized', 'cupy'):
+        raise ValueError('knn_query_backend must be specialized or cupy')
+    if backend == 'specialized' and k == 16 and 16 <= len(array) < 2**30:
+        from .knn_query16 import query_knn16
+        return query_knn16(tree, array)
+    # Other K values keep the exact general query, including tiny scenes.
     _, candidates = tree.query(array, k=k, eps=0.0, p=2.0)
     return candidates
 
@@ -53,13 +59,13 @@ def export_indices(candidates, count: int, k: int) -> Tensor:
     return torch.from_dlpack(candidates).to(dtype=torch.long).reshape(count, k)
 
 
-def _validate_first_query(points: Tensor, neighbors: Tensor):
+def _validate_first_query(points: Tensor, neighbors: Tensor, query_backend: str):
     """One-time sampled exact-distance check on the real first scene per rank.
 
     Only this startup check transfers points to CPU. Later steps stay on GPU.
     Tied neighbor IDs need not match SciPy's unspecified tie ordering.
     """
-    key = (points.device.index, neighbors.shape[1])
+    key = (points.device.index, neighbors.shape[1], query_backend)
     if key in _validated:
         return
     xyz = points.detach().float().cpu().numpy().astype(np.float64)
@@ -76,11 +82,13 @@ def _validate_first_query(points: Tensor, neighbors: Tensor):
                        rtol=1e-8, atol=1e-10):
         raise RuntimeError('GPU KD-tree failed the startup exact-kNN check against SciPy')
     _validated.add(key)
-    print(f'[moment kNN] CuPy exact GPU KD-tree verified on {points.device}, K={k}', flush=True)
+    print(f'[moment kNN] exact GPU KD-tree verified on {points.device}, '
+          f'K={k}, query={query_backend}', flush=True)
 
 
 @torch.no_grad()
-def build_cuda_knn(points: Tensor, k: int, *, check_finite: bool = True) -> Tensor:
+def build_cuda_knn(points: Tensor, k: int, *, check_finite: bool = True,
+                   query_backend: str = 'specialized') -> Tensor:
     if not points.is_cuda:
         raise ValueError('CuPy kNN requires CUDA points')
     try:
@@ -102,8 +110,8 @@ def build_cuda_knn(points: Tensor, k: int, *, check_finite: bool = True) -> Tens
         with cp.cuda.ExternalStream(stream.cuda_stream, device_id=points.device.index):
             array = prepare_coordinates(points)
             tree = build_tree(array, KDTree)
-            candidates = query_tree(tree, array, k)
+            candidates = query_tree(tree, array, k, backend=query_backend)
             candidates = export_indices(candidates, len(points), k)
             neighbors = self_first(candidates)
-        _validate_first_query(points, neighbors)
+        _validate_first_query(points, neighbors, query_backend)
     return neighbors

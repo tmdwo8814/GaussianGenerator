@@ -68,6 +68,14 @@ DLPack과 PyTorch의 현재 CUDA stream을 공유하여 매 scene의 CPU 검색�
 CPU 입력은 기존 SciPy 경로를 사용한다. CUDA에서 CuPy가 없으면 설치 안내와 함께
 중단하며, 느린 CPU 경로로 자동 전환하지 않는다.
 
+현재 기본값 `knn_query_backend: specialized`에서는 CuPy가 만든 동일한 트리를
+3D/K=16 전용 CUDA kernel로 검색한다. FP64 정밀도와 정확한 검색 조건은 유지하고,
+범용 거리 연산 및 반복적인 global 후보 버퍼 갱신을 줄였다.
+K가 16이 아닌 경우는 기존 CuPy query를 사용한다. 기존 검색을 명시적으로 선택하려면
+`knn_query_backend: cupy`로 설정한다. 시작 시 실제 CUDA kernel을 작은 검증 데이터의
+SciPy 결과와 대조한 후, 기존과 같이 첫 실제 scene에서도 표본 검사를 한다.
+새 kernel의 속도 및 전체 GPU 검증은 서버 실행이 필요하다.
+
 배분 MLP의 첫 선형층은 `W_i f_i + W_j f_j + W_g geometry + bias`로 계산한다.
 각 지지점의 feature 변환을 한 번만 수행하고 이웃마다 결과를 모으므로, 기존 수식과
 파라미터 이름을 유지하면서 중복 연산을 줄인다. 비선형 활성화는 합산 후 그대로 적용한다.
@@ -78,6 +86,38 @@ bitwise 동일한 결과나 학습 궤적을 보장하지는 않는다.
 학습 시 non-reentrant activation checkpointing을 적용한다. 전체 `[B,M,K,D]`
 이웃 feature를 유지하지 않는다. kNN index와 scene scale만 gradient에서 분리하고,
 point·DPT·backbone으로 향하는 gradient는 유지한다.
+
+## 추가 최적화 묶음
+
+K=16 전용 검색과 함께 다음 구현 최적화를 적용했다. 학습 파라미터, 이웃 정의,
+배분 softmax, mass 정규화, central covariance, opacity/SH 식은 유지한다.
+
+- `common/sparse_feature_pool.py`: incoming feature pooling의 직접 backward.
+  `h_i = Σ_(j,k: neighbor(j,k)=i) w_jk f_j`에 대해
+  `∂L/∂f_j = Σ_k w_jk g_neighbor(j,k)`,
+  `∂L/∂w_jk = f_j · g_neighbor(j,k)`를 chunk 단위로 계산한다.
+  forward 메시지를 checkpoint로 재생성하지 않고, 전체 `[M,K,D]` activation도
+  저장하지 않는다. weight를 통한 배분/geometry gradient는 그대로 전달한다.
+  mean offset과 covariance, 배분 MLP에는 기존 checkpoint 설정을 유지한다.
+- 배분의 source/destination feature projection을 하나의 행렬곱으로 묶는다.
+  기존 weight를 이어 붙여 사용하므로 파라미터 및 checkpoint key는 동일하다.
+- detached scene scale의 median을 batch 단위로 계산한다. 짝수 지지점 수에서도
+  기존과 같은 lower median을 사용한다.
+- 각 scene의 moment를 모은 후 scale/SH head와 최종 attribute 변환을 한 번 수행한다.
+  새로 생성된 SH linear 출력에 mask를 in-place 적용하여 추가 SH 텐서를 만들지 않는다.
+  `attributes_calls`는 local batch마다 1이며, kNN/배분/aggregation은 여전히 scene별이다.
+- moment 분기의 point head와 feature head가 FP32 token 변환 결과를 공유한다.
+  dtype 변환이 필요한 경우의 중복 복사와 backward를 줄인다. 기존 baseline 분기는 유지한다.
+
+pooling은 독립 dense 식 및 수치 미분으로 1차·2차 gradient를 검사했다.
+batch attribute 변환도 기존 scene별 식과 출력·gradient를 비교했다.
+별도 변경 전 코드와 전체 decoder 출력 및 모든 입력/파라미터 gradient를 비교했다.
+GPU의 atomic accumulation과 행렬곱 연산 순서가 달라질 수 있으므로 bitwise 동일한
+학습 궤적을 보장하지는 않는다. GPU 속도·peak memory의 실제 변화는 측정이 필요하다.
+
+검토했지만 이 묶음에 적용하지 않은 변경은 checkpoint 전체 해제, batch 전체의
+이웃 feature 동시 전개, blanket `torch.compile`, 낮은 정밀도와 approximate kNN이다.
+메모리 사용이나 수치적 동작이 달라질 수 있어 현 측정만으로 일괄 활성화하지 않았다.
 
 ## 실행
 

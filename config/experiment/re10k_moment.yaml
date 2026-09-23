@@ -18,6 +18,7 @@ model:
       chunk_size: 32768
       checkpoint_chunks: true
       knn_backend: auto  # Exact CuPy GPU KD-tree on CUDA; SciPy on CPU.
+      knn_query_backend: specialized  # Exact FP64 3D/K=16 query; cupy restores the previous query.
       knn_workers: 1  # Used only by the explicit SciPy backend.
       budget_max: 2.0
       budget_init: 0.6931471805599453
