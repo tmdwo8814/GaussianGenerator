@@ -110,12 +110,21 @@ On skipped steps the auxiliary loss is zero (no inverse-frequency reweighting).
 Run from the repository root in the **same environment used by the Slurm script**.
 The existing NoPoSplat dependencies and CUDA rasterizer must already work.
 
-The clone is already present; do not clone it again. The integration was checked
-against commit `95c9968145c8906b7b59383258e9f73b02853d89` (RoMaV2 2.0.1).
+Check the clone on the actual training server, not just on the local workstation.
+`RoMaV2/` is gitignored and is NOT transferred by parent-repository push/pull.
+The integration was checked against commit
+`95c9968145c8906b7b59383258e9f73b02853d89` (RoMaV2 2.0.1).
 Use Python >=3.10; upstream reports testing Linux/Python 3.12.
 
 ```bash
 conda activate ragaussian
+# From the GaussianGenerator root on the TRAINING SERVER.
+# Clone only if the installable project is missing; do not overwrite existing files.
+if [ ! -f RoMaV2/pyproject.toml ]; then
+  git clone https://github.com/Parskatt/RoMaV2.git RoMaV2 && \
+    git -C RoMaV2 checkout 95c9968145c8906b7b59383258e9f73b02853d89
+fi
+test -f RoMaV2/pyproject.toml || { echo "RoMaV2 clone/path is incomplete"; exit 1; }
 # Keep the working torch 2.11.0+cu128 environment. This also installs the exact
 # CuPy 14.2.0 requirement used by the optimized decoder.
 python -m pip install -r requirements-aux.txt
