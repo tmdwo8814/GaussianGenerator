@@ -5,7 +5,7 @@ defaults:
   - _self_
 
 wandb:
-  name: gaussian_decoder
+  name: gaussian_decoder_k8
   tags: [re10k, 256x256, moment_decoder]
 
 model:
