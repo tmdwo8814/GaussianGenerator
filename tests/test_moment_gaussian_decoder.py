@@ -186,7 +186,7 @@ class MomentDecoderTests(unittest.TestCase):
             cfg = compose(config_name="main", overrides=["+experiment=re10k_moment"])
         self.assertEqual(cfg.model.encoder.gs_params_head_type, "moment")
         decoder_cfg = from_dict(Cfg, OmegaConf.to_container(cfg.model.encoder.moment_decoder))
-        self.assertEqual(decoder_cfg.feature_dim, 64)
+        self.assertEqual(decoder_cfg.feature_dim, 256)
         self.assertEqual(decoder_cfg.num_neighbors, 16)
         for key in ("dataset", "data_loader", "optimizer", "trainer", "test", "loss", "train"):
             self.assertEqual(OmegaConf.to_container(cfg[key]), OmegaConf.to_container(baseline[key]))

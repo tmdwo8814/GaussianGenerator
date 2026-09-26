@@ -334,7 +334,9 @@ class DPTOutputAdapter(nn.Module):
             )
         elif self.head_type == 'features':
             # Dense DPT features for a separate, scene-level Gaussian decoder.
-            self.head = nn.Conv2d(feature_dim, self.num_channels, kernel_size=1)
+            # Full-width features pass through unchanged; smaller widths project.
+            self.head = (nn.Identity() if self.num_channels == feature_dim else
+                         nn.Conv2d(feature_dim, self.num_channels, kernel_size=1))
         elif self.head_type == 'gs_params':
             # The "DPTSegmentationModel" head
             self.head = nn.Sequential(

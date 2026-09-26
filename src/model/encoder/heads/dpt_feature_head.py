@@ -7,7 +7,8 @@ def create_dpt_feature_head(backbone, feature_dim: int = 64):
     """Create one independent feature head per input-view branch.
 
     Reuses the existing DPT refinement and RGB merger. Only its final output
-    head changes: a 1x1 projection replaces direct Gaussian-attribute regression.
+    head changes: 256 channels pass through unchanged; other widths use a
+    1x1 projection instead of direct Gaussian-attribute regression.
     """
     depth = backbone.dec_depth
     if depth <= 9:
