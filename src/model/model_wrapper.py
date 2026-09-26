@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable, Any
 
@@ -43,6 +43,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .auxiliary.descriptor_teacher import DescriptorTeacher, DescriptorTeacherCfg
 
 
 @dataclass
@@ -72,6 +73,7 @@ class TrainCfg:
     print_log_every_n_steps: int
     distiller: str
     distill_max_steps: int
+    descriptor_teacher: DescriptorTeacherCfg = field(default_factory=DescriptorTeacherCfg)
 
 
 @runtime_checkable
@@ -121,6 +123,11 @@ class ModelWrapper(LightningModule):
         self.decoder = decoder
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
+        self.descriptor_teacher = None
+        if train_cfg.descriptor_teacher.enabled:
+            if getattr(encoder, 'cross_view_verifier', None) is None:
+                raise ValueError("descriptor_teacher requires an enabled cross_view_verifier")
+            self.descriptor_teacher = DescriptorTeacher(train_cfg.descriptor_teacher)
 
         self.distiller = distiller
         self.distiller_loss = None
@@ -132,6 +139,14 @@ class ModelWrapper(LightningModule):
         self.benchmarker = Benchmarker()
         self._test_metric_names = ("psnr_ours", "ssim_ours", "lpips_ours")
         self._test_overlap_tags = ("small", "medium", "large")
+
+    def on_fit_start(self):
+        if self.descriptor_teacher is not None:
+            self.descriptor_teacher.matcher.initialize(self.device)
+
+    def on_fit_end(self):
+        if self.descriptor_teacher is not None:
+            self.descriptor_teacher.matcher.release()
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -150,12 +165,17 @@ class ModelWrapper(LightningModule):
                         else:
                             raise NotImplementedError
             batch = batch_combined
+        # Frozen teacher runs before normalization and before the encoder graph.
+        # Only actual context RGB is provided; no cameras or target information.
+        teacher_pairs = None
+        if self.descriptor_teacher is not None:
+            teacher_pairs = self.descriptor_teacher.prepare(batch['context']['image'], self.global_step)
         batch: BatchedExample = self.data_shim(batch)
         _, _, _, h, w = batch["target"]["image"].shape
 
         # Run the model.
         visualization_dump = None
-        if self.distiller is not None:
+        if self.distiller is not None or getattr(self.encoder, 'cross_view_verifier', None) is not None:
             visualization_dump = {}
         gaussians = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
         output = self.decoder.forward(
@@ -183,6 +203,18 @@ class ModelWrapper(LightningModule):
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
 
+        if visualization_dump is not None and 'cv_stats' in visualization_dump:
+            for key, value in visualization_dump['cv_stats'].items():
+                self.log(f'cv/{key}', value)
+        if self.descriptor_teacher is not None:
+            descriptor_loss, descriptor_stats = self.descriptor_teacher.loss(
+                self.encoder.cross_view_verifier, visualization_dump['cv_features'],
+                teacher_pairs, tuple(batch['context']['image'].shape[-2:]))
+            self.log('loss/descriptor', descriptor_loss)
+            for key, value in descriptor_stats.items():
+                self.log(f'cv/teacher_{key}', value)
+            total_loss = total_loss + self.train_cfg.descriptor_teacher.weight * descriptor_loss
+
         # distillation
         if self.distiller is not None and self.global_step <= self.train_cfg.distill_max_steps:
             with torch.no_grad():
@@ -206,6 +238,10 @@ class ModelWrapper(LightningModule):
                 f"context = {batch['context']['index'].tolist()}; "
                 f"loss = {total_loss:.6f}"
             )
+            if visualization_dump is not None and 'cv_stats' in visualization_dump:
+                stats = visualization_dump['cv_stats']
+                print(f"CV verify: accepted={stats['accepted']:.2f}; "
+                      f"matches={stats['matches']:.1f}; validation_inliers={stats['validation_inliers']:.2f}")
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
         # Tell the data loader processes about the current step.
@@ -768,7 +804,7 @@ class ModelWrapper(LightningModule):
             if not param.requires_grad:
                 continue
 
-            if any(module in name for module in ("gaussian_param_head", "gaussian_decoder", "intrinsic_encoder")):
+            if any(module in name for module in ("gaussian_param_head", "gaussian_decoder", "intrinsic_encoder", "cross_view_verifier")):
                 new_params.append(param)
                 new_param_names.append(name)
             else:

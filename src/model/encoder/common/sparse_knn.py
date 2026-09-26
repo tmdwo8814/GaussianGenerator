@@ -63,3 +63,24 @@ def build_knn(points: Tensor, k: int = 16, workers: int = 1,
         (own, candidates[keep].reshape(count, k - 1)), axis=1
     )
     return torch.from_numpy(neighbors.astype(np.int64, copy=False)).to(points.device)
+
+
+@torch.no_grad()
+def build_partitioned_knn(points: Tensor, sizes: tuple[int, ...], k: int = 16,
+                          workers: int = 1, backend: str = 'auto', *,
+                          query_backend: str = 'specialized') -> Tensor:
+    """Within-view fallback; same exact backend, self first, no duplicate padding.
+
+    Contiguous groups preserve support/slot order. For tiny groups use the same
+    smaller K for all rows; production pixel groups are much larger than K.
+    The caller already validated the full batch's coordinates.
+    """
+    if not sizes or min(sizes) < 1 or sum(sizes) != len(points):
+        raise ValueError("Partition sizes must be positive and cover all points")
+    k = min(k, min(sizes))
+    neighbors, offset = [], 0
+    for size in sizes:
+        neighbors.append(build_knn(points[offset:offset + size], k, workers, backend,
+                                   check_finite=False, query_backend=query_backend) + offset)
+        offset += size
+    return torch.cat(neighbors)

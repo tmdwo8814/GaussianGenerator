@@ -20,6 +20,7 @@ from ...geometry.projection import sample_image_grid
 from ..types import Gaussians
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
+from .common.cross_view_verifier import CrossViewVerifier, CrossViewVerifierCfg, pixel_representatives
 from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 
@@ -52,6 +53,7 @@ class EncoderNoPoSplatCfg:
     pretrained_weights: str = ""
     pose_free: bool = True
     moment_decoder: MomentDecoderCfg = field(default_factory=MomentDecoderCfg)
+    cross_view_verifier: CrossViewVerifierCfg = field(default_factory=CrossViewVerifierCfg)
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -98,12 +100,18 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         self.head2 = transpose_to_landscape(self.downstream_head2, activate=landscape_only)
 
     def set_gs_params_head(self, cfg, head_type):
+        self.cross_view_verifier = None
+        if cfg.cross_view_verifier.enabled and head_type != 'moment':
+            raise ValueError("Cross-view verification currently requires the moment head")
         if head_type == 'moment':
             if not cfg.pose_free or cfg.num_surfaces != 1 or cfg.gaussians_per_pixel != 1:
                 raise ValueError("The moment integration requires pose_free=True and one slot per pixel")
             self.gaussian_param_head = create_dpt_feature_head(self.backbone, cfg.moment_decoder.feature_dim)
             self.gaussian_param_head2 = create_dpt_feature_head(self.backbone, cfg.moment_decoder.feature_dim)
             self.gaussian_decoder = MomentGaussianDecoder(cfg.moment_decoder, cfg.gaussian_adapter.sh_degree)
+            if cfg.cross_view_verifier.enabled:
+                self.cross_view_verifier = CrossViewVerifier(
+                    cfg.moment_decoder.feature_dim, cfg.cross_view_verifier)
         elif head_type == 'linear':
             self.gaussian_param_head = nn.Sequential(
                 nn.ReLU(),
@@ -194,7 +202,16 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
             points = torch.cat((res1['pts3d'].reshape(b, h * w, 3),
                                 res2['pts3d'].reshape(b, h * w, 3)), dim=1)
             features = torch.cat((GS_res1, GS_res2), dim=1)
-            gaussians = self.gaussian_decoder(points, features)
+            partitions = None
+            verifier = getattr(self, 'cross_view_verifier', None)
+            if verifier is not None:
+                representatives = pixel_representatives(h, w, verifier.cfg.num_representatives, device)
+                points, fused, stats = verifier(points, features, h * w, representatives, representatives)
+                partitions = [None if accepted else (h * w, h * w) for accepted in fused]
+                if visualization_dump is not None:
+                    visualization_dump['cv_stats'] = stats
+                    visualization_dump['cv_features'] = features.detach()
+            gaussians = self.gaussian_decoder(points, features, partitions=partitions)
             if visualization_dump is not None:
                 means = gaussians.means.reshape(b, v, h, w, 1, 3)
                 visualization_dump['means'] = means

@@ -5,8 +5,8 @@ defaults:
   - _self_
 
 wandb:
-  name: gaussian_decoder
-  tags: [re10k, 256x256, moment_decoder]
+  name: gaussian_decoder_cvverify
+  tags: [re10k, 256x256, moment_decoder, cvverify]
 
 model:
   encoder:
@@ -14,7 +14,7 @@ model:
     moment_decoder:
       feature_dim: 64
       hidden_dim: 64
-      num_neighbors: 16  # Includes self; candidates span both views.
+      num_neighbors: 16  # Includes self; cross-view only after verified registration.
       chunk_size: 32768
       checkpoint_chunks: true
       knn_backend: auto  # Exact CuPy GPU KD-tree on CUDA; SciPy on CPU.
@@ -28,3 +28,29 @@ model:
       covariance_floor: 0.0001  # Standard deviation relative to scene scale.
       mass_epsilon: 0.000001
       scene_epsilon: 0.000001
+    cross_view_verifier:
+      enabled: true
+      descriptor_dim: 32
+      hidden_dim: 64
+      num_representatives: 1024  # Per view; no full pixel x pixel matching.
+      min_similarity: 0.8
+      min_margin: 0.02
+      min_matches: 24
+      ransac_trials: 64
+      distance_fraction: 0.5  # Residual tolerance / median representative spacing.
+      min_inlier_ratio: 0.6
+      min_spread_ratio: 0.05
+
+train:
+  descriptor_teacher:
+    enabled: true
+    weight: 0.05  # Applies only to descriptor parameters (input feature detached).
+    every_n_steps: 1
+    max_pairs: 512
+    min_pairs: 16
+    temperature: 0.1
+    exclusion_pixels: 3.0
+    matcher:
+      setting: fast
+      num_matches: 2048
+      min_confidence: 0.5

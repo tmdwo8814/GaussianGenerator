@@ -188,8 +188,11 @@ class MomentDecoderTests(unittest.TestCase):
         decoder_cfg = from_dict(Cfg, OmegaConf.to_container(cfg.model.encoder.moment_decoder))
         self.assertEqual(decoder_cfg.feature_dim, 64)
         self.assertEqual(decoder_cfg.num_neighbors, 16)
-        for key in ("dataset", "data_loader", "optimizer", "trainer", "test", "loss", "train"):
+        for key in ("dataset", "data_loader", "optimizer", "trainer", "test", "loss"):
             self.assertEqual(OmegaConf.to_container(cfg[key]), OmegaConf.to_container(baseline[key]))
+        training = OmegaConf.to_container(cfg.train)
+        self.assertTrue(training.pop("descriptor_teacher")["enabled"])
+        self.assertEqual(training, OmegaConf.to_container(baseline.train))
 
     def test_encoder_integration_uses_only_context_and_preserves_slot_order(self):
         # Run the production encoder forward with a tiny front end. DPT itself
@@ -250,10 +253,13 @@ class MomentDecoderTests(unittest.TestCase):
         model.encoder.backbone = nn.Linear(3, 3)
         model.encoder.gaussian_param_head = nn.Linear(3, 5)
         model.encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, hidden_dim=8))
+        model.encoder.cross_view_verifier = nn.Linear(5, 32)
         model.optimizer_cfg = SimpleNamespace(lr=1e-4, backbone_lr_multiplier=.1, warm_up_steps=2)
         optimizer = namespace["configure_optimizers"](model)["optimizer"]
         new_ids = {id(p) for p in optimizer.param_groups[0]["params"]}
         for p in model.encoder.gaussian_decoder.parameters():
+            self.assertIn(id(p), new_ids)
+        for p in model.encoder.cross_view_verifier.parameters():
             self.assertIn(id(p), new_ids)
         for p in model.encoder.backbone.parameters():
             self.assertNotIn(id(p), new_ids)

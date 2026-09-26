@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH -J GaussianGenerator
+#SBATCH -J RoMaV2
 #SBATCH --gres=gpu:high_perf:3
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
@@ -32,5 +32,10 @@ echo "Working directory: $PWD"
 python --version
 nvidia-smi
 wandb status || true
+
+# Optional: populate the RoMa/DINO cache once before launching DDP.
+if [[ "${ROMA_PREFLIGHT:-0}" == "1" ]]; then
+    python -m scripts.check_romav2 --setting "${ROMA_SETTING:-fast}"
+fi
 
 python -m src.main "+experiment=${EXPERIMENT:-re10k_moment}" wandb.mode=online "$@"

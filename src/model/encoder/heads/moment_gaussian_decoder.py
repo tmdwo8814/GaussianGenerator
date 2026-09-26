@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from ...types import Gaussians
-from ..common.sparse_knn import build_knn, validate_points
+from ..common.sparse_knn import build_knn, build_partitioned_knn, validate_points
 from ..common.sparse_feature_pool import pool_features
 
 
@@ -216,12 +216,15 @@ class MomentGaussianDecoder(nn.Module):
             opacities=-torch.expm1(-mass),
         )
 
-    def forward(self, points: Tensor, features: Tensor) -> Gaussians:
+    def forward(self, points: Tensor, features: Tensor,
+                partitions: list[tuple[int, ...] | None] | None = None) -> Gaussians:
         """[B, M, 3] points + [B, M, D] features -> standard Gaussians.
 
         M can represent pixels, voxels or tokens from any number of views.
         All points in one batch item must already share a coordinate frame.
         Output slot order is exactly the input support order.
+        Optional per-scene partitions restrict search after failed registration;
+        None retains the original global kNN path exactly.
         """
         if points.ndim != 3 or points.shape[-1] != 3 or min(points.shape[:2]) < 1:
             raise ValueError("points must have shape [B, M, 3], with B, M > 0")
@@ -229,6 +232,10 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError("features must have shape [B, M, feature_dim]")
         if points.device != features.device:
             raise ValueError("points and features must share a device")
+        if partitions is None:
+            partitions = [None] * len(points)
+        if len(partitions) != len(points):
+            raise ValueError("Provide one partition entry per scene")
 
         moments = []
         with torch.autocast(device_type=points.device.type, enabled=False):
@@ -239,12 +246,18 @@ class MomentGaussianDecoder(nn.Module):
             scene_scales = search_points.detach().norm(dim=-1).median(dim=-1).values.clamp_min(
                 self.cfg.scene_epsilon
             )
-            for scene_points, scene_features, scene_scale in zip(
-                    search_points, features.float(), scene_scales):
-                neighbors = build_knn(scene_points, self.cfg.num_neighbors,
-                                      self.cfg.knn_workers, self.cfg.knn_backend,
-                                      check_finite=False,
-                                      query_backend=self.cfg.knn_query_backend)
+            for scene_points, scene_features, scene_scale, sizes in zip(
+                    search_points, features.float(), scene_scales, partitions):
+                if sizes is None:
+                    neighbors = build_knn(scene_points, self.cfg.num_neighbors,
+                                          self.cfg.knn_workers, self.cfg.knn_backend,
+                                          check_finite=False,
+                                          query_backend=self.cfg.knn_query_backend)
+                else:
+                    neighbors = build_partitioned_knn(
+                        scene_points, sizes, self.cfg.num_neighbors,
+                        self.cfg.knn_workers, self.cfg.knn_backend,
+                        query_backend=self.cfg.knn_query_backend)
                 normalized = scene_points / scene_scale
                 q = self.predict_allocation(normalized, scene_features, neighbors)
                 moments.append(self.aggregate_moments(normalized, scene_features, neighbors, q))

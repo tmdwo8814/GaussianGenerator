@@ -1,0 +1,5 @@
+# Install into the existing working NoPoSplat environment; preserve CUDA 12.8 torch.
+-r requirements-fast.txt
+torch==2.11.0
+torchvision==0.26.0
+-e ./RoMaV2
