@@ -196,8 +196,12 @@ class MatcherTeacherTests(unittest.TestCase):
         self.assertIsNone(owner.model)
         rgb = torch.rand(2, 2, 3, 16, 16)
         def match(source, reference):
-            torch.testing.assert_close(source, rgb[1, 1])
-            torch.testing.assert_close(reference, rgb[1, 0])
+            # RoMa checks dimension 1 for RGB channels before adding any batch
+            # dimension. A permissive CHW mock used to hide the integration bug.
+            self.assertEqual(source.shape, (1, 3, 16, 16))
+            self.assertEqual(reference.shape, (1, 3, 16, 16))
+            torch.testing.assert_close(source[0], rgb[1, 1])
+            torch.testing.assert_close(reference[0], rgb[1, 0])
             field = identity_field().values.permute(0, 2, 3, 1)
             return {'warp_AB': field[..., :2], 'overlap_AB': field[..., 2:]}
         owner.model = SimpleNamespace(match=match)
@@ -207,6 +211,36 @@ class MatcherTeacherTests(unittest.TestCase):
         self.assertEqual(field.scene, 1)
         self.assertEqual(torch.get_float32_matmul_precision(), precision)
         self.assertEqual(field.values.shape, (1, 3, 32, 32))
+
+    def test_teacher_accepts_real_romav2_tensor_loader_without_model_weights(self):
+        # Exercise the cloned API's real input checks without importing/loading
+        # its heavy network. Optional when the third-party checkout is absent.
+        path = ROOT / 'RoMaV2/src/romav2/romav2.py'
+        if not path.exists():
+            self.skipTest('RoMaV2 checkout is required for its input-loader check')
+        import numpy as np
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'RoMaV2')
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == '_load_image')
+        namespace = {'torch': torch, 'Path': Path, 'np': np, 'ImageLike': object,
+                     'Image': SimpleNamespace(Image=type('UnusedPILImage', (), {})),
+                     'device': torch.device('cpu')}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), namespace)
+        loader = namespace['_load_image']
+        for batch_size, scene in ((1, 0), (3, 2)):
+            with self.subTest(batch_size=batch_size):
+                owner = teacher.DescriptorTeacher(teacher.DescriptorTeacherCfg())
+                rgb = torch.rand(batch_size, 2, 3, 16, 16)
+                def match(source, reference):
+                    source, reference = loader(None, source), loader(None, reference)
+                    self.assertEqual(source.shape, (1, 3, 16, 16))
+                    self.assertEqual(reference.shape, (1, 3, 16, 16))
+                    torch.testing.assert_close(source[0], rgb[scene, 1])
+                    torch.testing.assert_close(reference[0], rgb[scene, 0])
+                    field = identity_field().values.permute(0, 2, 3, 1)
+                    return {'warp_AB': field[..., :2], 'overlap_AB': field[..., 2:]}
+                owner.model = SimpleNamespace(match=match)
+                self.assertEqual(owner.prepare(rgb, scene).scene, scene)
 
     def test_default_256_channel_256_image_forward_and_support_count(self):
         model = alignment.SupportAlignment(alignment.SupportAlignmentCfg(), 256)

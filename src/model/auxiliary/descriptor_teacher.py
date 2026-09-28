@@ -177,7 +177,9 @@ class DescriptorTeacher:
             with device_context, torch.autocast(device_type=rgb.device.type, enabled=False):
                 model = self._model(rgb.device)
                 # RoMa AB means first argument -> second: source B -> reference A.
-                prediction = model.match(rgb[scene, 1].float(), rgb[scene, 0].float())
+                # Its tensor loader requires BCHW; retain a singleton scene batch.
+                prediction = model.match(rgb[scene:scene + 1, 1].float(),
+                                         rgb[scene:scene + 1, 0].float())
                 values = torch.cat((prediction['warp_AB'], prediction['overlap_AB']), -1)
                 values = values.permute(0, 3, 1, 2).contiguous().float()
         finally:
