@@ -1,5 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Optional, Protocol, runtime_checkable, Any
 
 import moviepy.editor as mpy
@@ -43,6 +44,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .auxiliary.descriptor_teacher import DescriptorTeacher, DescriptorTeacherCfg
 
 
 @dataclass
@@ -72,6 +74,7 @@ class TrainCfg:
     print_log_every_n_steps: int
     distiller: str
     distill_max_steps: int
+    descriptor_teacher: DescriptorTeacherCfg = field(default_factory=DescriptorTeacherCfg)
 
 
 @runtime_checkable
@@ -121,6 +124,16 @@ class ModelWrapper(LightningModule):
         self.decoder = decoder
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
+        self.descriptor_teacher = None
+        if train_cfg.descriptor_teacher.enabled:
+            if getattr(encoder, 'support_alignment', None) is None:
+                raise ValueError('descriptor_teacher requires model.encoder.support_alignment.enabled=true')
+            self.descriptor_teacher = DescriptorTeacher(train_cfg.descriptor_teacher)
+        self._alignment_timings = {}
+        self._alignment_completed_timings = {}
+        self._alignment_previous_start = None
+        self._alignment_wall_sum = 0.
+        self._alignment_wall_count = 0
 
         self.distiller = distiller
         self.distiller_loss = None
@@ -150,6 +163,20 @@ class ModelWrapper(LightningModule):
                         else:
                             raise NotImplementedError
             batch = batch_combined
+        # Teacher sees augmented CONTEXT RGB before the encoder normalization,
+        # and runs before allocating the main model's autograd graph.
+        prepared, alignment_dump = None, None
+        if self.descriptor_teacher is not None:
+            teacher_cfg = self.train_cfg.descriptor_teacher
+            logging = self.global_step == 0 or (self.global_step + 1) % teacher_cfg.log_every_n_steps == 0
+            rgb = batch['context']['image']
+            timer = self._alignment_timer_start(logging, rgb.device)
+            prepared = self.descriptor_teacher.prepare(rgb, self.global_step)
+            self._alignment_timer_end('teacher_ms', timer)
+            alignment_dump = {
+                'scene': prepared.scene if prepared is not None else 0,
+                'log': logging, 'apply': self.global_step >= teacher_cfg.warmup_steps,
+            }
         batch: BatchedExample = self.data_shim(batch)
         _, _, _, h, w = batch["target"]["image"].shape
 
@@ -157,7 +184,23 @@ class ModelWrapper(LightningModule):
         visualization_dump = None
         if self.distiller is not None:
             visualization_dump = {}
-        gaussians = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
+        encoder_kwargs = {'alignment_dump': alignment_dump} if alignment_dump is not None else {}
+        gaussians = self.encoder(batch["context"], self.global_step,
+                                 visualization_dump=visualization_dump, **encoder_kwargs)
+        alignment_loss, alignment_metrics = None, {}
+        if self.descriptor_teacher is not None:
+            timer = self._alignment_timer_start(alignment_dump['log'], gaussians.means.device)
+            alignment_loss, teacher_metrics = self.descriptor_teacher.loss(
+                self.encoder.support_alignment, alignment_dump, prepared)
+            self._alignment_timer_end('supervision_forward_ms', timer)
+            if 'timing' in alignment_dump:
+                self._alignment_timings['student_forward_ms'] = alignment_dump['timing']
+            alignment_metrics = {f'align/{k}': v for k, v in alignment_dump.get('metrics', {}).items()}
+            alignment_metrics.update({f'align_teacher/{k}': v for k, v in teacher_metrics.items()})
+            alignment_metrics['align/warmup'] = gaussians.means.new_tensor(not alignment_dump['apply'])
+            # Release dense teacher output and full-feature views before rendering.
+            del prepared
+            alignment_dump.clear()
         output = self.decoder.forward(
             gaussians,
             batch["target"]["extrinsics"],
@@ -194,6 +237,11 @@ class ModelWrapper(LightningModule):
             self.log("loss/distillation_loss", distillation_loss)
             total_loss = total_loss + distillation_loss
 
+        if alignment_loss is not None:
+            total_loss = total_loss + alignment_loss
+            self.log('loss/alignment_teacher', alignment_loss)
+            if self.global_step == 0 or (self.global_step + 1) % self.train_cfg.descriptor_teacher.log_every_n_steps == 0:
+                self._log_alignment_metrics(alignment_metrics)
         self.log("loss/total", total_loss)
 
         if (
@@ -213,6 +261,58 @@ class ModelWrapper(LightningModule):
             self.step_tracker.set_step(self.global_step)
 
         return total_loss
+
+    @staticmethod
+    def _alignment_timer_start(enabled, device):
+        if not enabled or device.type != 'cuda':
+            return None
+        timer = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        timer[0].record()
+        return timer
+
+    def _alignment_timer_end(self, name, timer):
+        if timer is not None:
+            timer[1].record()
+            self._alignment_timings[name] = timer
+
+    def _log_alignment_metrics(self, metrics):
+        # One packed collective per log interval, not one collective per scalar.
+        # NaN means no valid measurement, not a zero residual / successful fit.
+        device = next(iter(metrics.values())).device
+        if self._alignment_wall_count:
+            metrics['align_perf/step_wall_ms_mean'] = torch.tensor(
+                self._alignment_wall_sum / self._alignment_wall_count, device=device)
+        else:
+            metrics['align_perf/step_wall_ms_mean'] = torch.tensor(float('nan'), device=device)
+        self._alignment_wall_sum, self._alignment_wall_count = 0., 0
+        if device.type == 'cuda':
+            for name in ('teacher_ms', 'student_forward_ms', 'supervision_forward_ms'):
+                metrics[f'align_perf/{name}'] = torch.tensor(
+                    self._alignment_completed_timings.pop(name, float('nan')), device=device)
+            metrics['align_perf/torch_peak_allocated_gib'] = torch.tensor(
+                torch.cuda.max_memory_allocated(device) / 2**30, device=device)
+        names = sorted(metrics)
+        values = torch.stack([metrics[name].detach().float() for name in names])
+        finite = values.isfinite()
+        packed = torch.stack((torch.where(finite, values, 0), finite.float()))
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(packed)
+        values = torch.where(packed[1] > 0, packed[0] / packed[1].clamp_min(1), float('nan'))
+        self.log_dict(dict(zip(names, values)), on_step=True, on_epoch=False,
+                      sync_dist=False, rank_zero_only=True)
+
+    def on_train_batch_start(self, batch, batch_idx):
+        # Read completed events on the next batch; no cuda.synchronize in logging.
+        if self.descriptor_teacher is not None:
+            now = perf_counter()
+            if self._alignment_previous_start is not None:
+                self._alignment_wall_sum += (now - self._alignment_previous_start) * 1000
+                self._alignment_wall_count += 1
+            self._alignment_previous_start = now
+        for name, (start, end) in list(self._alignment_timings.items()):
+            if end.query():
+                self._alignment_completed_timings[name] = start.elapsed_time(end)
+                del self._alignment_timings[name]
 
     def _eval_step(self) -> int:
         return getattr(self, "_auto_eval_step", self.global_step)
@@ -768,7 +868,7 @@ class ModelWrapper(LightningModule):
             if not param.requires_grad:
                 continue
 
-            if any(module in name for module in ("gaussian_param_head", "gaussian_decoder", "intrinsic_encoder")):
+            if any(module in name for module in ("gaussian_param_head", "gaussian_decoder", "support_alignment", "intrinsic_encoder")):
                 new_params.append(param)
                 new_param_names.append(name)
             else:

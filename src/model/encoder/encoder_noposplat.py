@@ -12,6 +12,7 @@ from .backbone.croco.misc import transpose_to_landscape
 from .heads import head_factory
 from .heads.dpt_feature_head import create_dpt_feature_head
 from .heads.moment_gaussian_decoder import MomentDecoderCfg, MomentGaussianDecoder
+from .common.support_alignment import SupportAlignment, SupportAlignmentCfg
 from ...dataset.shims.bounds_shim import apply_bounds_shim
 from ...dataset.shims.normalize_shim import apply_normalize_shim
 from ...dataset.shims.patch_shim import apply_patch_shim
@@ -52,6 +53,7 @@ class EncoderNoPoSplatCfg:
     pretrained_weights: str = ""
     pose_free: bool = True
     moment_decoder: MomentDecoderCfg = field(default_factory=MomentDecoderCfg)
+    support_alignment: SupportAlignmentCfg = field(default_factory=SupportAlignmentCfg)
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -104,6 +106,8 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
             self.gaussian_param_head = create_dpt_feature_head(self.backbone, cfg.moment_decoder.feature_dim)
             self.gaussian_param_head2 = create_dpt_feature_head(self.backbone, cfg.moment_decoder.feature_dim)
             self.gaussian_decoder = MomentGaussianDecoder(cfg.moment_decoder, cfg.gaussian_adapter.sh_degree)
+            self.support_alignment = (SupportAlignment(cfg.support_alignment, cfg.moment_decoder.feature_dim)
+                                      if cfg.support_alignment.enabled else None)
         elif head_type == 'linear':
             self.gaussian_param_head = nn.Sequential(
                 nn.ReLU(),
@@ -150,6 +154,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         context: dict,
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
+        alignment_dump: Optional[dict] = None,
     ) -> Gaussians:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
@@ -189,11 +194,21 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
             # Release unused converted layers before the large decoder stage;
             # autograd retains only tensors actually needed by the two heads.
             del moment_tokens1, moment_tokens2
-            # Both point maps are already in NoPoSplat's common canonical frame.
-            # Keep view-major ordering; each point carries its own pixel feature.
+            # Preserve view-major ordering and the point-feature correspondence.
             points = torch.cat((res1['pts3d'].reshape(b, h * w, 3),
                                 res2['pts3d'].reshape(b, h * w, 3)), dim=1)
             features = torch.cat((GS_res1, GS_res2), dim=1)
+            aligner = getattr(self, 'support_alignment', None)
+            if aligner is not None:
+                timing = None
+                if alignment_dump is not None and alignment_dump.get('log', False) and points.is_cuda:
+                    timing = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                    timing[0].record()
+                points = aligner(points.reshape(b, v, h * w, 3),
+                                 features.reshape(b, v, h * w, -1), (h, w), alignment_dump).flatten(1, 2)
+                if timing is not None:
+                    timing[1].record()
+                    alignment_dump['timing'] = timing
             gaussians = self.gaussian_decoder(points, features)
             if visualization_dump is not None:
                 means = gaussians.means.reshape(b, v, h, w, 1, 3)

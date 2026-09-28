@@ -188,8 +188,12 @@ class MomentDecoderTests(unittest.TestCase):
         decoder_cfg = from_dict(Cfg, OmegaConf.to_container(cfg.model.encoder.moment_decoder))
         self.assertEqual(decoder_cfg.feature_dim, 256)
         self.assertEqual(decoder_cfg.num_neighbors, 16)
-        for key in ("dataset", "data_loader", "optimizer", "trainer", "test", "loss", "train"):
+        self.assertTrue(cfg.model.encoder.support_alignment.enabled)
+        self.assertTrue(cfg.train.descriptor_teacher.enabled)
+        for key in ("dataset", "data_loader", "optimizer", "trainer", "test", "loss"):
             self.assertEqual(OmegaConf.to_container(cfg[key]), OmegaConf.to_container(baseline[key]))
+        for key in baseline.train:
+            self.assertEqual(cfg.train[key], baseline.train[key])
 
     def test_encoder_integration_uses_only_context_and_preserves_slot_order(self):
         # Run the production encoder forward with a tiny front end. DPT itself

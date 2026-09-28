@@ -5,8 +5,8 @@ defaults:
   - _self_
 
 wandb:
-  name: gaussian_decoder_dpt256
-  tags: [re10k, 256x256, moment_decoder]
+  name: gaussian_decoder_dpt256_sim3
+  tags: [re10k, 256x256, moment_decoder, sim3_alignment]
 
 model:
   encoder:
@@ -28,3 +28,24 @@ model:
       covariance_floor: 0.0001  # Standard deviation relative to scene scale.
       mass_epsilon: 0.000001
       scene_epsilon: 0.000001
+    support_alignment:
+      enabled: true
+      descriptor_dim: 32  # Matching only; moment decoding keeps all 256 DPT channels.
+      hidden_dim: 64
+      source_grid: 16
+      target_grid: 32
+      extra_cells: 64  # Four fixed quarter-cell positions each; total queries = 512.
+      fine_window: 16
+      temperature: 0.1
+
+train:
+  descriptor_teacher:
+    enabled: true
+    setting: fast
+    every_n_steps: 1  # One rotating scene per GPU, not the full local batch.
+    warmup_steps: 1000  # Main photometric training continues; apply Sim(3) after this.
+    match_weight: 0.05
+    alignment_weight: 0.05
+    min_confidence: 0.5
+    correctness_pixels: 2.0
+    log_every_n_steps: 50
