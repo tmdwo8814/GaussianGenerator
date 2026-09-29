@@ -188,6 +188,11 @@ class MomentDecoderTests(unittest.TestCase):
         decoder_cfg = from_dict(Cfg, OmegaConf.to_container(cfg.model.encoder.moment_decoder))
         self.assertEqual(decoder_cfg.feature_dim, 256)
         self.assertEqual(decoder_cfg.num_neighbors, 16)
+        self.assertTrue(decoder_cfg.appearance_2d)
+        self.assertEqual(decoder_cfg.appearance_2d_radii, [1, 4])
+        self.assertEqual(decoder_cfg.appearance_dim, 32)
+        self.assertEqual(cfg.checkpointing.load, baseline.checkpointing.load)
+        self.assertEqual(cfg.model.encoder.pretrained_weights, baseline.model.encoder.pretrained_weights)
         for key in ("dataset", "data_loader", "optimizer", "trainer", "test", "loss", "train"):
             self.assertEqual(OmegaConf.to_container(cfg[key]), OmegaConf.to_container(baseline[key]))
 
@@ -225,9 +230,23 @@ class MomentDecoderTests(unittest.TestCase):
         encoder.gaussian_param_head = FeatureHead()
         encoder.gaussian_param_head2 = FeatureHead()
         # K=1 makes the expected ordering unambiguous: means must equal supports.
-        encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, num_neighbors=1))
+        encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, num_neighbors=1, appearance_2d=True))
+        encoder.cfg = SimpleNamespace(input_mean=(.1, .2, .3), input_std=(.2, .3, .4))
+        observed = {}
+
+        def observe_input(module, args, kwargs):
+            observed.update(kwargs)
+
+        encoder.gaussian_decoder.register_forward_pre_hook(observe_input, with_kwargs=True)
+        raw_rgb = torch.rand(1, 2, 3, 2, 2)
+        image = ((raw_rgb - torch.tensor(encoder.cfg.input_mean)[None, None, :, None, None])
+                 / torch.tensor(encoder.cfg.input_std)[None, None, :, None, None])
         dump = {}
-        result = encoder({"image": torch.randn(1, 2, 3, 2, 2)}, visualization_dump=dump)
+        diagnostics = {}
+        result = encoder({"image": image}, visualization_dump=dump, diagnostics_dump=diagnostics)
+        torch.testing.assert_close(observed['rgb'], rearrange(raw_rgb, 'b v c h w -> b (v h w) c'))
+        self.assertEqual(observed['image_shape'], (2, 2, 2))
+        self.assertIn('image_weight', diagnostics)
         torch.testing.assert_close(result.means, encoder.supports.reshape(1, 8, 3))
         self.assertEqual(dump["means"].shape, (1, 2, 2, 2, 1, 3))
         self.assertEqual(dump["depth"].shape, (1, 2, 2, 2, 1, 1))
@@ -249,7 +268,7 @@ class MomentDecoderTests(unittest.TestCase):
         model.encoder = nn.Module()
         model.encoder.backbone = nn.Linear(3, 3)
         model.encoder.gaussian_param_head = nn.Linear(3, 5)
-        model.encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, hidden_dim=8))
+        model.encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, hidden_dim=8, appearance_2d=True))
         model.optimizer_cfg = SimpleNamespace(lr=1e-4, backbone_lr_multiplier=.1, warm_up_steps=2)
         optimizer = namespace["configure_optimizers"](model)["optimizer"]
         new_ids = {id(p) for p in optimizer.param_groups[0]["params"]}

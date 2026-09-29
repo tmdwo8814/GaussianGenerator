@@ -5,8 +5,8 @@ defaults:
   - _self_
 
 wandb:
-  name: gaussian_decoder_dpt256
-  tags: [re10k, 256x256, moment_decoder]
+  name: 2DKNN-16
+  tags: [re10k, 256x256, moment_decoder, appearance_2d]
 
 model:
   encoder:
@@ -14,6 +14,10 @@ model:
     moment_decoder:
       feature_dim: 256
       hidden_dim: 64
+      appearance_2d: true
+      appearance_dim: 32  # Compact extra context; keep the original DPT256 path.
+      appearance_2d_radii: [1, 4]  # Eight image neighbors per radius, same source view.
+      log_every_n_steps: 50  # Detached candidate/selection and image-edge metrics.
       num_neighbors: 16  # Includes self; candidates span both views.
       chunk_size: 32768
       checkpoint_chunks: true

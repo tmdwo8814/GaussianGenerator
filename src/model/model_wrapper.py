@@ -42,6 +42,7 @@ from ..visualization.layout import add_border, hcat, vcat
 from ..visualization.validation_in_3d import render_cameras, render_projections
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
+from .encoder.common.image_neighborhood_appearance import image_error_statistics
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 
 
@@ -157,7 +158,21 @@ class ModelWrapper(LightningModule):
         visualization_dump = None
         if self.distiller is not None:
             visualization_dump = {}
-        gaussians = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
+        diagnostics = None
+        encoder_kwargs = {}
+        moment_decoder = getattr(self.encoder, 'gaussian_decoder', None)
+        if moment_decoder is not None and getattr(moment_decoder.cfg, 'appearance_2d', False):
+            interval = moment_decoder.cfg.log_every_n_steps
+            if interval:
+                # Match Lightning's step-log flush schedule so sparse W&B
+                # diagnostics are actually emitted. Zero disables their cost.
+                flush = max(1, self.trainer.log_every_n_steps)
+                interval = ((interval + flush - 1) // flush) * flush
+                if (self.global_step + 1) % interval == 0:
+                    diagnostics = {}
+                    encoder_kwargs['diagnostics_dump'] = diagnostics
+        gaussians = self.encoder(batch["context"], self.global_step,
+                                 visualization_dump=visualization_dump, **encoder_kwargs)
         output = self.decoder.forward(
             gaussians,
             batch["target"]["extrinsics"],
@@ -168,6 +183,10 @@ class ModelWrapper(LightningModule):
             depth_mode=self.train_cfg.depth_mode,
         )
         target_gt = batch["target"]["image"]
+        if diagnostics is not None:
+            diagnostics.update(image_error_statistics(output.color, target_gt))
+            self.log_dict({f'appearance_2d/{key}': value for key, value in diagnostics.items()},
+                          on_step=True, on_epoch=False, sync_dist=True)
 
         # Compute metrics.
         psnr_probabilistic = compute_psnr(

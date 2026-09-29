@@ -150,6 +150,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         context: dict,
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
+        diagnostics_dump: Optional[dict] = None,
     ) -> Gaussians:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
@@ -194,7 +195,15 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
             points = torch.cat((res1['pts3d'].reshape(b, h * w, 3),
                                 res2['pts3d'].reshape(b, h * w, 3)), dim=1)
             features = torch.cat((GS_res1, GS_res2), dim=1)
-            gaussians = self.gaussian_decoder(points, features)
+            appearance_kwargs = {}
+            if self.gaussian_decoder.cfg.appearance_2d:
+                # Source-pixel correspondence is known. Undo the context input
+                # normalization without using target images or camera poses.
+                rgb = rearrange(context['image'][:, :, :3], 'b v c h w -> b (v h w) c').float()
+                rgb = rgb * rgb.new_tensor(self.cfg.input_std) + rgb.new_tensor(self.cfg.input_mean)
+                appearance_kwargs = {'image_shape': (v, h, w), 'rgb': rgb,
+                                     'diagnostics': diagnostics_dump}
+            gaussians = self.gaussian_decoder(points, features, **appearance_kwargs)
             if visualization_dump is not None:
                 means = gaussians.means.reshape(b, v, h, w, 1, 3)
                 visualization_dump['means'] = means
