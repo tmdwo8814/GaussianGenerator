@@ -17,6 +17,8 @@ from torch.utils.checkpoint import checkpoint
 from ...types import Gaussians
 from ..common.sparse_knn import build_knn, validate_points
 from ..common.sparse_feature_pool import pool_features
+from ..common.group_aware_refinement import GroupAwareRefinement
+from ..common.refinement_diagnostics import summarize_refinement
 
 
 @dataclass
@@ -37,6 +39,9 @@ class MomentDecoderCfg:
     covariance_floor: float = 1e-4  # standard deviation / scene scale
     mass_epsilon: float = 1e-6
     scene_epsilon: float = 1e-6
+    group_aware_refine: bool = False
+    refine_hidden_dim: int = 32
+    log_every_n_steps: int = 50  # 0 disables detached diagnostics
 
 
 class MomentGaussianDecoder(nn.Module):
@@ -58,6 +63,8 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError("Covariance floor and epsilons must be positive")
         if sh_degree < 0:
             raise ValueError("sh_degree must be nonnegative")
+        if cfg.refine_hidden_dim < 1 or cfg.log_every_n_steps < 0:
+            raise ValueError("refine_hidden_dim must be positive; log_every_n_steps must be nonnegative")
 
         self.allocation_head = nn.Sequential(
             nn.Linear(2 * cfg.feature_dim + 4, cfg.hidden_dim),
@@ -86,6 +93,12 @@ class MomentGaussianDecoder(nn.Module):
         for degree in range(1, sh_degree + 1):
             sh_mask[degree**2 : (degree + 1)**2] = 0.1 * 0.25**degree
         self.register_buffer("sh_mask", sh_mask, persistent=False)
+        self.group_refiner = None
+        if cfg.group_aware_refine:
+            # Keep the original heads AND subsequent modules' initialization
+            # identical for a fixed seed when this experiment is enabled.
+            with torch.random.fork_rng(devices=[]):
+                self.group_refiner = GroupAwareRefinement(cfg.refine_hidden_dim)
 
     def _run_chunk(self, function, *args):
         if self.cfg.checkpoint_chunks and self.training and torch.is_grad_enabled():
@@ -95,7 +108,7 @@ class MomentGaussianDecoder(nn.Module):
         return function(*args)
 
     def _allocation_chunk(self, source_points, source_projection, budget,
-                          points, destination_projection, neighbors):
+                          points, destination_projection, neighbors, return_logits=False):
         delta = source_points[:, None] - points[neighbors]
         geometry = torch.cat((delta, delta.square().sum(-1, keepdim=True)), dim=-1)
         first = self.allocation_head[0]
@@ -105,10 +118,11 @@ class MomentGaussianDecoder(nn.Module):
                   + F.linear(geometry, first.weight[:, 2 * self.cfg.feature_dim:], first.bias))
         logits = self.allocation_head[2](self.allocation_head[1](hidden)).squeeze(-1)
         allocation = logits.softmax(dim=-1)  # sum_k A[j, k] = 1
-        return allocation * budget  # q[j, k] = A_ij * b_j
+        q = allocation * budget  # q[j, k] = A_ij * b_j
+        return (q, logits) if return_logits else q
 
     def predict_allocation(self, points: Tensor, features: Tensor,
-                           neighbors: Tensor) -> Tensor:
+                           neighbors: Tensor, return_logits: bool = False):
         """Normalized coordinates in; sparse outgoing mass q [M, K] out."""
         # Project each support once instead of repeating a 128->64 projection
         # for every edge. These projections remain in the autograd graph.
@@ -126,8 +140,11 @@ class MomentGaussianDecoder(nn.Module):
             stop = start + self.cfg.chunk_size
             chunks.append(self._run_chunk(
                 self._allocation_chunk, points[start:stop], source_projection[start:stop],
-                budget[start:stop], points, destination_projection, neighbors[start:stop],
+                budget[start:stop], points, destination_projection, neighbors[start:stop], return_logits,
             ))
+        if return_logits:
+            allocations, logits = zip(*chunks)
+            return torch.cat(allocations, 0), torch.cat(logits, 0), budget
         return torch.cat(chunks, dim=0)
 
     @staticmethod
@@ -216,7 +233,7 @@ class MomentGaussianDecoder(nn.Module):
             opacities=-torch.expm1(-mass),
         )
 
-    def forward(self, points: Tensor, features: Tensor) -> Gaussians:
+    def forward(self, points: Tensor, features: Tensor, diagnostics: dict | None = None) -> Gaussians:
         """[B, M, 3] points + [B, M, D] features -> standard Gaussians.
 
         M can represent pixels, voxels or tokens from any number of views.
@@ -231,6 +248,7 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError("points and features must share a device")
 
         moments = []
+        statistics = []
         with torch.autocast(device_type=points.device.type, enabled=False):
             search_points = points.float()
             # One host-visible finite check per batch, not one per scene.
@@ -246,8 +264,32 @@ class MomentGaussianDecoder(nn.Module):
                                       check_finite=False,
                                       query_backend=self.cfg.knn_query_backend)
                 normalized = scene_points / scene_scale
-                q = self.predict_allocation(normalized, scene_features, neighbors)
+                if self.group_refiner is None:
+                    q = self.predict_allocation(normalized, scene_features, neighbors)
+                else:
+                    q, logits, budget = self.predict_allocation(
+                        normalized, scene_features, neighbors, return_logits=True,
+                    )
+                    # Reuse the existing appearance head. Masked SH coefficients
+                    # are a view-independent proxy for appearance agreement.
+                    sh = self.sh_head(scene_features).reshape(-1, 3, self.d_sh)
+                    sh = (sh * self.sh_mask).flatten(1)
+                    q, stats = self.group_refiner(
+                        normalized, sh, neighbors, q, logits, budget,
+                        epsilon=self.cfg.mass_epsilon, chunk_size=self.cfg.chunk_size,
+                        checkpoint_chunks=self.cfg.checkpoint_chunks,
+                        collect_statistics=diagnostics is not None,
+                    )
+                    if stats is not None:
+                        statistics.append(stats)
+                # One shared FINAL allocation generates every attribute.
                 moments.append(self.aggregate_moments(normalized, scene_features, neighbors, q))
             batched_moments = [torch.stack(values) for values in zip(*moments)]
             del moments
-            return self.build_gaussians(*batched_moments, scene_scales)
+            gaussians = self.build_gaussians(*batched_moments, scene_scales)
+            if diagnostics is not None and statistics:
+                diagnostics.update(summarize_refinement(
+                    torch.stack(statistics), batched_moments[0], gaussians.covariances,
+                    scene_scales, self.cfg.mass_epsilon,
+                ))
+            return gaussians

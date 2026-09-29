@@ -188,6 +188,10 @@ class MomentDecoderTests(unittest.TestCase):
         decoder_cfg = from_dict(Cfg, OmegaConf.to_container(cfg.model.encoder.moment_decoder))
         self.assertEqual(decoder_cfg.feature_dim, 256)
         self.assertEqual(decoder_cfg.num_neighbors, 16)
+        self.assertTrue(decoder_cfg.group_aware_refine)
+        self.assertEqual(decoder_cfg.refine_hidden_dim, 32)
+        self.assertEqual(cfg.checkpointing.load, baseline.checkpointing.load)
+        self.assertEqual(cfg.model.encoder.pretrained_weights, baseline.model.encoder.pretrained_weights)
         for key in ("dataset", "data_loader", "optimizer", "trainer", "test", "loss", "train"):
             self.assertEqual(OmegaConf.to_container(cfg[key]), OmegaConf.to_container(baseline[key]))
 
@@ -225,9 +229,12 @@ class MomentDecoderTests(unittest.TestCase):
         encoder.gaussian_param_head = FeatureHead()
         encoder.gaussian_param_head2 = FeatureHead()
         # K=1 makes the expected ordering unambiguous: means must equal supports.
-        encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, num_neighbors=1))
+        encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, num_neighbors=1, group_aware_refine=True))
         dump = {}
-        result = encoder({"image": torch.randn(1, 2, 3, 2, 2)}, visualization_dump=dump)
+        diagnostics = {}
+        result = encoder({"image": torch.randn(1, 2, 3, 2, 2)}, visualization_dump=dump,
+                         diagnostics_dump=diagnostics)
+        self.assertIn('allocation_tv', diagnostics)
         torch.testing.assert_close(result.means, encoder.supports.reshape(1, 8, 3))
         self.assertEqual(dump["means"].shape, (1, 2, 2, 2, 1, 3))
         self.assertEqual(dump["depth"].shape, (1, 2, 2, 2, 1, 1))
@@ -249,7 +256,7 @@ class MomentDecoderTests(unittest.TestCase):
         model.encoder = nn.Module()
         model.encoder.backbone = nn.Linear(3, 3)
         model.encoder.gaussian_param_head = nn.Linear(3, 5)
-        model.encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, hidden_dim=8))
+        model.encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, hidden_dim=8, group_aware_refine=True))
         model.optimizer_cfg = SimpleNamespace(lr=1e-4, backbone_lr_multiplier=.1, warm_up_steps=2)
         optimizer = namespace["configure_optimizers"](model)["optimizer"]
         new_ids = {id(p) for p in optimizer.param_groups[0]["params"]}

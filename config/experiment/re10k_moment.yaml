@@ -5,13 +5,17 @@ defaults:
   - _self_
 
 wandb:
-  name: gaussian_decoder_dpt256
-  tags: [re10k, 256x256, moment_decoder]
+  name: group-aware-refine
+  tags: [re10k, 256x256, moment_decoder, group_aware_refine]
 
 model:
   encoder:
     gs_params_head_type: moment
     moment_decoder:
+      # Experiment 2: one group-aware redistribution on the existing kNN graph.
+      group_aware_refine: true
+      refine_hidden_dim: 32
+      log_every_n_steps: 50
       feature_dim: 256
       hidden_dim: 64
       num_neighbors: 16  # Includes self; candidates span both views.
