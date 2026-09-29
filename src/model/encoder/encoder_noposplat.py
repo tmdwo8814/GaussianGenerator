@@ -150,6 +150,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         context: dict,
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
+        diagnostics_dump: Optional[dict] = None,
     ) -> Gaussians:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
@@ -194,7 +195,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
             points = torch.cat((res1['pts3d'].reshape(b, h * w, 3),
                                 res2['pts3d'].reshape(b, h * w, 3)), dim=1)
             features = torch.cat((GS_res1, GS_res2), dim=1)
-            gaussians = self.gaussian_decoder(points, features)
+            gaussians = self.gaussian_decoder(points, features, diagnostics=diagnostics_dump)
             if visualization_dump is not None:
                 means = gaussians.means.reshape(b, v, h, w, 1, 3)
                 visualization_dump['means'] = means

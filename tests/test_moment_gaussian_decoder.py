@@ -187,7 +187,8 @@ class MomentDecoderTests(unittest.TestCase):
         self.assertEqual(cfg.model.encoder.gs_params_head_type, "moment")
         decoder_cfg = from_dict(Cfg, OmegaConf.to_container(cfg.model.encoder.moment_decoder))
         self.assertEqual(decoder_cfg.feature_dim, 256)
-        self.assertEqual(decoder_cfg.num_neighbors, 16)
+        self.assertEqual(decoder_cfg.num_neighbors, 32)
+        self.assertTrue(decoder_cfg.separate_appearance)
         for key in ("dataset", "data_loader", "optimizer", "trainer", "test", "loss", "train"):
             self.assertEqual(OmegaConf.to_container(cfg[key]), OmegaConf.to_container(baseline[key]))
 
@@ -249,7 +250,8 @@ class MomentDecoderTests(unittest.TestCase):
         model.encoder = nn.Module()
         model.encoder.backbone = nn.Linear(3, 3)
         model.encoder.gaussian_param_head = nn.Linear(3, 5)
-        model.encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, hidden_dim=8))
+        model.encoder.gaussian_decoder = Decoder(Cfg(feature_dim=5, hidden_dim=8,
+                                                     separate_appearance=True))
         model.optimizer_cfg = SimpleNamespace(lr=1e-4, backbone_lr_multiplier=.1, warm_up_steps=2)
         optimizer = namespace["configure_optimizers"](model)["optimizer"]
         new_ids = {id(p) for p in optimizer.param_groups[0]["params"]}

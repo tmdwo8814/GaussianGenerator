@@ -157,7 +157,23 @@ class ModelWrapper(LightningModule):
         visualization_dump = None
         if self.distiller is not None:
             visualization_dump = {}
-        gaussians = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
+        diagnostics = None
+        encoder_kwargs = {}
+        moment_decoder = getattr(self.encoder, 'gaussian_decoder', None)
+        if moment_decoder is not None:
+            interval = getattr(moment_decoder.cfg, 'log_every_n_steps', 0)
+            if interval:
+                # Match Lightning's flush steps so sparse diagnostics reach W&B.
+                flush = max(1, self.trainer.log_every_n_steps)
+                interval = ((interval + flush - 1) // flush) * flush
+                if (self.global_step + 1) % interval == 0:
+                    diagnostics = {}
+                    encoder_kwargs['diagnostics_dump'] = diagnostics
+        gaussians = self.encoder(batch["context"], self.global_step,
+                                 visualization_dump=visualization_dump, **encoder_kwargs)
+        if diagnostics is not None:
+            self.log_dict({f'moment/{key}': value for key, value in diagnostics.items()},
+                          on_step=True, on_epoch=False, sync_dist=True)
         output = self.decoder.forward(
             gaussians,
             batch["target"]["extrinsics"],

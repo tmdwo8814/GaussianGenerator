@@ -5,8 +5,8 @@ defaults:
   - _self_
 
 wandb:
-  name: gaussian_decoder_dpt256_k32
-  tags: [re10k, 256x256, moment_decoder]
+  name: separate_weight_k16
+  tags: [re10k, 256x256, moment_decoder, separate_weight]
 
 model:
   encoder:
@@ -14,7 +14,9 @@ model:
     moment_decoder:
       feature_dim: 256
       hidden_dim: 64
-      num_neighbors: 32  # Includes self; candidates span both views.
+      separate_appearance: true  # Zero-init per-edge scores; geometry is unchanged.
+      log_every_n_steps: 50  # Detached incoming-weight/covariance diagnostics.
+      num_neighbors: 16  # Includes self; candidates span both views.
       chunk_size: 32768
       checkpoint_chunks: true
       knn_backend: auto  # Exact CuPy GPU KD-tree on CUDA; SciPy on CPU.
