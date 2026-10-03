@@ -1,5 +1,10 @@
 # SH decoding with additional image neighbors
 
+On `exp/appearance-capacity`, the default experiment is the expanded version
+documented in [appearance_capacity.md](appearance_capacity.md). This document
+describes the original single-reader control (`appearance_capacity=false`,
+`separate_appearance=false`, `appearance_2d=true`).
+
 This experiment keeps the original moment decoder's geometry and adds an
 appearance-only neighborhood. A support j still distributes its geometry
 budget to its 16 nearest 3D slots. For SH, its candidates additionally include
