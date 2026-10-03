@@ -3,7 +3,8 @@
 Notation in this file: j is a source SUPPORT and i is a destination SLOT.
 neighbors[j, k] = i, so softmax runs over outgoing candidates (k). Moments
 use index_add over destination i, whose incoming degree is NOT limited to k.
-The decoder takes only points/features, never cameras or target images.
+The optional local CNN additionally needs the source feature raster shape,
+never cameras or target images.
 """
 
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ...types import Gaussians
 from ..common.moment_diagnostics import incoming_statistics, summarize_statistics
+from ..common.local_cnn_appearance import LocalCnnAppearance, source_sh_mean_squares
 from ..common.separate_appearance import appearance_weights
 from ..common.sparse_feature_pool import pool_features
 from ..common.sparse_knn import build_knn, validate_points
@@ -40,6 +42,8 @@ class MomentDecoderCfg:
     mass_epsilon: float = 1e-6
     scene_epsilon: float = 1e-6
     separate_appearance: bool = False
+    local_cnn: bool = False
+    local_cnn_hidden_dim: int = 256
     log_every_n_steps: int = 50  # 0 disables detached training diagnostics.
 
 
@@ -64,6 +68,10 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError("sh_degree must be nonnegative")
         if cfg.log_every_n_steps < 0:
             raise ValueError('log_every_n_steps must be nonnegative')
+        if cfg.local_cnn and not cfg.separate_appearance:
+            raise ValueError('local_cnn requires separate_appearance=True')
+        if cfg.local_cnn_hidden_dim < 1:
+            raise ValueError('local_cnn_hidden_dim must be positive')
 
         self.allocation_head = nn.Sequential(
             nn.Linear(2 * cfg.feature_dim + 4, cfg.hidden_dim),
@@ -100,6 +108,14 @@ class MomentGaussianDecoder(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.appearance_head = nn.Linear(cfg.hidden_dim, 1, bias=False)
             nn.init.zeros_(self.appearance_head.weight)
+
+        self.local_appearance = None
+        if cfg.local_cnn:
+            # Preserve existing parameters and subsequent module RNG state.
+            with torch.random.fork_rng(devices=[]):
+                self.local_appearance = LocalCnnAppearance(
+                    cfg.feature_dim, cfg.local_cnn_hidden_dim, 3 * self.d_sh,
+                )
 
     def _run_chunk(self, function, *args):
         if self.cfg.checkpoint_chunks and self.training and torch.is_grad_enabled():
@@ -246,13 +262,32 @@ class MomentGaussianDecoder(nn.Module):
             opacities=-torch.expm1(-mass),
         )
 
+    def predict_support_harmonics(self, features, image_shape, collect_statistics=False):
+        """H(f_j) + CNN(F_view)_j, BEFORE appearance weights move it to slots."""
+        views, height, width = image_shape
+        pixels = height * width
+        harmonics, statistics = [], []
+        for view in range(views):
+            view_features = features[view * pixels:(view + 1) * pixels]
+            base = self.sh_head(view_features)
+            # Checkpoint one full view at a time, without cutting 2D neighborhoods.
+            local = self._run_chunk(self.local_appearance, view_features, (height, width))
+            harmonics.append(base + local)
+            if collect_statistics:
+                statistics.append(source_sh_mean_squares(base, local, self.sh_mask))
+        return (torch.cat(harmonics, dim=0),
+                torch.stack(statistics).mean(0) if statistics else None)
+
     def forward(self, points: Tensor, features: Tensor,
-                diagnostics: dict | None = None) -> Gaussians:
+                diagnostics: dict | None = None, *,
+                image_shape: tuple[int, int, int] | None = None) -> Gaussians:
         """[B, M, 3] points + [B, M, D] features -> standard Gaussians.
 
         M can represent pixels, voxels or tokens from any number of views.
         All points in one batch item must already share a coordinate frame.
         Output slot order is exactly the input support order.
+        local_cnn requires image_shape=(V,H,W), M=V*H*W, and features in
+        view-major raster order. The CNN operates on these source features.
         """
         if points.ndim != 3 or points.shape[-1] != 3 or min(points.shape[:2]) < 1:
             raise ValueError("points must have shape [B, M, 3], with B, M > 0")
@@ -260,8 +295,14 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError("features must have shape [B, M, feature_dim]")
         if points.device != features.device:
             raise ValueError("points and features must share a device")
+        if self.local_appearance is not None:
+            if (image_shape is None or len(image_shape) != 3
+                    or any(not isinstance(size, int) or size < 1 for size in image_shape)
+                    or image_shape[0] * image_shape[1] * image_shape[2] != points.shape[1]):
+                raise ValueError('local_cnn requires image_shape=(V,H,W) with V*H*W=M')
 
         moments, harmonics, statistics = [], [], []
+        local_statistics = []
         with torch.autocast(device_type=points.device.type, enabled=False):
             search_points = points.float()
             # One host-visible finite check per batch, not one per scene.
@@ -291,10 +332,19 @@ class MomentGaussianDecoder(nn.Module):
                 appearance = geometry
                 if scores is not None:
                     appearance = appearance_weights(geometry, scores, neighbors)
-                    # H(sum(wA*f)) == sum(wA*H(f)) for this affine SH head.
-                    # Pool 75 SH channels at degree 4, not a second 256-D feature.
+                    if self.local_appearance is not None:
+                        source_harmonics, local_stats = self.predict_support_harmonics(
+                            scene_features, image_shape, collect_statistics=diagnostics is not None,
+                        )
+                        if local_stats is not None:
+                            local_statistics.append(local_stats)
+                    else:
+                        # H(sum(wA*f)) == sum(wA*H(f)) for the affine SH head.
+                        source_harmonics = self.sh_head(scene_features)
+                    # Pool combined source SH (75 channels), not a second
+                    # DPT256 feature. The local CNN must stay BEFORE this pooling.
                     harmonics.append(pool_features(
-                        self.sh_head(scene_features), appearance, neighbors, self.cfg.chunk_size
+                        source_harmonics, appearance, neighbors, self.cfg.chunk_size
                     ))
                 if diagnostics is not None:
                     statistics.append(incoming_statistics(geometry, appearance, neighbors))
@@ -309,4 +359,11 @@ class MomentGaussianDecoder(nn.Module):
                     torch.stack(statistics), batched_moments[0], result.covariances,
                     scene_scales, self.cfg.mass_epsilon,
                 ))
+                if local_statistics:
+                    base_rms, local_rms = torch.stack(local_statistics).mean(0).sqrt().unbind()
+                    diagnostics.update({
+                        'local_cnn/source_base_sh_rms': base_rms,
+                        'local_cnn/source_extra_sh_rms': local_rms,
+                        'local_cnn/source_extra_base_ratio': local_rms / base_rms.clamp_min(1e-8),
+                    })
             return result

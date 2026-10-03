@@ -195,7 +195,13 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
             points = torch.cat((res1['pts3d'].reshape(b, h * w, 3),
                                 res2['pts3d'].reshape(b, h * w, 3)), dim=1)
             features = torch.cat((GS_res1, GS_res2), dim=1)
-            gaussians = self.gaussian_decoder(points, features, diagnostics=diagnostics_dump)
+            decoder_kwargs = {}
+            if getattr(self.gaussian_decoder.cfg, 'local_cnn', False):
+                # Original DPT maps in the same view-major raster order as points.
+                # The CNN processes these maps before appearance allocation.
+                decoder_kwargs['image_shape'] = (v, h, w)
+            gaussians = self.gaussian_decoder(points, features, diagnostics=diagnostics_dump,
+                                             **decoder_kwargs)
             if visualization_dump is not None:
                 means = gaussians.means.reshape(b, v, h, w, 1, 3)
                 visualization_dump['means'] = means

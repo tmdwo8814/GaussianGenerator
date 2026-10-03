@@ -5,8 +5,8 @@ defaults:
   - _self_
 
 wandb:
-  name: separate_weight_k16
-  tags: [re10k, 256x256, moment_decoder, separate_weight]
+  name: moment-local-cnn
+  tags: [re10k, 256x256, moment_decoder, separate_weight, local_cnn]
 
 model:
   encoder:
@@ -15,7 +15,9 @@ model:
       feature_dim: 256
       hidden_dim: 64
       separate_appearance: true  # Zero-init per-edge scores; geometry is unchanged.
-      log_every_n_steps: 50  # Detached incoming-weight/covariance diagnostics.
+      local_cnn: true  # Source DPT map -> local SH -> appearance-weighted pooling.
+      local_cnn_hidden_dim: 256  # 3x3 Conv 256->256, ReLU, zero-init 1x1 Conv -> SH75.
+      log_every_n_steps: 50  # Detached incoming-weight/covariance and local SH diagnostics.
       num_neighbors: 16  # Includes self; candidates span both views.
       chunk_size: 32768
       checkpoint_chunks: true
