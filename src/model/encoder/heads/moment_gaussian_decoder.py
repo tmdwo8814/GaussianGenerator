@@ -20,6 +20,8 @@ from ..common.sparse_knn import build_knn, validate_points
 from ..common.sparse_feature_pool import pool_features
 from ..common.appearance_neighborhood import make_image_neighborhood
 from ..common.image_neighborhood_appearance import ImageNeighborhoodAppearance
+from ..common.separate_appearance import appearance_weights, appearance_weight_statistics
+from ..common.moment_shape import MomentShape, shape_statistics
 
 
 @dataclass
@@ -40,6 +42,11 @@ class MomentDecoderCfg:
     covariance_floor: float = 1e-4  # standard deviation / scene scale
     mass_epsilon: float = 1e-6
     scene_epsilon: float = 1e-6
+    separate_appearance: bool = False
+    moment_shape: bool = False
+    shape_hidden_dim: int = 128
+    shape_scale_limit: float = 4.0
+    shape_shear_limit: float = 0.5
     appearance_2d: bool = False
     appearance_dim: int = 32
     appearance_2d_radii: list[int] = field(default_factory=lambda: [1, 4])
@@ -107,6 +114,20 @@ class MomentGaussianDecoder(nn.Module):
                 self.appearance_sh_head = nn.Linear(cfg.appearance_dim, 3 * self.d_sh, bias=False)
                 nn.init.zeros_(self.appearance_sh_head.weight)
 
+        self.appearance_head = None
+        self.shape_head = None
+        # New branches must not change the initialization of existing heads
+        # or consume RNG used to initialize later parts of the encoder.
+        with torch.random.fork_rng(devices=[]):
+            if cfg.separate_appearance:
+                self.appearance_head = nn.Linear(cfg.hidden_dim, 1, bias=False)
+                nn.init.zeros_(self.appearance_head.weight)
+            if cfg.moment_shape:
+                self.shape_head = MomentShape(
+                    cfg.feature_dim, cfg.shape_hidden_dim, cfg.shape_scale_limit,
+                    cfg.shape_shear_limit, cfg.covariance_floor**2,
+                )
+
     def _run_chunk(self, function, *args):
         if self.cfg.checkpoint_chunks and self.training and torch.is_grad_enabled():
             # No mutation inside checkpointed functions; scatter happens outside.
@@ -115,7 +136,7 @@ class MomentGaussianDecoder(nn.Module):
         return function(*args)
 
     def _allocation_chunk(self, source_points, source_projection, budget,
-                          points, destination_projection, neighbors):
+                          points, destination_projection, neighbors, return_appearance=False):
         delta = source_points[:, None] - points[neighbors]
         geometry = torch.cat((delta, delta.square().sum(-1, keepdim=True)), dim=-1)
         first = self.allocation_head[0]
@@ -123,12 +144,16 @@ class MomentGaussianDecoder(nn.Module):
         # Retain the exact same parameters/state_dict and nonlinear function.
         hidden = (destination_projection[neighbors] + source_projection[:, None]
                   + F.linear(geometry, first.weight[:, 2 * self.cfg.feature_dim:], first.bias))
-        logits = self.allocation_head[2](self.allocation_head[1](hidden)).squeeze(-1)
+        hidden = self.allocation_head[1](hidden)
+        logits = self.allocation_head[2](hidden).squeeze(-1)
         allocation = logits.softmax(dim=-1)  # sum_k A[j, k] = 1
-        return allocation * budget  # q[j, k] = A_ij * b_j
+        mass = allocation * budget  # q[j, k] = A_ij * b_j
+        if return_appearance:
+            return mass, self.appearance_head(hidden).squeeze(-1)
+        return mass
 
     def predict_allocation(self, points: Tensor, features: Tensor,
-                           neighbors: Tensor) -> Tensor:
+                           neighbors: Tensor, *, return_appearance=False):
         """Normalized coordinates in; sparse outgoing mass q [M, K] out."""
         # Project each support once instead of repeating a 128->64 projection
         # for every edge. These projections remain in the autograd graph.
@@ -141,13 +166,18 @@ class MomentGaussianDecoder(nn.Module):
             self.cfg.hidden_dim, dim=-1
         )
         budget = self.cfg.budget_max * self.budget_head(features).sigmoid()
+        if return_appearance and self.appearance_head is None:
+            raise ValueError('Appearance scores require separate_appearance=True')
         chunks = []
         for start in range(0, len(points), self.cfg.chunk_size):
             stop = start + self.cfg.chunk_size
             chunks.append(self._run_chunk(
                 self._allocation_chunk, points[start:stop], source_projection[start:stop],
                 budget[start:stop], points, destination_projection, neighbors[start:stop],
+                return_appearance,
             ))
+        if return_appearance:
+            return tuple(torch.cat(values, dim=0) for values in zip(*chunks))
         return torch.cat(chunks, dim=0)
 
     @staticmethod
@@ -163,7 +193,7 @@ class MomentGaussianDecoder(nn.Module):
         return weights[..., None, None] * delta[..., :, None] * delta[..., None, :]
 
     def aggregate_moments(self, points: Tensor, features: Tensor,
-                          neighbors: Tensor, mass_per_edge: Tensor):
+                          neighbors: Tensor, mass_per_edge: Tensor, *, return_weights=False):
         """Incoming mass, weighted mean, CENTRAL covariance and pooled feature.
 
         All tensors use FP32 in forward. The epsilon self contribution only
@@ -203,9 +233,11 @@ class MomentGaussianDecoder(nn.Module):
             covariance.index_add_(0, indices.reshape(-1), messages.reshape(-1, 9))
         covariance = covariance.reshape(count, 3, 3)
         covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
-        return mass, means, covariance, pooled
+        moments = (mass, means, covariance, pooled)
+        return (*moments, weights) if return_weights else moments
 
-    def build_gaussians(self, mass, means, covariance, pooled, scene_scale, appearance_context=None):
+    def build_gaussians(self, mass, means, covariance, pooled, scene_scale,
+                        appearance_context=None, appearance_harmonics=None, diagnostics=None):
         # Accept a single scene for inspection/tests, or all scenes for training.
         # Batch the small heads to avoid repeated GEMMs and a final SH concat.
         if means.ndim == 2:
@@ -214,12 +246,30 @@ class MomentGaussianDecoder(nn.Module):
             )
             if appearance_context is not None:
                 appearance_context = appearance_context.unsqueeze(0)
+            if appearance_harmonics is not None:
+                appearance_harmonics = appearance_harmonics.unsqueeze(0)
         scene_scale = scene_scale.reshape(-1, 1, 1)
         coverage = self.cfg.scale_min + (self.cfg.scale_max - self.cfg.scale_min) * (
             self.scale_head(pooled).sigmoid()
         )
         eye = torch.eye(3, device=means.device, dtype=means.dtype)
         covariance = coverage[..., None].square() * covariance
+        if self.shape_head is not None:
+            flat_covariance = covariance.reshape(-1, 3, 3)
+            flat_features = pooled.reshape(-1, self.cfg.feature_dim)
+            transformed_chunks = []
+            for start in range(0, len(flat_features), self.cfg.chunk_size):
+                stop = start + self.cfg.chunk_size
+                before = flat_covariance[start:stop]
+                after, transform = self._run_chunk(self.shape_head, flat_features[start:stop], before)
+                transformed_chunks.append(after)
+                if diagnostics is not None:
+                    # Weight chunk means by their slot counts, including the
+                    # short last chunk. All diagnostics are detached.
+                    fraction = len(before) / len(flat_features)
+                    for key, value in shape_statistics(before, after, transform).items():
+                        diagnostics[key] = diagnostics.get(key, 0) + fraction * value
+            covariance = torch.cat(transformed_chunks, 0).reshape_as(covariance)
         # A fixed tiny floor can round away for wide/rank-deficient Gaussians.
         # Add a detached FP32 roundoff guard relative to the covariance trace.
         roundoff = 8 * torch.finfo(covariance.dtype).eps * (
@@ -227,7 +277,7 @@ class MomentGaussianDecoder(nn.Module):
         )
         floor = self.cfg.covariance_floor**2 + roundoff
         covariance = (covariance + floor[..., None, None] * eye) * scene_scale[..., None].square()
-        harmonics = self.sh_head(pooled)
+        harmonics = self.sh_head(pooled) if appearance_harmonics is None else appearance_harmonics
         if appearance_context is not None:
             # Equivalent to a linear SH head on [pooled_256, context_32].
             # Keep the old parameter keys; only the new columns start at zero.
@@ -271,7 +321,7 @@ class MomentGaussianDecoder(nn.Module):
             image = make_image_neighborhood(image_shape, self.cfg.appearance_2d_radii, points.device)
 
         moments = []
-        contexts, statistics = [], []
+        contexts, statistics, selected_harmonics = [], [], []
         with torch.autocast(device_type=points.device.type, enabled=False):
             search_points = points.float()
             # One host-visible finite check per batch, not one per scene.
@@ -287,8 +337,25 @@ class MomentGaussianDecoder(nn.Module):
                                       check_finite=False,
                                       query_backend=self.cfg.knn_query_backend)
                 normalized = scene_points / scene_scale
-                q = self.predict_allocation(normalized, scene_features, neighbors)
-                scene_moments = self.aggregate_moments(normalized, scene_features, neighbors, q)
+                scene_stats = {}
+                if self.appearance_head is not None:
+                    q, scores = self.predict_allocation(normalized, scene_features, neighbors,
+                                                        return_appearance=True)
+                    *scene_moments, geometry_weights = self.aggregate_moments(
+                        normalized, scene_features, neighbors, q, return_weights=True,
+                    )
+                    selected = appearance_weights(geometry_weights, scores, neighbors)
+                    # The base SH head is affine and incoming weights sum to
+                    # one. Pooling its 75 channels is equivalent to pooling
+                    # DPT256 then applying the head, with less activation memory.
+                    selected_harmonics.append(pool_features(
+                        self.sh_head(scene_features), selected, neighbors, self.cfg.chunk_size,
+                    ))
+                    if diagnostics is not None:
+                        scene_stats.update(appearance_weight_statistics(geometry_weights, selected, neighbors))
+                else:
+                    q = self.predict_allocation(normalized, scene_features, neighbors)
+                    scene_moments = self.aggregate_moments(normalized, scene_features, neighbors, q)
                 moments.append(scene_moments)
                 if self.appearance_reader is not None:
                     context, stats = self.appearance_reader(
@@ -299,15 +366,21 @@ class MomentGaussianDecoder(nn.Module):
                     )
                     contexts.append(context)
                     if stats is not None:
-                        statistics.append(stats)
+                        scene_stats.update(stats)
+                if scene_stats:
+                    statistics.append(scene_stats)
             batched_moments = [torch.stack(values) for values in zip(*moments)]
             del moments
             appearance_context = torch.stack(contexts) if contexts else None
             gaussians = self.build_gaussians(*batched_moments, scene_scales,
-                                            appearance_context=appearance_context)
+                                            appearance_context=appearance_context,
+                                            appearance_harmonics=(torch.stack(selected_harmonics)
+                                                                  if selected_harmonics else None),
+                                            diagnostics=diagnostics)
             if diagnostics is not None and statistics:
                 diagnostics.update({key: torch.stack([stats[key] for stats in statistics]).mean()
                                     for key in statistics[0]})
+            if diagnostics is not None and appearance_context is not None:
                 with torch.no_grad():
                     extra_sh = self.appearance_sh_head(appearance_context).reshape(
                         *appearance_context.shape[:2], 3, self.d_sh,

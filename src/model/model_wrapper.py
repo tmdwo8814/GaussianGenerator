@@ -185,7 +185,8 @@ class ModelWrapper(LightningModule):
         target_gt = batch["target"]["image"]
         if diagnostics is not None:
             diagnostics.update(image_error_statistics(output.color, target_gt))
-            self.log_dict({f'appearance_2d/{key}': value for key, value in diagnostics.items()},
+            prefix = 'moment_shape' if getattr(moment_decoder.cfg, 'moment_shape', False) else 'appearance_2d'
+            self.log_dict({f'{prefix}/{key}': value for key, value in diagnostics.items()},
                           on_step=True, on_epoch=False, sync_dist=True)
 
         # Compute metrics.
