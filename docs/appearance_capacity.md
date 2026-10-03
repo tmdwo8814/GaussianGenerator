@@ -14,11 +14,11 @@ The user's W&B name in `re10k_moment.yaml` is preserved.
    includes the original tiny self prior; it still governs every geometry
    attribute, including the pooled feature used by the coverage scale head.
 4. Build the same deduplicated union of 3D edges and radius-1/radius-4 image
-   edges ONCE per scene. Four independent width-32 readers use this graph.
+   edges once per scene evaluation. Two independent width-32 readers use this graph.
    Each has its own source key/value, geometry-pooled query, positional
-   projections and incoming softmax. Concatenate their contexts into `c128`.
-5. Produce raw SH as `Linear(fA) + MLP(concat(fA, c128))`. The MLP is
-   `384 -> 256 -> SiLU -> 75` at SH degree 4 (SiLU follows the first Linear).
+   projections and incoming softmax. Concatenate their contexts into `c64`.
+5. Produce raw SH as `Linear(fA) + MLP(concat(fA, c64))`. The MLP is
+   `320 -> 128 -> SiLU -> 75` at SH degree 4 (SiLU follows the first Linear).
    Its final weight and bias start at zero. Apply the original SH mask once.
 
 The extra image edges do NOT carry geometry mass or multiply by `wG`.
@@ -26,8 +26,8 @@ They can influence SH even when they are absent from the geometry graph.
 Only context RGB and its view-major raster layout enter the decoder; target
 images/poses are used by the unchanged renderer and MSE/LPIPS losses.
 
-This decoder has **272,601 trainable parameters**, excluding DPT and point
-heads: moment 52,942 + separate score 64 + four readers 101,760 + MLP 117,835.
+The current reduced decoder has **154,649 trainable parameters**, excluding DPT
+and point heads: moment 52,942 + separate score 64 + two readers 50,880 + MLP 50,763.
 Heads are independent but the complete decoder is shared across input views.
 
 ## Configuration and launch
@@ -40,9 +40,10 @@ num_neighbors: 16
 appearance_2d: true
 separate_appearance: true
 appearance_capacity: true
-appearance_heads: 4
+appearance_heads: 2
 appearance_dim: 32       # Per head, not total context width.
-appearance_mlp_dim: 256
+appearance_mlp_dim: 128
+checkpoint_appearance: true
 appearance_2d_radii: [1, 4]
 log_every_n_steps: 50
 ```
@@ -56,7 +57,7 @@ strictly compatible resume checkpoint for this experiment.
 For the original 2DKNN control, set BOTH `appearance_capacity=false` and
 `separate_appearance=false`; keep `appearance_2d=true`. To restore the original
 moment decoder, also set `appearance_2d=false`. Setting `appearance_2d_radii=[]`
-only removes the extra image candidates and retains all four readers.
+only removes the extra image candidates and retains the configured readers.
 
 ## Logging
 
@@ -70,11 +71,11 @@ to zero to disable their cost.
 | geometry/appearance_entropy | Incoming entropy of the corresponding original-graph weights. |
 | geometry/appearance_concentration | Mean sum of squared incoming weights. |
 | geometry/appearance_effective_supports | Mean per-slot inverse concentration; not a candidate count. |
-| head_0..3/entropy | Each head's incoming attention entropy on the expanded graph. |
-| head_0..3/image_weight | Each head's weight on NEW image edges after deduplication. |
-| head_0..3/context_rms | Magnitude of each head's 32-D context. |
-| head_attention_tv | Mean incoming TV across the six head pairs; tests whether selections differ. |
-| image_weight, entropy | Mean across the four readers. |
+| head_0..1/entropy | Each head's incoming attention entropy on the expanded graph. |
+| head_0..1/image_weight | Each head's weight on NEW image edges after deduplication. |
+| head_0..1/context_rms | Magnitude of each head's 32-D context. |
+| head_attention_tv | Mean incoming TV across head pairs; tests whether selections differ. |
+| image_weight, entropy | Mean across the configured readers. |
 | image_weight_scale_0 / scale_1 | Mean reader weights on new radius-1 / radius-4 edges. |
 | added_candidates, incoming_candidates, added_candidate_fraction, new_2d_fraction | Same candidate definitions as the original 2DKNN experiment. |
 | base_sh_rms | RMS of the masked Linear(fA) output. |
@@ -88,11 +89,41 @@ TV or image attention alone also does not prove a rendering-quality gain.
 
 ## Cost and verification
 
-There is one 3D search per scene and one deduplication for all heads. Value
-messages are processed one compact head at a time with chunk checkpointing.
-The final nonlinear SH head is also checkpointed in chunks to avoid retaining
-a full-batch concatenated 384-D activation. No new package is required by the
-training environment. Four readers still cost more than one; measure actual
+The optimized forward completes SH and Gaussian attributes **one scene at a
+time**, retaining final attributes rather than stacking full-batch DPT256
+appearance features, geometry-pooled features, and multi-head contexts. This
+removes the list-plus-stack copies from the old capacity path.
+
+`checkpoint_appearance: true` adds a non-reentrant checkpoint around incoming
+appearance selection, feature pooling, the reader, and SH generation. Its
+large intermediate features, key/value/query projections and weights are
+recomputed scene by scene during backward. Inputs shared with the geometry
+path remain available; final attributes and backbone/renderer memory are
+still required. Inner chunk checkpoints continue to bound edge activations.
+`chunk_size`, head count, widths, candidates, precision, batch size and loss
+are unchanged by this optimization. Unused Python references to chunk logits
+and the last message are also released earlier.
+
+kNN is **outside** the new checkpoint: exactly one search per scene, including
+backward. The image-edge merge and appearance computations can be recomputed.
+This trades extra computation for lower retention; it is not a promise of
+equal step time or of fitting every batch into GPU memory. Inference performs
+one pass with no backward recomputation. `checkpoint_appearance: false` skips
+the new checkpoint but keeps scene-by-scene output generation for diagnosis.
+
+All parameter names, shapes and optimizer parameter order remain unchanged
+from the 2-head/MLP-128 version. That version's weights remain strictly loadable;
+this does not make old 4-head or baseline checkpoints shape-compatible. The
+optimization preserves the mathematical output/gradients, with possible small
+floating-point differences from per-scene rather than batched GEMMs. W&B metric
+names and full-batch SH RMS aggregation remain unchanged.
+
+No new package is required. `test_capacity_memory.py` compares the optimized
+path to the previous stack-then-SH flow, including nonzero heads, all parameter
+and input gradients, detached metrics and strict state loading. It also checks
+unique tensor storage saved by autograd at DPT256/2-head/MLP-128 widths. That CPU
+retention measurement excludes Python-only copies, temporary workspace,
+backbone and renderer; it is **not** a CUDA peak-VRAM benchmark. Measure actual
 step time and peak VRAM on the training host.
 
 Run `python -m unittest discover -s tests -v`. New checks cover incoming

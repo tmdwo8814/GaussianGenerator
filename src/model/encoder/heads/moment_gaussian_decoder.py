@@ -49,6 +49,7 @@ class MomentDecoderCfg:
     appearance_capacity: bool = False
     appearance_heads: int = 4
     appearance_mlp_dim: int = 256
+    checkpoint_appearance: bool = True  # Recompute one complete capacity scene in backward.
     log_every_n_steps: int = 50  # 0 disables detached diagnostics
 
 
@@ -264,8 +265,31 @@ class MomentGaussianDecoder(nn.Module):
             diagnostics['base_sh_rms'], diagnostics['extra_sh_rms'] = rms.unbind()
         return torch.cat(harmonics).reshape(*shape, 3 * self.d_sh)
 
+    def _capacity_scene(self, points, features, rgb, means, geometry_pooled,
+                        geometry_weights, scores, neighbors, image, collect_statistics):
+        """Pure checkpoint boundary: only final SH and detached metrics escape.
+
+        kNN and geometry moments are computed outside and reused. Selected
+        DPT features, expanded graph, reader projections/weights and contexts
+        are recomputed for this scene instead of retained for the full batch.
+        Existing inner chunk checkpoints still bound edge recomputation memory.
+        """
+        selected = appearance_weights(geometry_weights, scores, neighbors)
+        appearance_pooled = pool_features(features, selected, neighbors, self.cfg.chunk_size)
+        context, stats = self.appearance_reader(
+            points, features, rgb, means, geometry_pooled, neighbors, image,
+            chunk_size=self.cfg.chunk_size, checkpoint_chunks=self.cfg.checkpoint_chunks,
+            collect_statistics=collect_statistics,
+        )
+        report = {} if collect_statistics else None
+        raw_sh = self._capacity_harmonics(appearance_pooled, context, report)
+        if report is not None:
+            report.update(stats)
+            report.update(appearance_weight_statistics(geometry_weights, selected, neighbors))
+        return raw_sh, report
+
     def build_gaussians(self, mass, means, covariance, pooled, scene_scale, appearance_context=None,
-                        appearance_pooled=None, diagnostics=None):
+                        appearance_pooled=None, diagnostics=None, appearance_harmonics=None):
         # Accept a single scene for inspection/tests, or all scenes for training.
         # Batch the small heads to avoid repeated GEMMs and a final SH concat.
         if means.ndim == 2:
@@ -276,6 +300,8 @@ class MomentGaussianDecoder(nn.Module):
                 appearance_context = appearance_context.unsqueeze(0)
             if appearance_pooled is not None:
                 appearance_pooled = appearance_pooled.unsqueeze(0)
+            if appearance_harmonics is not None:
+                appearance_harmonics = appearance_harmonics.unsqueeze(0)
         scene_scale = scene_scale.reshape(-1, 1, 1)
         coverage = self.cfg.scale_min + (self.cfg.scale_max - self.cfg.scale_min) * (
             self.scale_head(pooled).sigmoid()
@@ -290,7 +316,9 @@ class MomentGaussianDecoder(nn.Module):
         floor = self.cfg.covariance_floor**2 + roundoff
         covariance = (covariance + floor[..., None, None] * eye) * scene_scale[..., None].square()
         sh_features = pooled if appearance_pooled is None else appearance_pooled
-        if self.cfg.appearance_capacity:
+        if appearance_harmonics is not None:
+            harmonics = appearance_harmonics
+        elif self.cfg.appearance_capacity:
             if appearance_context is None or appearance_pooled is None:
                 raise ValueError("appearance_capacity requires appearance pooled features and context")
             harmonics = self._capacity_harmonics(sh_features, appearance_context, diagnostics)
@@ -340,6 +368,7 @@ class MomentGaussianDecoder(nn.Module):
 
         moments = []
         contexts, statistics, appearance_features = [], [], []
+        completed_scenes = []
         with torch.autocast(device_type=points.device.type, enabled=False):
             search_points = points.float()
             # One host-visible finite check per batch, not one per scene.
@@ -365,6 +394,27 @@ class MomentGaussianDecoder(nn.Module):
                     *scene_moments, geometry = self.aggregate_moments(
                         normalized, scene_features, neighbors, q, return_weights=True,
                     )
+                    if self.cfg.appearance_capacity:
+                        args = (normalized, scene_features, rgb[scene_index].float(),
+                                scene_moments[1], scene_moments[3], geometry, scores,
+                                neighbors, image, diagnostics is not None)
+                        if (self.cfg.checkpoint_appearance and self.training
+                                and torch.is_grad_enabled()):
+                            raw_sh, scene_stats = checkpoint(
+                                self._capacity_scene, *args,
+                                use_reentrant=False, preserve_rng_state=False,
+                            )
+                        else:
+                            raw_sh, scene_stats = self._capacity_scene(*args)
+                        completed_scenes.append(self.build_gaussians(
+                            *scene_moments, scene_scale, appearance_harmonics=raw_sh,
+                        ))
+                        if scene_stats is not None:
+                            statistics.append(scene_stats)
+                        # No Python list of per-scene DPT256/context tensors,
+                        # and no full-batch copies of those tensors via stack.
+                        del args, raw_sh, scene_moments, geometry, scores
+                        continue
                     selected = appearance_weights(geometry, scores, neighbors)
                     appearance_features.append(pool_features(
                         scene_features, selected, neighbors, self.cfg.chunk_size,
@@ -384,10 +434,24 @@ class MomentGaussianDecoder(nn.Module):
                         scene_stats.update(stats)
                 if scene_stats:
                     statistics.append(scene_stats)
+            if completed_scenes:
+                if diagnostics is not None:
+                    for key in statistics[0]:
+                        values = torch.stack([stats[key] for stats in statistics])
+                        # Preserve the previous full-batch RMS, rather than
+                        # accidentally changing it to a mean of scene RMSs.
+                        diagnostics[key] = (values.square().mean().sqrt()
+                                            if key in ('base_sh_rms', 'extra_sh_rms')
+                                            else values.mean())
+                return Gaussians(**{
+                    key: torch.cat([getattr(scene, key) for scene in completed_scenes], dim=0)
+                    for key in ('means', 'covariances', 'harmonics', 'opacities')
+                })
             batched_moments = [torch.stack(values) for values in zip(*moments)]
             del moments
             appearance_context = torch.stack(contexts) if contexts else None
             appearance_pooled = torch.stack(appearance_features) if appearance_features else None
+            del contexts, appearance_features
             gaussians = self.build_gaussians(*batched_moments, scene_scales,
                                             appearance_context=appearance_context,
                                             appearance_pooled=appearance_pooled, diagnostics=diagnostics)

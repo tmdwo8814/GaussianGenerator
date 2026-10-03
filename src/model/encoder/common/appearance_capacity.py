@@ -1,8 +1,8 @@
-"""Four independent compact appearance readers on ONE shared candidate graph.
+"""Independent compact appearance readers on ONE shared candidate graph.
 
 Each head has the existing reader's own key/value, query, position and score
-projections. Softmax is incoming per slot and per head. Values stay width 32
-on edges; only the resulting slot contexts are concatenated to width 128.
+projections. Softmax is incoming per slot and per head. Values stay compact
+on edges; only the resulting slot contexts are concatenated across heads.
 """
 
 from itertools import combinations
@@ -48,6 +48,7 @@ class MultiHeadAppearance(nn.Module):
                 scores.append(run(head._score_chunk, keys[start:stop], queries,
                                   *edge_args(start, stop)))
             weights = incoming_softmax(torch.cat(scores), neighbors, valid)
+            del scores  # Chunk logits need not coexist with messages of the next stage.
             context = points.new_zeros(len(points), head.context_dim)
             for start in range(0, len(points), chunk_size):
                 stop = start + chunk_size
@@ -56,6 +57,7 @@ class MultiHeadAppearance(nn.Module):
                 context.index_add_(0, neighbors[start:stop].flatten(),
                                    messages.reshape(-1, head.context_dim))
             contexts.append(context)
+            del messages  # The final dense edge message is no longer needed here.
             if collect_statistics:
                 reports.append(appearance_statistics(weights, valid, image.valid, geometry_k))
                 diagnostic_weights.append(weights.detach())
