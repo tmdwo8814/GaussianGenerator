@@ -17,9 +17,9 @@ model:
       appearance_2d: true
       separate_appearance: true  # Independent weights on the original 3D graph.
       appearance_capacity: true
-      appearance_heads: 4
+      appearance_heads: 2
       appearance_dim: 32  # Per head: 4 x 32 = 128 context channels.
-      appearance_mlp_dim: 256  # [selected DPT256, context128] -> 256 -> SH75.
+      appearance_mlp_dim: 128  # [selected DPT256, context128] -> 256 -> SH75.
       appearance_2d_radii: [1, 4]  # Eight image neighbors per radius, same source view.
       log_every_n_steps: 50  # Detached candidate/selection and image-edge metrics.
       num_neighbors: 16  # Includes self; candidates span both views.
