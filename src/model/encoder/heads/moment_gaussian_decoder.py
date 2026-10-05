@@ -31,6 +31,9 @@ class MomentDecoderCfg:
     num_neighbors: int = 16
     chunk_size: int = 32768
     checkpoint_chunks: bool = True
+    compile_kernels: bool = False  # Regional tensor fusion on CUDA; ordinary PyTorch on CPU.
+    cache_image_neighbors: bool = True  # Fixed raster indices only, never 3D kNN or features.
+    shape_chunk_size: int = 0  # 0 follows chunk_size; geometry/appearance chunks are unchanged.
     knn_backend: str = 'auto'
     knn_query_backend: str = 'specialized'
     knn_workers: int = 1
@@ -57,6 +60,9 @@ class MomentGaussianDecoder(nn.Module):
     def __init__(self, cfg: MomentDecoderCfg, sh_degree: int = 4):
         super().__init__()
         self.cfg = cfg
+        # One transient raster cache, not a module buffer (no DDP broadcast).
+        self._image_cache_key = None
+        self._image_cache = None
         if cfg.knn_backend not in ('auto', 'cupy', 'scipy'):
             raise ValueError('knn_backend must be auto, cupy or scipy')
         if cfg.knn_query_backend not in ('specialized', 'cupy'):
@@ -74,6 +80,8 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError("sh_degree must be nonnegative")
         if cfg.appearance_dim < 1 or cfg.log_every_n_steps < 0:
             raise ValueError("appearance_dim must be positive; log_every_n_steps must be nonnegative")
+        if cfg.shape_chunk_size < 0:
+            raise ValueError('shape_chunk_size must be nonnegative')
         if (any(not isinstance(radius, int) or radius < 1 for radius in cfg.appearance_2d_radii)
                 or len(set(cfg.appearance_2d_radii)) != len(cfg.appearance_2d_radii)):
             raise ValueError("appearance_2d_radii must contain unique positive integers")
@@ -110,7 +118,9 @@ class MomentGaussianDecoder(nn.Module):
         if cfg.appearance_2d:
             # Preserve every original head and subsequent RNG initialization.
             with torch.random.fork_rng(devices=[]):
-                self.appearance_reader = ImageNeighborhoodAppearance(cfg.feature_dim, cfg.appearance_dim)
+                self.appearance_reader = ImageNeighborhoodAppearance(
+                    cfg.feature_dim, cfg.appearance_dim, compile_kernels=cfg.compile_kernels,
+                )
                 self.appearance_sh_head = nn.Linear(cfg.appearance_dim, 3 * self.d_sh, bias=False)
                 nn.init.zeros_(self.appearance_sh_head.weight)
 
@@ -126,7 +136,24 @@ class MomentGaussianDecoder(nn.Module):
                 self.shape_head = MomentShape(
                     cfg.feature_dim, cfg.shape_hidden_dim, cfg.shape_scale_limit,
                     cfg.shape_shear_limit, cfg.covariance_floor**2,
+                    compile_kernels=cfg.compile_kernels,
                 )
+
+    def _image_neighbors(self, image_shape, device):
+        key = (tuple(image_shape), tuple(self.cfg.appearance_2d_radii), device)
+        if not self.cfg.cache_image_neighbors or key != self._image_cache_key:
+            # Validation can run under inference_mode before the next train step.
+            # Cache normal tensors so autograd may save them during training.
+            with torch.inference_mode(False), torch.no_grad():
+                image = make_image_neighborhood(image_shape, self.cfg.appearance_2d_radii, device)
+            if not self.cfg.cache_image_neighbors:
+                return image
+            self._image_cache_key, self._image_cache = key, image
+        return self._image_cache
+
+    def _apply(self, function, recurse=True):
+        self._image_cache_key, self._image_cache = None, None
+        return super()._apply(function, recurse=recurse)
 
     def _run_chunk(self, function, *args):
         if self.cfg.checkpoint_chunks and self.training and torch.is_grad_enabled():
@@ -220,7 +247,8 @@ class MomentGaussianDecoder(nn.Module):
             )
             mean_offsets.index_add_(0, indices.reshape(-1), offsets.reshape(-1, 3))
         means = points + mean_offsets
-        pooled = pool_features(features, weights, neighbors, self.cfg.chunk_size)
+        pooled = pool_features(features, weights, neighbors, self.cfg.chunk_size,
+                               compile_kernels=self.cfg.compile_kernels)
 
         covariance = points.new_zeros(count, 9)
         for start in range(0, count, self.cfg.chunk_size):
@@ -258,8 +286,9 @@ class MomentGaussianDecoder(nn.Module):
             flat_covariance = covariance.reshape(-1, 3, 3)
             flat_features = pooled.reshape(-1, self.cfg.feature_dim)
             transformed_chunks = []
-            for start in range(0, len(flat_features), self.cfg.chunk_size):
-                stop = start + self.cfg.chunk_size
+            shape_chunk = self.cfg.shape_chunk_size or self.cfg.chunk_size
+            for start in range(0, len(flat_features), shape_chunk):
+                stop = start + shape_chunk
                 before = flat_covariance[start:stop]
                 after, transform = self._run_chunk(self.shape_head, flat_features[start:stop], before)
                 transformed_chunks.append(after)
@@ -317,8 +346,7 @@ class MomentGaussianDecoder(nn.Module):
                 raise ValueError("appearance_2d requires image_shape=(V,H,W) with V*H*W=M")
             if rgb is None or rgb.shape != points.shape or rgb.device != points.device:
                 raise ValueError("appearance_2d requires context RGB [B,M,3] on the points device")
-            # Same source-image layout for the local batch; compute it once.
-            image = make_image_neighborhood(image_shape, self.cfg.appearance_2d_radii, points.device)
+            image = self._image_neighbors(image_shape, points.device)
 
         moments = []
         contexts, statistics, selected_harmonics = [], [], []
@@ -350,6 +378,7 @@ class MomentGaussianDecoder(nn.Module):
                     # DPT256 then applying the head, with less activation memory.
                     selected_harmonics.append(pool_features(
                         self.sh_head(scene_features), selected, neighbors, self.cfg.chunk_size,
+                        compile_kernels=self.cfg.compile_kernels,
                     ))
                     if diagnostics is not None:
                         scene_stats.update(appearance_weight_statistics(geometry_weights, selected, neighbors))

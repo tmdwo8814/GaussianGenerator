@@ -1,6 +1,6 @@
 # Experiment 2: Moment Shape v1
 
-Branch: `exp/moment-shape`. Experiment: `re10k_moment`. W&B: `moment-shape-v1`.
+Branch: `exp/moment-shape`. Experiment: `re10k_moment`. W&B: `moment-shape`.
 
 This version keeps the original DPT256, 3D kNN16, support budgets, allocation,
 Gaussian centers and opacity mapping. It combines separate appearance weights
@@ -36,7 +36,7 @@ existing common coordinate frame; this is not a rotation-equivariance claim.
 Decoder parameters (excluding backbone, DPT and point heads): **115,284**.
 The shape MLP adds **34,438** parameters; separate selection adds **64**.
 No extra kNN, matching, eigendecomposition or matrix inverse is used. Shape MLP
-activations use the existing chunk size and activation checkpointing.
+activations use bounded chunks and activation checkpointing.
 
 MSE, LPIPS, pretrained initialization, e2e optimization and evaluation settings
 are unchanged. No SSIM loss is added. Use a fresh run for this experiment:
@@ -75,3 +75,62 @@ and original gradients, shape bounds, positive definite covariance including
 degenerate moments, checkpoint parity, scene-scale equivariance, one kNN per
 scene, optimizer inclusion, and logging without adding a loss. CUDA parity is
 checked only when a CUDA device is available.
+
+## Same-model speed settings
+
+The optimized experiment keeps FP32, all 115,284 decoder parameters, DPT256,
+3D kNN16, the sixteen 2D candidates at radii [1,4], incoming softmax, shape
+bounds, losses and activation checkpointing. Old model/optimizer checkpoints
+keep the same parameter names, shapes and ordering. Floating-point reduction
+order can differ; numerical equivalence does not guarantee identical training
+trajectories or evaluation scores.
+
+- `compile_kernels: true` compiles only sparse pooling, the 2D reader's tensor
+  chunks, and the shape head. Pooling backward can fuse gather/multiply/reduce.
+  Appearance chunks return aggregated [slots,32] contributions instead of
+  exporting [chunk,32,32] messages, allowing message/scatter fusion. kNN,
+  scene loops, the renderer and logging remain eager. CUDA graphs are disabled
+  to avoid extra graph capture memory. CPU uses ordinary PyTorch.
+- `cache_image_neighbors: true` reuses only the fixed raster indices, masks and
+  coordinates. The single cache is replaced on layout/radius/device changes
+  and cleared by model `.to(...)`. It is neither checkpoint state nor a DDP
+  buffer. 3D neighbors, features, matching and weights are never cached.
+- `shape_chunk_size: 65536` halves shape-head calls relative to 32768 for the
+  usual batch. This modestly increases temporary shape-head workspace; edge
+  chunk size stays 32768 and shape checkpointing remains on. Set it to 0 to
+  follow the old shared chunk size.
+
+Compilation happens on initial CUDA calls (including backward and a new tensor
+shape/mode). Initial steps can be slower. Compare warmed-up runs. GPU speed and
+peak memory must be measured on the training machine; no speedup is guaranteed.
+There is no global precision change, reduced capacity, new loss or custom CUDA
+extension. CPU/Dynamo tests do not substitute for CUDA/Inductor validation.
+
+For the old execution path, use these Hydra overrides together:
+
+```text
+model.encoder.moment_decoder.compile_kernels=false
+model.encoder.moment_decoder.shape_chunk_size=0
+model.encoder.moment_decoder.cache_image_neighbors=false
+```
+
+Run the numerical tests on the CUDA host (CUDA tests automatically run there):
+
+```bash
+python -m unittest discover -s tests -p 'test_moment_shape_speed.py' -v
+```
+
+One command compares both decoder implementations using the same weights,
+inputs and a forward+backward workload after compilation/warmup:
+
+```bash
+python -m scripts.benchmark_moment_shape --batch-size 16 --warmup 3 --steps 10
+```
+
+This standalone **single-GPU** benchmark includes exact 3D kNN and uses a
+synthetic scene. It excludes the backbone, renderer, optimizer and DDP, so its
+ratio is not the total training speedup. It checks sampled outputs/gradients
+before timing. Reported memory is PyTorch allocated memory, excluding CuPy and
+other GPU allocations. The normal training entry point remains
+`scripts/train_re10k.sh`; do not compare its first compiling steps to warmed-up
+baseline steps.

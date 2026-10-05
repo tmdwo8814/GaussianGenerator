@@ -10,12 +10,14 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from .appearance_neighborhood import ImageNeighborhood, incoming_softmax, merge_appearance_neighbors
+from .tensor_kernels import run_tensor_kernel
 
 
 class ImageNeighborhoodAppearance(nn.Module):
-    def __init__(self, feature_dim: int, context_dim: int):
+    def __init__(self, feature_dim: int, context_dim: int, *, compile_kernels: bool = False):
         super().__init__()
         self.context_dim = context_dim
+        self.compile_kernels = compile_kernels
         # Project once per support/slot instead of per edge at DPT width 256.
         self.source = nn.Linear(feature_dim + 3, 2 * context_dim)
         self.query = nn.Linear(feature_dim, context_dim, bias=False)
@@ -50,6 +52,16 @@ class ImageNeighborhoodAppearance(nn.Module):
         message = F.silu(values[:, None] + self.value_position(geometry))
         return weights[..., None] * message
 
+    def _aggregate_chunk(self, values, weights, source_points, means, source_xy, xy,
+                         source_views, view_ids, neighbors, added):
+        # Return [slots,D], not [chunk,K,D]. The compiler can fuse message
+        # generation with scatter; no mutation of a checkpoint input occurs.
+        messages = self._message_chunk(values, weights, source_points, means, source_xy,
+                                       xy, source_views, view_ids, neighbors, added)
+        return values.new_zeros(len(means), self.context_dim).index_add(
+            0, neighbors.flatten(), messages.reshape(-1, self.context_dim),
+        )
+
     def forward(self, points: Tensor, features: Tensor, rgb: Tensor, means: Tensor,
                 pooled: Tensor, geometry_neighbors: Tensor, image: ImageNeighborhood, *,
                 chunk_size: int, checkpoint_chunks: bool, collect_statistics: bool = False):
@@ -60,9 +72,11 @@ class ImageNeighborhoodAppearance(nn.Module):
         queries = self.query(pooled)
 
         def run(function, *args):
+            def operation(*inputs):
+                return run_tensor_kernel(function, self, *inputs, enabled=self.compile_kernels)
             if checkpoint_chunks and self.training and torch.is_grad_enabled():
-                return checkpoint(function, *args, use_reentrant=False, preserve_rng_state=False)
-            return function(*args)
+                return checkpoint(operation, *args, use_reentrant=False, preserve_rng_state=False)
+            return operation(*args)
 
         def edge_args(start, stop):
             return (points[start:stop], means, image.xy[start:stop], image.xy,
@@ -71,16 +85,26 @@ class ImageNeighborhoodAppearance(nn.Module):
         scores = []
         for start in range(0, len(points), chunk_size):
             stop = start + chunk_size
-            scores.append(run(self._score_chunk, keys[start:stop], queries, *edge_args(start, stop)))
+            scores.append(run(ImageNeighborhoodAppearance._score_chunk, keys[start:stop], queries,
+                              *edge_args(start, stop)))
         # This normalization includes the new edges independently of q_geometry.
         # Multiplying by q_geometry would set every new image edge to zero.
         weights = incoming_softmax(torch.cat(scores), neighbors, valid)
+        del scores
         context = points.new_zeros(len(points), self.context_dim)
         for start in range(0, len(points), chunk_size):
             stop = start + chunk_size
-            messages = run(self._message_chunk, values[start:stop], weights[start:stop],
-                           *edge_args(start, stop))
-            context.index_add_(0, neighbors[start:stop].flatten(), messages.reshape(-1, self.context_dim))
+            if self.compile_kernels:
+                contribution = run(ImageNeighborhoodAppearance._aggregate_chunk,
+                                   values[start:stop], weights[start:stop], *edge_args(start, stop))
+                context.add_(contribution)
+                del contribution
+            else:
+                messages = run(ImageNeighborhoodAppearance._message_chunk,
+                               values[start:stop], weights[start:stop], *edge_args(start, stop))
+                context.index_add_(0, neighbors[start:stop].flatten(),
+                                   messages.reshape(-1, self.context_dim))
+                del messages
         statistics = None
         if collect_statistics:
             statistics = appearance_statistics(weights, valid, image.valid, geometry_k)

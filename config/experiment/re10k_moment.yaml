@@ -26,6 +26,9 @@ model:
       num_neighbors: 16  # Includes self; candidates span both views.
       chunk_size: 32768
       checkpoint_chunks: true
+      compile_kernels: true  # Fuse bounded CUDA tensor kernels; first steps include compilation.
+      cache_image_neighbors: true  # Reuse fixed 2D indices; 3D kNN is still rebuilt every forward.
+      shape_chunk_size: 65536  # Only shape MLP: fewer calls, checkpoint still enabled.
       knn_backend: auto  # Exact CuPy GPU KD-tree on CUDA; SciPy on CPU.
       knn_query_backend: specialized  # Exact FP64 3D/K=16 query; cupy restores the previous query.
       knn_workers: 1  # Used only by the explicit SciPy backend.

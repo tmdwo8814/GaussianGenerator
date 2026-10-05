@@ -201,7 +201,7 @@ class MomentShapeTests(unittest.TestCase):
         options = from_dict(Cfg, OmegaConf.to_container(config.model.encoder.moment_decoder))
         self.assertTrue(options.moment_shape and options.separate_appearance and options.appearance_2d)
         self.assertEqual((options.feature_dim, options.appearance_dim, options.shape_hidden_dim), (256, 32, 128))
-        self.assertEqual(config.wandb.name, 'moment-shape-v1')
+        self.assertEqual(config.wandb.name, 'moment-shape')
         model = torch.nn.Module()
         model.encoder = torch.nn.Module()
         model.encoder.gaussian_decoder = Decoder(cfg())

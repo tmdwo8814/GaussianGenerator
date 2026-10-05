@@ -9,11 +9,13 @@ from math import isfinite, log
 import torch
 from torch import Tensor, nn
 
+from .tensor_kernels import run_tensor_kernel
+
 
 class MomentShape(nn.Module):
     def __init__(self, feature_dim: int, hidden_dim: int = 128,
                  scale_limit: float = 4.0, shear_limit: float = 0.5,
-                 epsilon: float = 1e-8):
+                 epsilon: float = 1e-8, *, compile_kernels: bool = False):
         super().__init__()
         if min(feature_dim, hidden_dim) < 1:
             raise ValueError('Moment shape feature and hidden dimensions must be positive')
@@ -26,6 +28,7 @@ class MomentShape(nn.Module):
         self.log_scale_limit = log(scale_limit)
         self.shear_limit = shear_limit
         self.epsilon = epsilon
+        self.compile_kernels = compile_kernels
         self.mlp = nn.Sequential(
             nn.Linear(feature_dim + 6, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 6),
         )
@@ -33,6 +36,10 @@ class MomentShape(nn.Module):
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, features: Tensor, covariance: Tensor) -> tuple[Tensor, Tensor]:
+        return run_tensor_kernel(MomentShape._forward, self, features, covariance,
+                                 enabled=self.compile_kernels)
+
+    def _forward(self, features, covariance):
         # Six unique entries, normalized by trace to describe shape rather
         # than scene/coverage scale. The clamp also handles zero-rank moments.
         trace = covariance.diagonal(dim1=-2, dim2=-1).sum(-1)
