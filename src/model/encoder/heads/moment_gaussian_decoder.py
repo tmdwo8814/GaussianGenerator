@@ -22,6 +22,7 @@ from ..common.appearance_neighborhood import make_image_neighborhood
 from ..common.image_neighborhood_appearance import ImageNeighborhoodAppearance
 from ..common.appearance_capacity import MultiHeadAppearance
 from ..common.separate_appearance import appearance_weights, appearance_weight_statistics
+from ..common.tensor_kernels import run_tensor_kernel
 
 
 @dataclass
@@ -31,6 +32,9 @@ class MomentDecoderCfg:
     num_neighbors: int = 16
     chunk_size: int = 32768
     checkpoint_chunks: bool = True
+    compile_kernels: bool = False  # Bounded CUDA tensor kernels, without CUDA graphs.
+    cache_image_neighbors: bool = True  # Cache only fixed raster metadata, not 3D kNN.
+    batch_appearance_projections: bool = False  # Independent heads in shared support-level GEMMs.
     knn_backend: str = 'auto'
     knn_query_backend: str = 'specialized'
     knn_workers: int = 1
@@ -57,6 +61,8 @@ class MomentGaussianDecoder(nn.Module):
     def __init__(self, cfg: MomentDecoderCfg, sh_degree: int = 4):
         super().__init__()
         self.cfg = cfg
+        self._image_cache_key = None
+        self._image_cache = None
         if cfg.knn_backend not in ('auto', 'cupy', 'scipy'):
             raise ValueError('knn_backend must be auto, cupy or scipy')
         if cfg.knn_query_backend not in ('specialized', 'cupy'):
@@ -122,6 +128,8 @@ class MomentGaussianDecoder(nn.Module):
                 if cfg.appearance_capacity:
                     self.appearance_reader = MultiHeadAppearance(
                         cfg.feature_dim, cfg.appearance_dim, cfg.appearance_heads,
+                        compile_kernels=cfg.compile_kernels,
+                        batch_projections=cfg.batch_appearance_projections,
                     )
                     self.appearance_sh_head = nn.Sequential(
                         nn.Linear(cfg.feature_dim + cfg.appearance_heads * cfg.appearance_dim,
@@ -131,9 +139,26 @@ class MomentGaussianDecoder(nn.Module):
                     nn.init.zeros_(self.appearance_sh_head[-1].weight)
                     nn.init.zeros_(self.appearance_sh_head[-1].bias)
                 else:
-                    self.appearance_reader = ImageNeighborhoodAppearance(cfg.feature_dim, cfg.appearance_dim)
+                    self.appearance_reader = ImageNeighborhoodAppearance(
+                        cfg.feature_dim, cfg.appearance_dim, compile_kernels=cfg.compile_kernels,
+                    )
                     self.appearance_sh_head = nn.Linear(cfg.appearance_dim, 3 * self.d_sh, bias=False)
                     nn.init.zeros_(self.appearance_sh_head.weight)
+
+    def _image_neighbors(self, image_shape, device):
+        key = (tuple(image_shape), tuple(self.cfg.appearance_2d_radii), device)
+        if not self.cfg.cache_image_neighbors or key != self._image_cache_key:
+            # Validation may run under inference_mode before the next train step.
+            with torch.inference_mode(False), torch.no_grad():
+                image = make_image_neighborhood(image_shape, self.cfg.appearance_2d_radii, device)
+            if not self.cfg.cache_image_neighbors:
+                return image
+            self._image_cache_key, self._image_cache = key, image
+        return self._image_cache
+
+    def _apply(self, function, recurse=True):
+        self._image_cache_key, self._image_cache = None, None
+        return super()._apply(function, recurse=recurse)
 
     def _run_chunk(self, function, *args):
         if self.cfg.checkpoint_chunks and self.training and torch.is_grad_enabled():
@@ -226,7 +251,8 @@ class MomentGaussianDecoder(nn.Module):
             )
             mean_offsets.index_add_(0, indices.reshape(-1), offsets.reshape(-1, 3))
         means = points + mean_offsets
-        pooled = pool_features(features, weights, neighbors, self.cfg.chunk_size)
+        pooled = pool_features(features, weights, neighbors, self.cfg.chunk_size,
+                               compile_kernels=self.cfg.compile_kernels)
 
         covariance = points.new_zeros(count, 9)
         for start in range(0, count, self.cfg.chunk_size):
@@ -243,10 +269,14 @@ class MomentGaussianDecoder(nn.Module):
         return (*moments, weights) if return_weights else moments
 
     def _capacity_sh_chunk(self, pooled, context):
+        return run_tensor_kernel(MomentGaussianDecoder._capacity_sh_values, self, pooled, context,
+                                 enabled=self.cfg.compile_kernels)
+
+    def _capacity_sh_values(self, pooled, context):
         return self.sh_head(pooled), self.appearance_sh_head(torch.cat((pooled, context), -1))
 
     def _capacity_harmonics(self, pooled, context, diagnostics):
-        """Checkpoint the MLP per chunk instead of saving a [B,M,384] concat."""
+        """Checkpoint bounded SH chunks, including inside the scene checkpoint."""
         shape = pooled.shape[:-1]
         pooled, context = pooled.reshape(-1, pooled.shape[-1]), context.reshape(-1, context.shape[-1])
         harmonics, squared = [], []
@@ -275,7 +305,8 @@ class MomentGaussianDecoder(nn.Module):
         Existing inner chunk checkpoints still bound edge recomputation memory.
         """
         selected = appearance_weights(geometry_weights, scores, neighbors)
-        appearance_pooled = pool_features(features, selected, neighbors, self.cfg.chunk_size)
+        appearance_pooled = pool_features(features, selected, neighbors, self.cfg.chunk_size,
+                                          compile_kernels=self.cfg.compile_kernels)
         context, stats = self.appearance_reader(
             points, features, rgb, means, geometry_pooled, neighbors, image,
             chunk_size=self.cfg.chunk_size, checkpoint_chunks=self.cfg.checkpoint_chunks,
@@ -363,8 +394,7 @@ class MomentGaussianDecoder(nn.Module):
                 raise ValueError("appearance_2d requires image_shape=(V,H,W) with V*H*W=M")
             if rgb is None or rgb.shape != points.shape or rgb.device != points.device:
                 raise ValueError("appearance_2d requires context RGB [B,M,3] on the points device")
-            # Same source-image layout for the local batch; compute it once.
-            image = make_image_neighborhood(image_shape, self.cfg.appearance_2d_radii, points.device)
+            image = self._image_neighbors(image_shape, points.device)
 
         moments = []
         contexts, statistics, appearance_features = [], [], []
@@ -418,6 +448,7 @@ class MomentGaussianDecoder(nn.Module):
                     selected = appearance_weights(geometry, scores, neighbors)
                     appearance_features.append(pool_features(
                         scene_features, selected, neighbors, self.cfg.chunk_size,
+                        compile_kernels=self.cfg.compile_kernels,
                     ))
                     if diagnostics is not None:
                         scene_stats.update(appearance_weight_statistics(geometry, selected, neighbors))

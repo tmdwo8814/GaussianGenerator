@@ -132,3 +132,71 @@ count, zero-initialized equivalence, nonzero gradients through every active
 head, unchanged geometry, image-only candidates, empty/border graphs,
 checkpoint parity, optimizer grouping, Hydra configuration and W&B logging.
 CUDA parity tests run only on a CUDA-capable host.
+
+## Speed optimization (same capacity)
+
+The current experiment additionally enables:
+
+```yaml
+compile_kernels: true
+cache_image_neighbors: true
+batch_appearance_projections: true
+```
+
+The shared moment-shape optimizations are ported to sparse feature pooling,
+2D score/message chunks and the fixed raster cache. Message chunks aggregate
+into [slots,32] before returning, allowing compiler fusion of messages and
+scatter. The nonlinear SH MLP also uses regional compilation. Compilation is
+limited to tensor kernels; the renderer, kNN, scene loop and checkpoint
+scheduling remain eager. CUDA graphs and precision changes are not enabled.
+
+For this multi-head model, independent source projection weights are
+concatenated for one support-level Linear; independent query weights are
+concatenated for another. Results are split back into the original heads.
+Each head keeps its own parameters and its own incoming softmax. With two
+heads this replaces four support/query GEMM calls with two per scene evaluation
+(including recomputation), with the same mathematical projections. It does not
+combine scores or normalize across heads. The learned function and total
+154,649 parameters are unchanged.
+
+Only support/slot projections are batched. Edge features are still processed
+one head and one chunk at a time; there is no [M,K,heads,D] expansion. Both
+`checkpoint_appearance` and `checkpoint_chunks` stay enabled. SH/edge chunk
+size remains 32768: the shape-only larger chunk from moment-shape is not
+applicable here. Batched projections can modestly increase temporary live
+storage; CPU retention tests cannot establish CUDA peak memory.
+
+The one-entry raster cache contains only image indices, masks and pixel
+coordinates. It is invalidated when shape/radii/device change or `.to(...)`
+is called; it is not checkpoint state or a DDP buffer. Geometry neighbors and
+all learned quantities are computed afresh. The 3D search remains outside
+checkpointing, once per scene even when backward recomputes appearance.
+
+Parameters, optimizer ordering, diagnostic definitions, FP32, head widths,
+candidate sets, losses and existing model checkpoint compatibility are retained.
+Different accumulation/GEMM ordering can introduce small floating-point
+variation. Final reconstruction metrics or a GPU speedup are not guaranteed.
+
+Disable the three flags above together to recover the previous execution
+path while keeping the same model and the earlier OOM protections. CPU always
+uses eager tensor operations. CUDA first use (and a new shape/mode) includes
+compilation time, so compare warmed-up steps. No custom CUDA extension is added.
+
+Verification and one-process, single-GPU comparison:
+
+```bash
+python -m unittest discover -s tests -p 'test_capacity_speed.py' -v
+python -m scripts.benchmark_appearance_capacity --batch-size 16 --warmup 3 --steps 10
+```
+
+The test covers independently trained heads, full output/input/parameter
+first derivatives, nested scene/chunk checkpointing with AOTAutograd, strict
+state loading, cache invalidation and inference-to-training transitions. A
+full-width CPU autograd retention guard complements the earlier memory tests;
+CUDA/Inductor tests run only on a CUDA host.
+
+The benchmark compares identical synthetic inputs/weights, checks sampled
+outputs and gradients, and measures decoder forward/backward including exact
+kNN. It excludes backbone, renderer, optimizer and DDP; its ratio is not total
+training speedup. Peak memory reports PyTorch allocation, excluding CuPy and
+other GPU allocations. The training entry point remains `scripts/train_re10k.sh`.
