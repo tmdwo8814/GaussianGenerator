@@ -5,7 +5,7 @@
 #SBATCH --mem=128G
 #SBATCH -p batch_grad
 #SBATCH -w ariel-n1
-#SBATCH -t 5-00:00:00
+#SBATCH -t 6-00:00:00
 #SBATCH -o logs/slurm-%A.out
 #SBATCH --export=ALL
 
