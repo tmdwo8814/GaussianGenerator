@@ -47,6 +47,18 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         cam_trans_delta: Float[Tensor, "batch view 3"] | None = None,
     ) -> DecoderOutput:
         b, v, _, _ = extrinsics.shape
+        if gaussians.active_mask is not None:
+            # Scene counts may differ. Compact BEFORE repeating target views;
+            # indexing preserves attribute/pose gradients, and each rasterizer
+            # invocation receives only the selected number of Gaussians.
+            results = [self.forward(
+                gaussians.compact_scene(i), extrinsics[i:i + 1], intrinsics[i:i + 1],
+                near[i:i + 1], far[i:i + 1], image_shape, depth_mode,
+                None if cam_rot_delta is None else cam_rot_delta[i:i + 1],
+                None if cam_trans_delta is None else cam_trans_delta[i:i + 1],
+            ) for i in range(b)]
+            return DecoderOutput(torch.cat([x.color for x in results]),
+                                 torch.cat([x.depth for x in results]))
         color, depth = render_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),
             rearrange(intrinsics, "b v i j -> (b v) i j"),

@@ -161,6 +161,10 @@ class ModelWrapper(LightningModule):
         diagnostics = None
         encoder_kwargs = {}
         moment_decoder = getattr(self.encoder, 'gaussian_decoder', None)
+        control_dump = None
+        if getattr(moment_decoder, 'slot_controller', None) is not None:
+            control_dump = {}
+            encoder_kwargs['control_dump'] = control_dump
         if moment_decoder is not None and getattr(moment_decoder.cfg, 'appearance_2d', False):
             interval = moment_decoder.cfg.log_every_n_steps
             if interval:
@@ -203,6 +207,15 @@ class ModelWrapper(LightningModule):
             loss = loss_fn.forward(output, batch, gaussians, self.global_step)
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
+
+        if control_dump is not None:
+            budget_loss, control_logs = moment_decoder.slot_controller.budget_loss(
+                control_dump, self.global_step,
+            )
+            total_loss = total_loss + budget_loss
+            self.log('loss/slot_budget', budget_loss, on_step=True, on_epoch=False, sync_dist=True)
+            self.log_dict({f'slot/{key}': value for key, value in control_logs.items()},
+                          on_step=True, on_epoch=False, sync_dist=True)
 
         # distillation
         if self.distiller is not None and self.global_step <= self.train_cfg.distill_max_steps:

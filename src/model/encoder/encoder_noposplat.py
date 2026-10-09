@@ -151,6 +151,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
         diagnostics_dump: Optional[dict] = None,
+        control_dump: Optional[dict] = None,
     ) -> Gaussians:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
@@ -203,6 +204,8 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
                 rgb = rgb * rgb.new_tensor(self.cfg.input_std) + rgb.new_tensor(self.cfg.input_mean)
                 appearance_kwargs = {'image_shape': (v, h, w), 'rgb': rgb,
                                      'diagnostics': diagnostics_dump}
+            if self.gaussian_decoder.cfg.slot_control.enabled:
+                appearance_kwargs.update(global_step=global_step, control_dump=control_dump)
             gaussians = self.gaussian_decoder(points, features, **appearance_kwargs)
             if visualization_dump is not None:
                 means = gaussians.means.reshape(b, v, h, w, 1, 3)

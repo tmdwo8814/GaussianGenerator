@@ -23,6 +23,7 @@ from ..common.image_neighborhood_appearance import ImageNeighborhoodAppearance
 from ..common.appearance_capacity import MultiHeadAppearance
 from ..common.separate_appearance import appearance_weights, appearance_weight_statistics
 from ..common.tensor_kernels import run_tensor_kernel
+from ..common.slot_control import SlotControlCfg, SlotController
 
 
 @dataclass
@@ -55,6 +56,7 @@ class MomentDecoderCfg:
     appearance_mlp_dim: int = 256
     checkpoint_appearance: bool = True  # Recompute one complete capacity scene in backward.
     log_every_n_steps: int = 50  # 0 disables detached diagnostics
+    slot_control: SlotControlCfg = field(default_factory=SlotControlCfg)
 
 
 class MomentGaussianDecoder(nn.Module):
@@ -144,6 +146,32 @@ class MomentGaussianDecoder(nn.Module):
                     )
                     self.appearance_sh_head = nn.Linear(cfg.appearance_dim, 3 * self.d_sh, bias=False)
                     nn.init.zeros_(self.appearance_sh_head.weight)
+
+        self.slot_controller = None
+        if cfg.slot_control.enabled:
+            with torch.random.fork_rng(devices=[]):
+                self.slot_controller = SlotController(
+                    cfg.feature_dim, cfg.slot_control, chunk_size=cfg.chunk_size,
+                    epsilon=cfg.mass_epsilon, checkpoint_chunks=cfg.checkpoint_chunks,
+                    compile_kernels=cfg.compile_kernels,
+                )
+
+    def _attach_slot_control(self, gaussians, masks, reports, control_dump, global_step):
+        if self.slot_controller is None:
+            return gaussians
+        # Keep the dense source layout for moment/appearance features and image
+        # diagnostics. The renderer physically selects active primitives before
+        # rasterization; it does not merely render M zero-opacity placeholders.
+        if self.slot_controller.progress(global_step) > 0:
+            gaussians.active_mask = torch.stack(masks)
+        if control_dump is not None:
+            control_dump['active_count'] = torch.stack([x['active_count'] for x in reports]).sum()
+            control_dump['candidate_count'] = torch.stack([x['candidate_count'] for x in reports]).sum()
+            control_dump['scene_count'] = gaussians.means.new_tensor(len(reports))
+            for key in ('raw_active_fraction', 'fallback_fraction', 'probability_mean', 'mass_relative_error'):
+                values = torch.stack([x[key] for x in reports])
+                control_dump[key] = values.max() if key == 'mass_relative_error' else values.mean()
+        return gaussians
 
     def _image_neighbors(self, image_shape, device):
         key = (tuple(image_shape), tuple(self.cfg.appearance_2d_radii), device)
@@ -372,7 +400,8 @@ class MomentGaussianDecoder(nn.Module):
 
     def forward(self, points: Tensor, features: Tensor, *,
                 image_shape: tuple[int, int, int] | None = None,
-                rgb: Tensor | None = None, diagnostics: dict | None = None) -> Gaussians:
+                rgb: Tensor | None = None, diagnostics: dict | None = None,
+                global_step: int | None = None, control_dump: dict | None = None) -> Gaussians:
         """[B, M, 3] points + [B, M, D] features -> standard Gaussians.
 
         M can represent pixels, voxels or tokens from any number of views.
@@ -381,6 +410,10 @@ class MomentGaussianDecoder(nn.Module):
         appearance_2d requires image_shape=(V,H,W), M=V*H*W and context RGB
         [B,M,3] in [0,1], all in the SAME view-major raster order as points.
         """
+        if not self.training:
+            # Inference must use learned selection even when a caller uses the
+            # encoder's default step=0. Warmup only governs optimization.
+            global_step = None
         if points.ndim != 3 or points.shape[-1] != 3 or min(points.shape[:2]) < 1:
             raise ValueError("points must have shape [B, M, 3], with B, M > 0")
         if features.shape != (*points.shape[:2], self.cfg.feature_dim):
@@ -399,6 +432,7 @@ class MomentGaussianDecoder(nn.Module):
         moments = []
         contexts, statistics, appearance_features = [], [], []
         completed_scenes = []
+        slot_masks, slot_reports = [], []
         with torch.autocast(device_type=points.device.type, enabled=False):
             search_points = points.float()
             # One host-visible finite check per batch, not one per scene.
@@ -417,10 +451,18 @@ class MomentGaussianDecoder(nn.Module):
                 scene_stats = {}
                 if self.appearance_head is None:
                     q = self.predict_allocation(normalized, scene_features, neighbors)
-                    scene_moments = self.aggregate_moments(normalized, scene_features, neighbors, q)
                 else:
                     q, scores = self.predict_allocation(normalized, scene_features, neighbors,
                                                         return_appearance=True)
+                if self.slot_controller is not None:
+                    q, mask, report = self.slot_controller(
+                        normalized, scene_features, neighbors, q, global_step=global_step,
+                    )
+                    slot_masks.append(mask)
+                    slot_reports.append(report)
+                if self.appearance_head is None:
+                    scene_moments = self.aggregate_moments(normalized, scene_features, neighbors, q)
+                else:
                     *scene_moments, geometry = self.aggregate_moments(
                         normalized, scene_features, neighbors, q, return_weights=True,
                     )
@@ -474,10 +516,11 @@ class MomentGaussianDecoder(nn.Module):
                         diagnostics[key] = (values.square().mean().sqrt()
                                             if key in ('base_sh_rms', 'extra_sh_rms')
                                             else values.mean())
-                return Gaussians(**{
+                gaussians = Gaussians(**{
                     key: torch.cat([getattr(scene, key) for scene in completed_scenes], dim=0)
                     for key in ('means', 'covariances', 'harmonics', 'opacities')
                 })
+                return self._attach_slot_control(gaussians, slot_masks, slot_reports, control_dump, global_step)
             batched_moments = [torch.stack(values) for values in zip(*moments)]
             del moments
             appearance_context = torch.stack(contexts) if contexts else None
@@ -495,4 +538,4 @@ class MomentGaussianDecoder(nn.Module):
                             *appearance_context.shape[:2], 3, self.d_sh,
                         ) * self.sh_mask
                         diagnostics['context_sh_rms'] = extra_sh.square().mean().sqrt()
-            return gaussians
+            return self._attach_slot_control(gaussians, slot_masks, slot_reports, control_dump, global_step)

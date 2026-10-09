@@ -192,7 +192,8 @@ class AppearanceCapacityTests(unittest.TestCase):
         self.assertEqual((options.feature_dim, options.appearance_heads, options.appearance_dim,
                           options.appearance_mlp_dim), (256, 2, 32, 128))
         self.assertTrue(options.checkpoint_appearance)
-        self.assertEqual(sum(p.numel() for p in Decoder(options).parameters()), 154649)
+        self.assertTrue(options.slot_control.enabled)
+        self.assertEqual(sum(p.numel() for p in Decoder(options).parameters()), 167354)
         model = torch.nn.Module()
         model.encoder = torch.nn.Module()
         model.encoder.gaussian_decoder = Decoder(cfg())

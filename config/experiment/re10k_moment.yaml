@@ -5,8 +5,8 @@ defaults:
   - _self_
 
 wandb:
-  name: final
-  tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, final]
+  name: final_control
+  tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, final, slot_control]
 
 # Final decoder: DPT256 moment + 2D neighbors + separate weights + appearance capacity.
 # Training length is inherited from re10k.yaml (trainer.max_steps); set it manually.
@@ -42,3 +42,12 @@ model:
       covariance_floor: 0.0001  # Standard deviation relative to scene scale.
       mass_epsilon: 0.000001
       scene_epsilon: 0.000001
+      slot_control:
+        enabled: true
+        feature_dim: 32  # Gate only; the main decoder keeps DPT256.
+        hidden_dim: 64
+        target_fraction: 0.75  # Global training-batch budget, not a fixed per-scene top-k.
+        loss_weight: 0.01  # Multiplies max(active_fraction - target_fraction, 0)^2.
+        warmup_steps: 10000  # From-scratch decoder training: all slots stay open.
+        ramp_steps: 10000  # Then linearly ramp the count-loss coefficient.
+        initial_probability: 0.9  # Zero last-layer weights make every slot initially open.
