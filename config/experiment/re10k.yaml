@@ -7,7 +7,7 @@ defaults:
   - override /loss: [mse, lpips]
 
 wandb:
-  name: baseline_analysis
+  name: noposplat
   tags: [re10k, 256x256]
 
 model:
