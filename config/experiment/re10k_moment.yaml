@@ -5,9 +5,11 @@ defaults:
   - _self_
 
 wandb:
-  name: appearance_capacity
-  tags: [re10k, 256x256, moment_decoder, appearance_capacity, v1]
+  name: gaussian_decoder_final
+  tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, final]
 
+# Final decoder: DPT256 moment + 2D neighbors + separate weights + appearance capacity.
+# Training length is inherited from re10k.yaml (trainer.max_steps); set it manually.
 model:
   encoder:
     gs_params_head_type: moment
