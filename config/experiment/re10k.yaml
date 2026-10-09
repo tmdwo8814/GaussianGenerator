@@ -7,7 +7,7 @@ defaults:
   - override /loss: [mse, lpips]
 
 wandb:
-  name: baseline_analysis
+  name: noposplat
   tags: [re10k, 256x256]
 
 model:
@@ -36,7 +36,7 @@ data_loader:
 
 trainer:
   # max_steps: 18751
-  max_steps: 80001
+  max_steps: 140001
   # val_check_interval: 1500
   val_check_interval: null
 
