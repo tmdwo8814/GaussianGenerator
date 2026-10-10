@@ -168,9 +168,16 @@ class MomentGaussianDecoder(nn.Module):
             control_dump['active_count'] = torch.stack([x['active_count'] for x in reports]).sum()
             control_dump['candidate_count'] = torch.stack([x['candidate_count'] for x in reports]).sum()
             control_dump['scene_count'] = gaussians.means.new_tensor(len(reports))
-            for key in ('raw_active_fraction', 'fallback_fraction', 'probability_mean', 'mass_relative_error'):
+            for key in reports[0]:
+                if key in ('active_count', 'candidate_count'):
+                    continue
                 values = torch.stack([x[key] for x in reports])
-                control_dump[key] = values.max() if key == 'mass_relative_error' else values.mean()
+                if key.endswith('_min'):
+                    control_dump[key] = values.min()
+                elif key.endswith('_max') or key == 'mass_relative_error':
+                    control_dump[key] = values.max()
+                else:
+                    control_dump[key] = values.mean()
         return gaussians
 
     def _image_neighbors(self, image_shape, device):

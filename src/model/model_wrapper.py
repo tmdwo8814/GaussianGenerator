@@ -214,8 +214,12 @@ class ModelWrapper(LightningModule):
             )
             total_loss = total_loss + budget_loss
             self.log('loss/slot_budget', budget_loss, on_step=True, on_epoch=False, sync_dist=True)
-            self.log_dict({f'slot/{key}': value for key, value in control_logs.items()},
-                          on_step=True, on_epoch=False, sync_dist=True)
+            for key, value in control_logs.items():
+                # Preserve worst-case support statistics across DDP ranks.
+                reduction = ('min' if key.endswith('_min') else
+                             'max' if key.endswith('_max') or key == 'mass_relative_error' else 'mean')
+                self.log(f'slot/{key}', value, on_step=True, on_epoch=False,
+                         sync_dist=True, reduce_fx=reduction)
 
         # distillation
         if self.distiller is not None and self.global_step <= self.train_cfg.distill_max_steps:
@@ -247,6 +251,46 @@ class ModelWrapper(LightningModule):
             self.step_tracker.set_step(self.global_step)
 
         return total_loss
+
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None,
+                                    gradient_clip_algorithm=None):
+        moment_decoder = getattr(self.encoder, 'gaussian_decoder', None)
+        if getattr(moment_decoder, 'slot_controller', None) is None:
+            self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val,
+                                gradient_clip_algorithm=gradient_clip_algorithm)
+            return
+
+        # Lightning calls this after backward/AMP unscaling and before the
+        # optimizer update. Reuse the existing norm computation for the guard.
+        parameters = [p for group in optimizer.param_groups for p in group['params']
+                      if p.grad is not None]
+        if not parameters:
+            return
+        algorithm = getattr(gradient_clip_algorithm, 'value', gradient_clip_algorithm) or 'norm'
+        limit = gradient_clip_val if gradient_clip_val is not None else 0.
+        max_norm = limit if algorithm == 'norm' and limit > 0 else float('inf')
+        try:
+            torch.nn.utils.clip_grad_norm_(parameters, max_norm, error_if_nonfinite=True)
+        except RuntimeError as error:
+            if 'non-finite' not in str(error):
+                raise
+            # Scan names only on failure; healthy steps do not synchronize once
+            # per tensor. The optimizer has not changed any model weights yet.
+            optimized = {id(p) for p in parameters}
+            bad_names = []
+            for name, parameter in self.named_parameters():
+                if id(parameter) in optimized and not torch.isfinite(parameter.grad).all():
+                    bad_names.append(name)
+                    if len(bad_names) == 8:
+                        break
+            detail = (', '.join(bad_names) if bad_names else
+                      'all gradient elements are finite, but the total gradient norm overflowed')
+            raise RuntimeError(
+                f'Non-finite gradients before optimizer update: step={self.global_step}, '
+                f'rank={self.global_rank}; {detail}. No optimizer update was applied.'
+            ) from error
+        if algorithm == 'value' and limit > 0:
+            self.clip_gradients(optimizer, gradient_clip_val=limit, gradient_clip_algorithm=algorithm)
 
     def _eval_step(self) -> int:
         return getattr(self, "_auto_eval_step", self.global_step)

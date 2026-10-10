@@ -5,7 +5,7 @@ import copy
 import importlib
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from einops import rearrange, repeat
@@ -58,7 +58,7 @@ class SlotControlTests(unittest.TestCase):
         # Closed slot 1 remains a SOURCE of its complete budget.
         self.assertGreater(allocated[1].sum().item(), 0)
         torch.testing.assert_close(control.redistribute_mass(q, neighbors, torch.ones(3)), q,
-                                   rtol=0, atol=0)
+                                   rtol=2e-6, atol=1e-7)
         (allocated * torch.randn_like(allocated)).sum().backward()
         for gradient in (logits.grad, budgets.grad, gate.grad):
             self.assertTrue(torch.isfinite(gradient).all())
@@ -79,6 +79,87 @@ class SlotControlTests(unittest.TestCase):
         out = control.redistribute_mass(torch.zeros(3, 3), neighbors, opened.float())
         self.assertTrue(torch.isfinite(out).all())
         self.assertEqual(out.sum().item(), 0)
+
+    def test_tiny_remaining_mass_does_not_poison_normalization_backward(self):
+        neighbors = torch.tensor([[0, 1], [1, 0]])
+        q = torch.tensor([[1e-25, 1.], [1., 1e-25]], requires_grad=True)
+        gates = torch.tensor([1., 0.], requires_grad=True)
+        out = control.redistribute_mass(q, neighbors, gates)
+        out[0, 0].backward()
+        # The former budget/remaining-first expression yielded NaN/Inf here.
+        torch.testing.assert_close(out, torch.tensor([[1., 0.], [0., 1.]]))
+        self.assertTrue(torch.isfinite(q.grad).all())
+        self.assertTrue(torch.isfinite(gates.grad).all())
+        # Large STE gradients still require coverage protection, tested below.
+
+    def test_retention_protection_keeps_softmax_budget_and_gate_gradients_finite(self):
+        neighbors = torch.tensor([[0, 1], [1, 0]])
+        for gap in (23., 44., 58., 81., 110.):
+            with self.subTest(logit_gap=gap):
+                logits = torch.tensor([[-gap, 0.], [0., -gap]], requires_grad=True)
+                budget_logits = torch.zeros(2, 1, requires_grad=True)
+                gate_logits = torch.tensor([.4, -.4], requires_grad=True)
+                q = logits.softmax(-1) * (2 * budget_logits.sigmoid())
+                p = gate_logits.sigmoid()
+                opened = control.repair_coverage(p > .5, p, neighbors, q)
+                self.assertEqual(opened.tolist(), [True, True])
+                gates = opened.float() + (p - p.detach())
+                out = control.redistribute_mass(q, neighbors, gates)
+                out[0, 0].backward()
+                torch.testing.assert_close(out.sum(-1), q.sum(-1))
+                for gradient in (logits.grad, budget_logits.grad, gate_logits.grad):
+                    self.assertTrue(torch.isfinite(gradient).all())
+                    self.assertTrue(torch.isfinite(gradient.norm()))
+
+    def test_repair_bounds_amplification_for_k16_and_zero_budgets(self):
+        for k in (1, 2, 16):
+            neighbors = (torch.arange(32)[:, None] + torch.arange(k)) % 32
+            q = (torch.randn(32, k) * 30).softmax(-1) * torch.rand(32, 1)
+            q[0] = 0
+            p = torch.rand(32)
+            raw = p > .8
+            opened = control.repair_coverage(raw, p, neighbors, q)
+            self.assertTrue(opened[raw].all())
+            self.assertTrue(opened[neighbors].any(-1).all())
+            budget = q.sum(-1)
+            remaining = (q * opened[neighbors]).sum(-1)
+            positive = budget > 0
+            self.assertTrue((remaining[positive] >= budget[positive] / k - 1e-7).all())
+            self.assertLessEqual((budget[positive] / remaining[positive]).max().item(), k + 1e-5)
+            out = control.redistribute_mass(q, neighbors, opened.float())
+            torch.testing.assert_close(out.sum(-1), budget)
+            self.assertEqual(out[~opened[neighbors]].abs().sum().item(), 0)
+            all_open = torch.ones(32, dtype=torch.bool)
+            torch.testing.assert_close(control.repair_coverage(all_open, p, neighbors, q), all_open)
+
+    def test_zero_and_subnormal_budget_fallback_has_finite_backward(self):
+        for scale in (0., 1e-40, 1e-37, 1e-20):
+            with self.subTest(budget_scale=scale):
+                neighbors = graph()
+                q = (torch.rand(3, 3) * scale).requires_grad_()
+                p = torch.tensor([.8, .1, .9], requires_grad=True)
+                opened = control.repair_coverage(p > .5, p, neighbors, q)
+                gates = opened.float() + (p - p.detach())
+                out = control.redistribute_mass(q, neighbors, gates)
+                (out * torch.randn_like(out)).sum().backward()
+                torch.testing.assert_close(out.sum(-1), q.sum(-1), rtol=2e-6, atol=1e-44)
+                self.assertTrue(torch.isfinite(q.grad).all())
+                self.assertTrue(torch.isfinite(p.grad).all())
+
+    def test_controller_reports_retention_before_and_after_protection(self):
+        model = controller()
+        neighbors = torch.tensor([[0, 1], [1, 0]])
+        p = torch.tensor([.8, .1], requires_grad=True)
+        q = torch.tensor([[1e-25, 1.], [1., 1e-25]])
+        with patch.object(model, '_probabilities', return_value=p):
+            _, opened, state = model(torch.randn(2, 3), torch.randn(2, 5), neighbors, q,
+                                     global_step=20)
+        self.assertEqual(opened.tolist(), [True, True])
+        self.assertLess(state['raw_retained_mass_fraction_min'].item(), 1e-24)
+        self.assertEqual(state['retained_mass_fraction_min'].item(), 1.)
+        self.assertEqual(state['redistribution_scale_max'].item(), 1.)
+        self.assertEqual(state['fallback_fraction'].item(), .5)
+        self.assertTrue(all(torch.isfinite(v).all() for v in state.values()))
 
     def test_budget_gradient_trains_controller_not_original_features_or_mass(self):
         model = controller()
@@ -105,7 +186,10 @@ class SlotControlTests(unittest.TestCase):
         points, features, q = torch.randn(3, 3), torch.randn(3, 5), torch.rand(3, 3)
         for step, coefficient in ((0, 0), (10, 0), (15, .005), (20, .01)):
             output, mask, state = model(points, features, graph(), q, global_step=step)
-            torch.testing.assert_close(output, q, rtol=0, atol=0)
+            # Warmup bypasses normalization exactly. Active normalization can
+            # differ by FP32 roundoff even when every slot remains open.
+            torch.testing.assert_close(output, q, rtol=0 if step <= 10 else 2e-6,
+                                       atol=0 if step <= 10 else 1e-7)
             self.assertTrue(mask.all())
             state['scene_count'] = torch.tensor(1.)
             loss, logs = model.budget_loss(state, step)
@@ -211,7 +295,8 @@ class SlotControlTests(unittest.TestCase):
             state = {}
             b = controlled(points, features, image_shape=(2, 2, 3), rgb=rgb, global_step=step, control_dump=state)
             for x, y in zip(attributes(a), attributes(b)):
-                torch.testing.assert_close(x, y, rtol=0, atol=0)
+                torch.testing.assert_close(x, y, rtol=0 if step == 0 else 2e-6,
+                                           atol=0 if step == 0 else 1e-7)
             self.assertEqual(state['active_count'].item(), 12)
 
         # Fully connected candidate sets make coverage deterministic in a tiny
@@ -271,13 +356,21 @@ class SlotControlTests(unittest.TestCase):
     def test_training_adds_budget_loss_and_logs_true_retained_and_removed_ratios(self):
         model = controller()
         logs = {}
+        log_options = {}
+
+        def log(key, value, **kwargs):
+            logs[key] = value
+            log_options[key] = kwargs
 
         class Encoder:
             gaussian_decoder = SimpleNamespace(cfg=SimpleNamespace(appearance_2d=False), slot_controller=model)
 
             def __call__(self, context, step, visualization_dump=None, control_dump=None):
                 control_dump.update(active_count=torch.tensor(9., requires_grad=True),
-                                    candidate_count=torch.tensor(10.), scene_count=torch.tensor(1.))
+                                    candidate_count=torch.tensor(10.), scene_count=torch.tensor(1.),
+                                    raw_retained_mass_fraction_min=torch.tensor(.001),
+                                    retained_mass_fraction_min=torch.tensor(.1),
+                                    redistribution_scale_max=torch.tensor(10.))
 
         namespace = dict(torch=torch, rearrange=rearrange,
                          compute_psnr=lambda target, image: image.flatten(1).mean(1))
@@ -291,7 +384,7 @@ class SlotControlTests(unittest.TestCase):
             train_cfg=SimpleNamespace(depth_mode=None, print_log_every_n_steps=100),
             losses=[SimpleNamespace(name='mse', forward=lambda *a: torch.tensor(2.))],
             global_rank=1, global_step=20, step_tracker=None,
-            log=lambda k, v, **kw: logs.update({k: v}), log_dict=lambda values, **kw: logs.update(values),
+            log=log, log_dict=lambda values, **kw: logs.update(values),
         )
         loss = train(wrapper, batch, 0)
         self.assertAlmostEqual(loss.item(), 2 + .01 * (.9 - .75)**2, places=6)
@@ -300,6 +393,72 @@ class SlotControlTests(unittest.TestCase):
         self.assertEqual(logs['slot/gaussians_before'].item(), 10)
         self.assertEqual(logs['slot/gaussians_after'].item(), 9)
         self.assertIn('loss/slot_budget', logs)
+        self.assertEqual(log_options['slot/raw_retained_mass_fraction_min']['reduce_fx'], 'min')
+        self.assertEqual(log_options['slot/retained_mass_fraction_min']['reduce_fx'], 'min')
+        self.assertEqual(log_options['slot/redistribution_scale_max']['reduce_fx'], 'max')
+
+    def test_decoder_retention_diagnostics_preserve_extrema_across_scenes(self):
+        decoder = Decoder(Cfg(feature_dim=5, hidden_dim=8,
+                              slot_control=control.SlotControlCfg(enabled=True)))
+        reports = [dict(active_count=torch.tensor(2.), candidate_count=torch.tensor(3.),
+                        retained_mass_fraction_min=torch.tensor(low),
+                        redistribution_scale_max=torch.tensor(high),
+                        fallback_fraction=torch.tensor(fallback))
+                   for low, high, fallback in ((.8, 1.25, .1), (.1, 10., .3))]
+        dump = {}
+        decoder._attach_slot_control(SimpleNamespace(means=torch.zeros(2, 3, 3)),
+                                     [torch.ones(3, dtype=torch.bool)] * 2, reports, dump, 20000)
+        self.assertAlmostEqual(dump['retained_mass_fraction_min'].item(), .1)
+        self.assertEqual(dump['redistribution_scale_max'].item(), 10.)
+        self.assertAlmostEqual(dump['fallback_fraction'].item(), .2)
+        self.assertEqual(dump['active_count'].item(), 4.)
+
+    def test_gradient_guard_matches_existing_clipping_and_rejects_bad_updates(self):
+        clip = method(ROOT / 'src/model/model_wrapper.py', 'ModelWrapper',
+                      'configure_gradient_clipping', dict(torch=torch))
+        for bad_value in (None, float('nan'), float('inf'), 1e25):
+            with self.subTest(bad_value=bad_value):
+                model = torch.nn.Linear(2, 1)
+                optimizer = torch.optim.AdamW(model.parameters(), lr=.01)
+                before = [p.detach().clone() for p in model.parameters()]
+                for p in model.parameters():
+                    p.grad = torch.full_like(p, 2. if bad_value is None else bad_value)
+                wrapper = SimpleNamespace(
+                    encoder=SimpleNamespace(gaussian_decoder=SimpleNamespace(slot_controller=object())),
+                    global_step=10371, global_rank=2, named_parameters=model.named_parameters,
+                    clip_gradients=Mock(),
+                )
+                if bad_value is None:
+                    reference = copy.deepcopy(model)
+                    for a, b in zip(reference.parameters(), model.parameters()):
+                        a.grad = b.grad.clone()
+                    torch.nn.utils.clip_grad_norm_(reference.parameters(), .5)
+                    clip(wrapper, optimizer, .5, 'norm')
+                    for a, b in zip(reference.parameters(), model.parameters()):
+                        torch.testing.assert_close(a.grad, b.grad, rtol=0, atol=0)
+                else:
+                    def closure():
+                        clip(wrapper, optimizer, .5, 'norm')
+                    with self.assertRaisesRegex(RuntimeError, 'step=10371, rank=2') as caught:
+                        optimizer.step(closure=closure)
+                    if bad_value == 1e25:
+                        self.assertIn('norm overflowed', str(caught.exception))
+                    else:
+                        self.assertIn('weight', str(caught.exception))
+                    self.assertEqual(len(optimizer.state), 0)
+                for old, new in zip(before, model.parameters()):
+                    torch.testing.assert_close(old, new, rtol=0, atol=0)
+                wrapper.clip_gradients.assert_not_called()
+
+    def test_disabled_slot_control_keeps_default_lightning_clipping(self):
+        clip = method(ROOT / 'src/model/model_wrapper.py', 'ModelWrapper',
+                      'configure_gradient_clipping', dict(torch=torch))
+        wrapper = SimpleNamespace(encoder=SimpleNamespace(), clip_gradients=Mock())
+        optimizer = object()
+        clip(wrapper, optimizer, .5, 'norm')
+        wrapper.clip_gradients.assert_called_once_with(
+            optimizer, gradient_clip_val=.5, gradient_clip_algorithm='norm',
+        )
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is required for controller device parity')
     def test_cuda_controller_matches_cpu_outputs_and_gradients(self):

@@ -32,20 +32,25 @@ class SlotControlCfg:
 
 def repair_coverage(opened: Tensor, probabilities: Tensor, neighbors: Tensor,
                     mass: Tensor) -> Tensor:
-    """Open one scored candidate for uncovered rows, globally shared by slots.
+    """Retain at least 1/K of each support's original allocation before rescaling.
 
-    Prefer positive-mass edges when they exist, so an open but underflowed
-    softmax edge cannot leave a nonzero support budget without a destination.
-    No greedy Python loop, extra kNN, or distance/opacity threshold is used.
+    Reopen the largest allocation if too little mass survives. Its mass is at
+    least budget/K, bounding the redistribution factor by K. Gate probability
+    only breaks ties (and selects a destination for zero-budget rows). Slot
+    openings are shared globally, so other supports can only gain coverage.
     """
     with torch.no_grad():
-        positive = mass > 0
-        usable = positive | ~positive.any(-1, keepdim=True)
-        uncovered = ~(opened[neighbors] & usable).any(-1)
-        scores = probabilities[neighbors].masked_fill(~usable, -torch.inf)
+        edge_open = opened[neighbors]
+        budget = mass.sum(-1)
+        remaining = (mass * edge_open).sum(-1)
+        # The explicit zero check also covers subnormal budget/K underflow.
+        insufficient = (remaining < budget / neighbors.shape[1]) | ((remaining == 0) & (budget > 0))
+        needs_repair = insufficient | ~edge_open.any(-1)
+        largest = mass == mass.amax(-1, keepdim=True)
+        scores = probabilities[neighbors].masked_fill(~largest, -torch.inf)
         chosen = neighbors.gather(1, scores.argmax(-1, keepdim=True)).squeeze(-1)
         additions = torch.zeros_like(probabilities).index_add(
-            0, chosen, uncovered.to(probabilities.dtype),
+            0, chosen, needs_repair.to(probabilities.dtype),
         )
         return opened | (additions > 0)
 
@@ -57,11 +62,14 @@ def redistribute_mass(mass: Tensor, neighbors: Tensor, gates: Tensor) -> Tensor:
     remaining = weighted.sum(-1, keepdim=True)
     budget = mass.sum(-1, keepdim=True)
     tiny = torch.finfo(mass.dtype).tiny
-    # Multiplication by budget/remaining is exactly identity with all gates open.
-    result = weighted * (budget / remaining.clamp_min(tiny))
-    # Handles zero/subnormal budgets without a 0/0 or an artificial new budget.
-    fallback = budget * edge_gates / edge_gates.sum(-1, keepdim=True).clamp_min(1)
-    return torch.where(remaining > tiny, result, fallback)
+    valid = remaining > tiny
+    # Normalize before restoring the budget; do not form a huge budget/remaining
+    # intermediate. Mask the denominator BEFORE dividing: masking an unsafe
+    # result afterward does not keep its backward graph finite.
+    denominator = torch.where(valid, remaining, torch.ones_like(remaining))
+    normalized = weighted / denominator
+    fallback = edge_gates / edge_gates.sum(-1, keepdim=True).clamp_min(1)
+    return torch.where(valid, normalized, fallback) * budget
 
 
 def global_active_fraction(active_count: Tensor, candidate_count: Tensor) -> Tensor:
@@ -174,10 +182,22 @@ class SlotController(nn.Module):
             'candidate_count': mass.new_tensor(len(mass)),
         }
         with torch.no_grad():
+            budget = mass.sum(-1)
+            positive_budget = budget > 0
+            safe_budget = torch.where(positive_budget, budget, torch.ones_like(budget))
+            raw_remaining = (mass * raw[neighbors]).sum(-1)
+            remaining = (mass * opened[neighbors]).sum(-1)
+            raw_fraction = torch.where(positive_budget, raw_remaining / safe_budget, 1.)
+            fraction = torch.where(positive_budget, remaining / safe_budget, 1.)
+            safe_remaining = torch.where(remaining > 0, remaining, torch.ones_like(remaining))
+            amplification = torch.where(positive_budget, budget / safe_remaining, 1.)
             report.update(
                 raw_active_fraction=raw.float().mean(),
                 fallback_fraction=(opened & ~raw).float().mean(),
                 probability_mean=probabilities.mean(),
+                raw_retained_mass_fraction_min=raw_fraction.min(),
+                retained_mass_fraction_min=fraction.min(),
+                redistribution_scale_max=amplification.max(),
                 mass_relative_error=((allocated.sum(-1) - mass.sum(-1)).abs()
                                      / mass.sum(-1).clamp_min(self.epsilon)).max(),
             )
