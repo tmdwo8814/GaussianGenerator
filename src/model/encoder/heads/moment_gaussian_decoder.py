@@ -8,7 +8,7 @@ never cameras or target images.
 """
 
 from dataclasses import dataclass, field
-from math import log
+from math import isfinite, log
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,7 @@ from ..common.sparse_feature_pool import pool_features
 from ..common.appearance_neighborhood import make_image_neighborhood
 from ..common.image_neighborhood_appearance import ImageNeighborhoodAppearance
 from ..common.appearance_capacity import MultiHeadAppearance
+from ..common.appearance_moments import appearance_feature_std
 from ..common.separate_appearance import appearance_weights, appearance_weight_statistics
 from ..common.tensor_kernels import run_tensor_kernel
 
@@ -53,6 +54,9 @@ class MomentDecoderCfg:
     appearance_capacity: bool = False
     appearance_heads: int = 4
     appearance_mlp_dim: int = 256
+    appearance_mlp_depth: int = 1  # Number of hidden Linear + SiLU layers.
+    appearance_moments: bool = False  # Also read weighted feature std using wA.
+    appearance_variance_epsilon: float = 1e-6
     checkpoint_appearance: bool = True  # Recompute one complete capacity scene in backward.
     log_every_n_steps: int = 50  # 0 disables detached diagnostics
 
@@ -82,8 +86,14 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError("appearance_dim must be positive; log_every_n_steps must be nonnegative")
         if cfg.appearance_heads < 1 or cfg.appearance_mlp_dim < 1:
             raise ValueError("appearance_heads and appearance_mlp_dim must be positive")
+        if not isinstance(cfg.appearance_mlp_depth, int) or cfg.appearance_mlp_depth < 1:
+            raise ValueError("appearance_mlp_depth must be a positive integer")
+        if not isfinite(cfg.appearance_variance_epsilon) or cfg.appearance_variance_epsilon <= 0:
+            raise ValueError("appearance_variance_epsilon must be finite and positive")
         if cfg.appearance_capacity and not (cfg.appearance_2d and cfg.separate_appearance):
             raise ValueError("appearance_capacity requires appearance_2d and separate_appearance")
+        if cfg.appearance_moments and not cfg.appearance_capacity:
+            raise ValueError("appearance_moments requires appearance_capacity")
         if (any(not isinstance(radius, int) or radius < 1 for radius in cfg.appearance_2d_radii)
                 or len(set(cfg.appearance_2d_radii)) != len(cfg.appearance_2d_radii)):
             raise ValueError("appearance_2d_radii must contain unique positive integers")
@@ -131,11 +141,16 @@ class MomentGaussianDecoder(nn.Module):
                         compile_kernels=cfg.compile_kernels,
                         batch_projections=cfg.batch_appearance_projections,
                     )
-                    self.appearance_sh_head = nn.Sequential(
-                        nn.Linear(cfg.feature_dim + cfg.appearance_heads * cfg.appearance_dim,
-                                  cfg.appearance_mlp_dim),
-                        nn.SiLU(), nn.Linear(cfg.appearance_mlp_dim, 3 * self.d_sh),
-                    )
+                    input_dim = (cfg.feature_dim * (2 if cfg.appearance_moments else 1)
+                                 + cfg.appearance_heads * cfg.appearance_dim)
+                    layers = [nn.Linear(input_dim, cfg.appearance_mlp_dim), nn.SiLU()]
+                    for _ in range(cfg.appearance_mlp_depth - 1):
+                        layers.extend([nn.Linear(cfg.appearance_mlp_dim, cfg.appearance_mlp_dim),
+                                       nn.SiLU()])
+                    layers.append(nn.Linear(cfg.appearance_mlp_dim, 3 * self.d_sh))
+                    # Depth=1 / moments=False preserves the original Final's
+                    # module keys, initialization order and learned function.
+                    self.appearance_sh_head = nn.Sequential(*layers)
                     nn.init.zeros_(self.appearance_sh_head[-1].weight)
                     nn.init.zeros_(self.appearance_sh_head[-1].bias)
                 else:
@@ -268,21 +283,32 @@ class MomentGaussianDecoder(nn.Module):
         moments = mass, means, covariance, pooled
         return (*moments, weights) if return_weights else moments
 
-    def _capacity_sh_chunk(self, pooled, context):
-        return run_tensor_kernel(MomentGaussianDecoder._capacity_sh_values, self, pooled, context,
+    def _capacity_sh_chunk(self, pooled, context, spread=None):
+        return run_tensor_kernel(MomentGaussianDecoder._capacity_sh_values, self, pooled, context, spread,
                                  enabled=self.cfg.compile_kernels)
 
-    def _capacity_sh_values(self, pooled, context):
-        return self.sh_head(pooled), self.appearance_sh_head(torch.cat((pooled, context), -1))
+    def _capacity_sh_values(self, pooled, context, spread=None):
+        values = (pooled, spread, context) if spread is not None else (pooled, context)
+        return self.sh_head(pooled), self.appearance_sh_head(torch.cat(values, -1))
 
-    def _capacity_harmonics(self, pooled, context, diagnostics):
+    def _capacity_harmonics(self, pooled, context, diagnostics, spread=None):
         """Checkpoint bounded SH chunks, including inside the scene checkpoint."""
+        if self.cfg.appearance_moments:
+            if spread is None or spread.shape != pooled.shape:
+                raise ValueError("appearance_moments requires feature std with the pooled feature shape")
+        elif spread is not None:
+            raise ValueError("Feature std requires appearance_moments=True")
         shape = pooled.shape[:-1]
         pooled, context = pooled.reshape(-1, pooled.shape[-1]), context.reshape(-1, context.shape[-1])
+        if spread is not None:
+            spread = spread.reshape_as(pooled)
         harmonics, squared = [], []
         for start in range(0, len(pooled), self.cfg.chunk_size):
             stop = start + self.cfg.chunk_size
-            base, extra = self._run_chunk(self._capacity_sh_chunk, pooled[start:stop], context[start:stop])
+            base, extra = self._run_chunk(
+                self._capacity_sh_chunk, pooled[start:stop], context[start:stop],
+                None if spread is None else spread[start:stop],
+            )
             harmonics.append(base + extra)
             if diagnostics is not None:
                 with torch.no_grad():
@@ -307,20 +333,32 @@ class MomentGaussianDecoder(nn.Module):
         selected = appearance_weights(geometry_weights, scores, neighbors)
         appearance_pooled = pool_features(features, selected, neighbors, self.cfg.chunk_size,
                                           compile_kernels=self.cfg.compile_kernels)
+        spread = None
+        if self.cfg.appearance_moments:
+            spread = appearance_feature_std(
+                features, selected, neighbors, appearance_pooled, self.cfg.chunk_size,
+                compile_kernels=self.cfg.compile_kernels,
+                epsilon=self.cfg.appearance_variance_epsilon,
+            )
         context, stats = self.appearance_reader(
             points, features, rgb, means, geometry_pooled, neighbors, image,
             chunk_size=self.cfg.chunk_size, checkpoint_chunks=self.cfg.checkpoint_chunks,
             collect_statistics=collect_statistics,
         )
         report = {} if collect_statistics else None
-        raw_sh = self._capacity_harmonics(appearance_pooled, context, report)
+        raw_sh = self._capacity_harmonics(appearance_pooled, context, report, spread)
         if report is not None:
             report.update(stats)
             report.update(appearance_weight_statistics(geometry_weights, selected, neighbors))
+            if spread is not None:
+                with torch.no_grad():
+                    report['feature_std_mean'] = spread.mean()
+                    report['feature_std_rms'] = spread.square().mean().sqrt()
         return raw_sh, report
 
     def build_gaussians(self, mass, means, covariance, pooled, scene_scale, appearance_context=None,
-                        appearance_pooled=None, diagnostics=None, appearance_harmonics=None):
+                        appearance_pooled=None, diagnostics=None, appearance_harmonics=None,
+                        appearance_std=None):
         # Accept a single scene for inspection/tests, or all scenes for training.
         # Batch the small heads to avoid repeated GEMMs and a final SH concat.
         if means.ndim == 2:
@@ -333,6 +371,8 @@ class MomentGaussianDecoder(nn.Module):
                 appearance_pooled = appearance_pooled.unsqueeze(0)
             if appearance_harmonics is not None:
                 appearance_harmonics = appearance_harmonics.unsqueeze(0)
+            if appearance_std is not None:
+                appearance_std = appearance_std.unsqueeze(0)
         scene_scale = scene_scale.reshape(-1, 1, 1)
         coverage = self.cfg.scale_min + (self.cfg.scale_max - self.cfg.scale_min) * (
             self.scale_head(pooled).sigmoid()
@@ -352,7 +392,8 @@ class MomentGaussianDecoder(nn.Module):
         elif self.cfg.appearance_capacity:
             if appearance_context is None or appearance_pooled is None:
                 raise ValueError("appearance_capacity requires appearance pooled features and context")
-            harmonics = self._capacity_harmonics(sh_features, appearance_context, diagnostics)
+            harmonics = self._capacity_harmonics(sh_features, appearance_context, diagnostics,
+                                                appearance_std)
         else:
             harmonics = self.sh_head(sh_features)
         if appearance_context is not None and not self.cfg.appearance_capacity:
@@ -472,7 +513,7 @@ class MomentGaussianDecoder(nn.Module):
                         # Preserve the previous full-batch RMS, rather than
                         # accidentally changing it to a mean of scene RMSs.
                         diagnostics[key] = (values.square().mean().sqrt()
-                                            if key in ('base_sh_rms', 'extra_sh_rms')
+                                            if key in ('base_sh_rms', 'extra_sh_rms', 'feature_std_rms')
                                             else values.mean())
                 return Gaussians(**{
                     key: torch.cat([getattr(scene, key) for scene in completed_scenes], dim=0)

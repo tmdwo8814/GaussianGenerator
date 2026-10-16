@@ -190,9 +190,11 @@ class AppearanceCapacityTests(unittest.TestCase):
         options = from_dict(Cfg, OmegaConf.to_container(config.model.encoder.moment_decoder))
         self.assertTrue(options.appearance_capacity and options.separate_appearance)
         self.assertEqual((options.feature_dim, options.appearance_heads, options.appearance_dim,
-                          options.appearance_mlp_dim), (256, 2, 32, 128))
+                          options.appearance_mlp_dim), (256, 2, 32, 256))
+        self.assertEqual(options.appearance_mlp_depth, 2)
+        self.assertTrue(options.appearance_moments)
         self.assertTrue(options.checkpoint_appearance)
-        self.assertEqual(sum(p.numel() for p in Decoder(options).parameters()), 154649)
+        self.assertEqual(sum(p.numel() for p in Decoder(options).parameters()), 336665)
         model = torch.nn.Module()
         model.encoder = torch.nn.Module()
         model.encoder.gaussian_decoder = Decoder(cfg())

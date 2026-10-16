@@ -5,10 +5,10 @@ defaults:
   - _self_
 
 wandb:
-  name: final
-  tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, final]
+  name: final_plus
+  tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus]
 
-# Final decoder: DPT256 moment + 2D neighbors + separate weights + appearance capacity.
+# Final++: Final + wider/deeper SH MLP (A) + appearance feature std (B).
 # Training length is inherited from re10k.yaml (trainer.max_steps); set it manually.
 model:
   encoder:
@@ -21,7 +21,10 @@ model:
       appearance_capacity: true
       appearance_heads: 2
       appearance_dim: 32  # Per head: 2 x 32 = 64 context channels.
-      appearance_mlp_dim: 128  # [selected DPT256, context64] -> 128 -> SH75.
+      appearance_mlp_dim: 256
+      appearance_mlp_depth: 2  # [mean256, std256, context64] -> 256 -> 256 -> SH75.
+      appearance_moments: true  # Weighted std on the same wA graph; no new parameters.
+      appearance_variance_epsilon: 0.000001  # Stabilizes sqrt near zero feature variance.
       checkpoint_appearance: true  # Keep scene outputs; recompute appearance activations in backward.
       appearance_2d_radii: [1, 4]  # Eight image neighbors per radius, same source view.
       log_every_n_steps: 50  # Detached candidate/selection and image-edge metrics.

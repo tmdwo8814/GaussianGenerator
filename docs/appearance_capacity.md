@@ -1,7 +1,9 @@
-# Appearance capacity, experiment 1
+# Appearance capacity and Final++
 
-Branch: `exp/appearance-capacity`. Version: `moment-appearance-capacity-v1`.
-The user's W&B name in `re10k_moment.yaml` is preserved.
+Current branch: `exp/Final++`. W&B run name: `final_plus`.
+This adds the expanded SH MLP (A) and appearance feature standard deviation
+(B) to Final. Geometry allocation, budget, opacity, candidate sets, DPT256,
+losses and the user-configured training length are unchanged.
 
 ## Flow
 
@@ -17,17 +19,24 @@ The user's W&B name in `re10k_moment.yaml` is preserved.
    edges once per scene evaluation. Two independent width-32 readers use this graph.
    Each has its own source key/value, geometry-pooled query, positional
    projections and incoming softmax. Concatenate their contexts into `c64`.
-5. Produce raw SH as `Linear(fA) + MLP(concat(fA, c64))`. The MLP is
-   `320 -> 128 -> SiLU -> 75` at SH degree 4 (SiLU follows the first Linear).
+5. Also pool `f[j]^2` using the SAME `wA` and calculate channel-wise spread:
+   `stdA[i] = sqrt(clamp(sum_j wA[j,i] * f[j]^2 - fA[i]^2, min=0) + 1e-6)`.
+   This is feature dispersion, not a consistency loss or a new selection rule.
+6. Produce raw SH as `Linear(fA) + MLP(concat(fA, stdA, c64))`. The MLP is
+   `576 -> 256 -> SiLU -> 256 -> SiLU -> 75` at SH degree 4.
    Its final weight and bias start at zero. Apply the original SH mask once.
+   Final's previous readout was `Linear(fA) + MLP(concat(fA, c64))`, with
+   `320 -> 128 -> SiLU -> 75` for that MLP.
 
 The extra image edges do NOT carry geometry mass or multiply by `wG`.
 They can influence SH even when they are absent from the geometry graph.
 Only context RGB and its view-major raster layout enter the decoder; target
 images/poses are used by the unchanged renderer and MSE/LPIPS losses.
 
-The current reduced decoder has **154,649 trainable parameters**, excluding DPT
-and point heads: moment 52,942 + separate score 64 + two readers 50,880 + MLP 50,763.
+Final++ has **336,665 trainable parameters**, excluding DPT and point heads:
+moment 52,942 + separate score 64 + two readers 50,880 + MLP 232,779.
+Final has 154,649; the baseline has 1,222,310 across its TWO DPT output heads
+(each `3x3 Conv 256->256` without bias, then `1x1 Conv 256->83` with bias).
 Heads are independent but the complete decoder is shared across input views.
 
 ## Configuration and launch
@@ -42,7 +51,10 @@ separate_appearance: true
 appearance_capacity: true
 appearance_heads: 2
 appearance_dim: 32       # Per head, not total context width.
-appearance_mlp_dim: 128
+appearance_mlp_dim: 256
+appearance_mlp_depth: 2  # Hidden layers, each followed by SiLU.
+appearance_moments: true
+appearance_variance_epsilon: 0.000001
 checkpoint_appearance: true
 appearance_2d_radii: [1, 4]
 log_every_n_steps: 50
@@ -54,7 +66,7 @@ the same pretrained initialization as earlier runs. An old trained 2DKNN
 decoder checkpoint has a different reader/SH-head architecture; it is not a
 strictly compatible resume checkpoint for this experiment.
 
-For the original 2DKNN control, set BOTH `appearance_capacity=false` and
+For the original 2DKNN control, set `appearance_moments=false`, BOTH `appearance_capacity=false` and
 `separate_appearance=false`; keep `appearance_2d=true`. To restore the original
 moment decoder, also set `appearance_2d=false`. Setting `appearance_2d_radii=[]`
 only removes the extra image candidates and retains the configured readers.
@@ -80,11 +92,12 @@ to zero to disable their cost.
 | added_candidates, incoming_candidates, added_candidate_fraction, new_2d_fraction | Same candidate definitions as the original 2DKNN experiment. |
 | base_sh_rms | RMS of the masked Linear(fA) output. |
 | extra_sh_rms | RMS of the masked additional MLP output, initially zero. |
+| feature_std_mean / feature_std_rms | Mean/RMS feature spread under wA; these do not establish a quality gain. |
 | edge_mse, smooth_mse, edge_fraction | Existing post-render image diagnostics; not an SSIM loss. |
 
 The selection statistics average all slots (including almost-empty ones),
-not only visible Gaussians. `extra_sh_rms` describes an MLP of BOTH fA and
-context; it does not isolate the context's causal contribution. Nonzero head
+not only visible Gaussians. `extra_sh_rms` describes an MLP of fA, stdA and
+context; it does not isolate any one input's causal contribution. Nonzero head
 TV or image attention alone also does not prove a rendering-quality gain.
 
 ## Cost and verification
@@ -111,8 +124,9 @@ equal step time or of fitting every batch into GPU memory. Inference performs
 one pass with no backward recomputation. `checkpoint_appearance: false` skips
 the new checkpoint but keeps scene-by-scene output generation for diagnosis.
 
-All parameter names, shapes and optimizer parameter order remain unchanged
-from the 2-head/MLP-128 version. That version's weights remain strictly loadable;
+For the memory-only optimization described here, parameter names, shapes and
+optimizer order remain unchanged from the 2-head/MLP-128 version. With the
+original Final configuration, that version's weights remain strictly loadable;
 this does not make old 4-head or baseline checkpoints shape-compatible. The
 optimization preserves the mathematical output/gradients, with possible small
 floating-point differences from per-scene rather than batched GEMMs. W&B metric
@@ -156,8 +170,8 @@ concatenated for another. Results are split back into the original heads.
 Each head keeps its own parameters and its own incoming softmax. With two
 heads this replaces four support/query GEMM calls with two per scene evaluation
 (including recomputation), with the same mathematical projections. It does not
-combine scores or normalize across heads. The learned function and total
-154,649 parameters are unchanged.
+combine scores or normalize across heads. The original Final's learned
+function and 154,649 parameters are unchanged by these speed flags alone.
 
 Only support/slot projections are batched. Edge features are still processed
 one head and one chunk at a time; there is no [M,K,heads,D] expansion. Both
@@ -200,3 +214,42 @@ outputs and gradients, and measures decoder forward/backward including exact
 kNN. It excludes backbone, renderer, optimizer and DDP; its ratio is not total
 training speedup. Peak memory reports PyTorch allocation, excluding CuPy and
 other GPU allocations. The training entry point remains `scripts/train_re10k.sh`.
+
+## Final++ switches and cost
+
+All three switches live under `model.encoder.moment_decoder`:
+
+| Variant | appearance_moments | appearance_mlp_dim | appearance_mlp_depth | Post-DPT parameters |
+| --- | --- | --- | --- | ---: |
+| Final | false | 128 | 1 | 154,649 |
+| A | false | 256 | 2 | 271,129 |
+| B | true | 256 | 1 | 270,873 |
+| A+B (default) | true | 256 | 2 | 336,665 |
+
+For example, restore the exact Final architecture (including checkpoint keys):
+
+```bash
+sbatch scripts/train_re10k.sh \
+  model.encoder.moment_decoder.appearance_moments=false \
+  model.encoder.moment_decoder.appearance_mlp_dim=128 \
+  model.encoder.moment_decoder.appearance_mlp_depth=1 \
+  wandb.name=final_control
+```
+
+The Final++ SH layers differ in shape from Final checkpoints. Train Final++
+from the same pretrained backbone initialization; a full Final decoder
+checkpoint is not a shape-compatible resume checkpoint.
+
+Feature std is computed in FP32 inside the existing per-scene appearance
+checkpoint, using one extra sparse pool. Concatenation to 576 channels is
+inside the existing SH chunk checkpoint, not across the whole batch. No new
+kNN or candidate expansion is added, and all existing memory optimizations
+are retained. Wider/deeper MLP activations and the second-moment pool still
+add computation and temporary memory; parameter counts do not predict VRAM
+or speed. Benchmark on the training GPU before assigning a full run.
+
+`python -m unittest discover -s tests -p test_final_plus.py -v` checks weighted
+std against a dense central-variance reference (including gradients), equal
+means with different spread, initialization/geometry equivalence, all four
+parameter counts and nested checkpoint/inference parity. The CUDA/Inductor
+comparison runs only on a CUDA host.
