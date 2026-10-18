@@ -14,13 +14,15 @@ set -euo pipefail
 # Submit from the repository root, with the ragaussian environment active:
 #   mkdir -p logs
 #   sbatch scripts/eval_re10k.sh
-# Use the existing wandb login, or export WANDB_API_KEY before submitting.
+# Authentication defaults to the same key as train_re10k.sh.
 # To continue after another timeout, specify only the unfinished steps:
 #   EVAL_STEPS='[120000,140000]' sbatch scripts/eval_re10k.sh
 
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 mkdir -p logs
 
+# Use the training key by default; an exported WANDB_API_KEY takes precedence.
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_MODE=online
 export WANDB_ENTITY="${WANDB_ENTITY:-tmdwo8814-}"
 export WANDB_PROJECT="${WANDB_PROJECT:-noposplat}"
