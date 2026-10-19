@@ -18,8 +18,9 @@ Defaults:
 - Index: `assets/evaluation_index_re10k.json`.
 - Cameras: optimize target poses once using 100% Final and the existing loss,
   save them per scene, and reuse those exact cameras for all seven renders.
-- One `high_perf` GPU on `ariel-n1`, partition `batch_grad`, eight CPUs, 128 GB,
-  six days, matching the cluster conventions in `scripts/train_re10k.sh`.
+- One `high_perf` GPU on `ariel-n1`, partition `batch_grad`, eight CPUs, 80 GB
+  of system RAM, and six days. The cluster limits system RAM to 91,878 MB per
+  allocated GPU; requesting the training script's 128 GB with one GPU is rejected.
 
 Change inputs at submission time:
 
