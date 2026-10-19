@@ -1,0 +1,56 @@
+# @package _global_
+
+defaults:
+  - acid
+  - _self_
+
+# Inherit ACID roots, optimizer, batch size, and checkpoint retention from acid.
+# Train to 80000 steps, then evaluate checkpoints at 20000/40000/60000/80000.
+wandb:
+  name: final_plus_acid
+  tags: [acid, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus]
+
+# Keep the model parameters identical to re10k_moment.yaml.
+model:
+  encoder:
+    gs_params_head_type: moment
+    moment_decoder:
+      feature_dim: 256
+      hidden_dim: 64
+      appearance_2d: true
+      separate_appearance: true
+      appearance_capacity: true
+      appearance_heads: 2
+      appearance_dim: 32
+      appearance_mlp_dim: 256
+      appearance_mlp_depth: 2
+      appearance_moments: true
+      appearance_variance_epsilon: 0.000001
+      checkpoint_appearance: true
+      appearance_2d_radii: [1, 4]
+      log_every_n_steps: 50
+      num_neighbors: 16
+      chunk_size: 32768
+      checkpoint_chunks: true
+      compile_kernels: true
+      cache_image_neighbors: true
+      batch_appearance_projections: true
+      knn_backend: auto
+      knn_query_backend: specialized
+      knn_workers: 1
+      budget_max: 2.0
+      budget_init: 0.6931471805599453
+      scale_min: 1.0
+      scale_max: 3.0
+      scale_init: 1.75
+      covariance_floor: 0.0001
+      mass_epsilon: 0.000001
+      scene_epsilon: 0.000001
+
+trainer:
+  # ACID uses DatasetRE10k internally; its default index would be RE10K's.
+  auto_eval_index_path: assets/evaluation_index_acid.json
+
+test:
+  compute_scores: true
+  align_pose: true
