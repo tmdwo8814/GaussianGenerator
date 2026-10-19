@@ -28,7 +28,7 @@ dataset:
 
 optimizer:
   lr: 2e-4
-  warm_up_steps: 125
+  warm_up_steps: 2000
   backbone_lr_multiplier: 0.1
 
 data_loader:
