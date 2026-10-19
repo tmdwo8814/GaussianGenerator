@@ -64,8 +64,11 @@ class ImageNeighborhoodAppearance(nn.Module):
 
     def forward(self, points: Tensor, features: Tensor, rgb: Tensor, means: Tensor,
                 pooled: Tensor, geometry_neighbors: Tensor, image: ImageNeighborhood, *,
-                chunk_size: int, checkpoint_chunks: bool, collect_statistics: bool = False):
-        neighbors, valid = merge_appearance_neighbors(geometry_neighbors, image, chunk_size)
+                chunk_size: int, checkpoint_chunks: bool, collect_statistics: bool = False,
+                geometry_valid: Tensor | None = None, destination_mask: Tensor | None = None):
+        neighbors, valid = merge_appearance_neighbors(
+            geometry_neighbors, image, chunk_size, geometry_valid, destination_mask,
+        )
         geometry_k = geometry_neighbors.shape[1]
         added = (torch.arange(neighbors.shape[1], device=points.device) >= geometry_k).to(points.dtype)
         keys, values = self.source(torch.cat((features, rgb), -1)).split(self.context_dim, -1)

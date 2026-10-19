@@ -41,7 +41,8 @@ edges carry a safe self index but remain masked out everywhere downstream.
 
 
 def merge_appearance_neighbors(geometry: Tensor, image: ImageNeighborhood,
-                               chunk_size: int) -> tuple[Tensor, Tensor]:
+                               chunk_size: int, geometry_valid: Tensor | None = None,
+                               destination_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
     """Keep geometry first; mask image edges already present in that row.
 
 No compaction is needed: masks avoid variable-size batches, and the number
@@ -51,10 +52,17 @@ of allocated columns stays K + 8*len(radii). Radii must be positive/unique.
     for start in range(0, len(geometry), chunk_size):
         stop = start + chunk_size
         duplicate = (image.neighbors[start:stop, :, None]
-                     == geometry[start:stop, None, :]).any(-1)
-        added[start:stop] &= ~duplicate
-    return (torch.cat((geometry, image.neighbors), -1),
-            torch.cat((torch.ones_like(geometry, dtype=torch.bool), added), -1))
+                     == geometry[start:stop, None, :])
+        if geometry_valid is not None:
+            duplicate = duplicate & geometry_valid[start:stop, None, :]
+        added[start:stop] &= ~duplicate.any(-1)
+    if geometry_valid is None:
+        geometry_valid = torch.ones_like(geometry, dtype=torch.bool)
+    neighbors = torch.cat((geometry, image.neighbors), -1)
+    valid = torch.cat((geometry_valid, added), -1)
+    if destination_mask is not None:
+        valid = valid & destination_mask[neighbors]
+    return neighbors, valid
 
 
 class _IncomingSoftmax(torch.autograd.Function):

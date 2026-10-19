@@ -385,7 +385,7 @@ class ModelWrapper(LightningModule):
             )
             save_image(comparison, path / f"{scene}.png")
 
-    def test_step_align(self, batch, gaussians):
+    def test_step_align(self, batch, gaussians, camera_dump: dict | None = None):
         b, v, _, h, w = batch["target"]["image"].shape
         with torch.set_grad_enabled(True):
             cam_rot_delta = nn.Parameter(torch.zeros([b, v, 3], requires_grad=True, device=self.device))
@@ -439,6 +439,9 @@ class ModelWrapper(LightningModule):
                         cam_trans_delta.data.fill_(0)
 
                         extrinsics = rearrange(new_extrinsic, "(b v) i j -> b v i j", b=b, v=v)
+
+        if camera_dump is not None:
+            camera_dump['extrinsics'] = extrinsics.detach().clone()
 
         # Render Gaussians.
         output = self.decoder.forward(

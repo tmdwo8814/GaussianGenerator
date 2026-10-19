@@ -29,8 +29,11 @@ class MultiHeadAppearance(nn.Module):
         ])
 
     def forward(self, points, features, rgb, means, pooled, geometry_neighbors, image, *,
-                chunk_size: int, checkpoint_chunks: bool, collect_statistics: bool = False):
-        neighbors, valid = merge_appearance_neighbors(geometry_neighbors, image, chunk_size)
+                chunk_size: int, checkpoint_chunks: bool, collect_statistics: bool = False,
+                geometry_valid=None, destination_mask=None):
+        neighbors, valid = merge_appearance_neighbors(
+            geometry_neighbors, image, chunk_size, geometry_valid, destination_mask,
+        )
         geometry_k = geometry_neighbors.shape[1]
         added = (torch.arange(neighbors.shape[1], device=points.device) >= geometry_k).to(points.dtype)
         source = torch.cat((features, rgb), -1)
