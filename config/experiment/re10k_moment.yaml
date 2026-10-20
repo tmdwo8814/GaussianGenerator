@@ -5,10 +5,10 @@ defaults:
   - _self_
 
 wandb:
-  name: final_plus_acid
-  tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus]
+  name: final_plus_rel
+  tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus, geometry_relation]
 
-# Final++: Final + wider/deeper SH MLP (A) + appearance feature std (B).
+# Final++rel: Final++ (A+B) + zero-initialized geometry-conditioned relation.
 # Training length is inherited from re10k.yaml (trainer.max_steps); set it manually.
 model:
   encoder:
@@ -16,6 +16,7 @@ model:
     moment_decoder:
       feature_dim: 256
       hidden_dim: 64
+      geometry_conditioned_relation: true  # 4 -> 64 gate; +320 parameters; zero-init preserves Final++.
       appearance_2d: true
       separate_appearance: true  # Independent weights on the original 3D graph.
       appearance_capacity: true

@@ -217,19 +217,21 @@ other GPU allocations. The training entry point remains `scripts/train_re10k.sh`
 
 ## Final++ switches and cost
 
-All three switches live under `model.encoder.moment_decoder`:
+These switches live under `model.encoder.moment_decoder`. Counts in this table
+exclude the optional `geometry_conditioned_relation` (+320 parameters at H=64).
 
 | Variant | appearance_moments | appearance_mlp_dim | appearance_mlp_depth | Post-DPT parameters |
 | --- | --- | --- | --- | ---: |
 | Final | false | 128 | 1 | 154,649 |
 | A | false | 256 | 2 | 271,129 |
 | B | true | 256 | 1 | 270,873 |
-| A+B (default) | true | 256 | 2 | 336,665 |
+| A+B (Final++) | true | 256 | 2 | 336,665 |
 
 For example, restore the exact Final architecture (including checkpoint keys):
 
 ```bash
 sbatch scripts/train_re10k.sh \
+  model.encoder.moment_decoder.geometry_conditioned_relation=false \
   model.encoder.moment_decoder.appearance_moments=false \
   model.encoder.moment_decoder.appearance_mlp_dim=128 \
   model.encoder.moment_decoder.appearance_mlp_depth=1 \
@@ -253,3 +255,7 @@ std against a dense central-variance reference (including gradients), equal
 means with different spread, initialization/geometry equivalence, all four
 parameter counts and nested checkpoint/inference parity. The CUDA/Inductor
 comparison runs only on a CUDA host.
+
+The `exp/Final++rel` configs additionally enable the geometry-conditioned
+allocation relation. See [geometry_relation.md](geometry_relation.md) for its
+formula, initialization, logging and the switch back to Final++.

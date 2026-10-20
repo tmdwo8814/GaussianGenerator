@@ -22,6 +22,7 @@ from ..common.appearance_neighborhood import make_image_neighborhood
 from ..common.image_neighborhood_appearance import ImageNeighborhoodAppearance
 from ..common.appearance_capacity import MultiHeadAppearance
 from ..common.appearance_moments import appearance_feature_std
+from ..common.geometry_conditioned_relation import GeometryConditionedRelation
 from ..common.separate_appearance import appearance_weights, appearance_weight_statistics
 from ..common.tensor_kernels import run_tensor_kernel
 
@@ -30,6 +31,7 @@ from ..common.tensor_kernels import run_tensor_kernel
 class MomentDecoderCfg:
     feature_dim: int = 64
     hidden_dim: int = 64
+    geometry_conditioned_relation: bool = False  # Final++rel: geometry-gated feature product.
     num_neighbors: int = 16
     chunk_size: int = 32768
     checkpoint_chunks: bool = True
@@ -160,6 +162,14 @@ class MomentGaussianDecoder(nn.Module):
                     self.appearance_sh_head = nn.Linear(cfg.appearance_dim, 3 * self.d_sh, bias=False)
                     nn.init.zeros_(self.appearance_sh_head.weight)
 
+        self.geometry_relation = None
+        if cfg.geometry_conditioned_relation:
+            # Add the gate without changing any Final++ or later initialization.
+            with torch.random.fork_rng(devices=[]):
+                self.geometry_relation = GeometryConditionedRelation(
+                    cfg.hidden_dim, epsilon=cfg.scene_epsilon,
+                )
+
     def _image_neighbors(self, image_shape, device):
         key = (tuple(image_shape), tuple(self.cfg.appearance_2d_radii), device)
         if not self.cfg.cache_image_neighbors or key != self._image_cache_key:
@@ -183,26 +193,43 @@ class MomentGaussianDecoder(nn.Module):
         return function(*args)
 
     def _allocation_chunk(self, source_points, source_projection, budget,
-                          points, destination_projection, neighbors, return_appearance=False):
+                          points, destination_projection, neighbors, return_appearance=False,
+                          source_relation=None, destination_relation=None, collect_statistics=False):
         delta = source_points[:, None] - points[neighbors]
         geometry = torch.cat((delta, delta.square().sum(-1, keepdim=True)), dim=-1)
         first = self.allocation_head[0]
         # W[fi,fj,g] + b = Wi fi + Wj fj + Wg g + b, BEFORE SiLU.
-        # Retain the exact same parameters/state_dict and nonlinear function.
+        # Keep the original additive path; the optional interaction follows.
         hidden = (destination_projection[neighbors] + source_projection[:, None]
                   + F.linear(geometry, first.weight[:, 2 * self.cfg.feature_dim:], first.bias))
+        statistics = None
+        if self.geometry_relation is not None:
+            update, gate = self.geometry_relation(
+                geometry, source_relation, destination_relation[neighbors],
+            )
+            if collect_statistics:
+                # Pure checkpoint output: no mutable log state or host sync.
+                with torch.no_grad():
+                    statistics = torch.stack((
+                        gate.square().sum(), update.square().sum(), hidden.square().sum(),
+                    ))
+            hidden = hidden + update
         hidden = self.allocation_head[1](hidden)
         logits = self.allocation_head[2](hidden).squeeze(-1)
         allocation = logits.softmax(dim=-1)  # sum_k A[j, k] = 1
         mass = allocation * budget  # q[j, k] = A_ij * b_j
+        outputs = [mass]
         if return_appearance:
-            return mass, self.appearance_head(hidden).squeeze(-1)
-        return mass
+            outputs.append(self.appearance_head(hidden).squeeze(-1))
+        if collect_statistics:
+            outputs.append(statistics)
+        return tuple(outputs) if len(outputs) > 1 else mass
 
     def predict_allocation(self, points: Tensor, features: Tensor,
-                           neighbors: Tensor, return_appearance: bool = False):
+                           neighbors: Tensor, return_appearance: bool = False,
+                           diagnostics: dict | None = None):
         """Normalized coordinates in; sparse outgoing mass q [M, K] out."""
-        # Project each support once instead of repeating a 128->64 projection
+        # Project each support once instead of repeating feature projections
         # for every edge. These projections remain in the autograd graph.
         if return_appearance and self.appearance_head is None:
             raise ValueError("Appearance scores require separate_appearance=True")
@@ -214,6 +241,11 @@ class MomentGaussianDecoder(nn.Module):
         destination_projection, source_projection = F.linear(features, projection_weight).split(
             self.cfg.hidden_dim, dim=-1
         )
+        source_relation, destination_relation = None, None
+        if self.geometry_relation is not None:
+            source_relation = self.geometry_relation.normalize_projection(source_projection)
+            destination_relation = self.geometry_relation.normalize_projection(destination_projection)
+        collect_statistics = diagnostics is not None and self.geometry_relation is not None
         budget = self.cfg.budget_max * self.budget_head(features).sigmoid()
         chunks = []
         for start in range(0, len(points), self.cfg.chunk_size):
@@ -221,7 +253,19 @@ class MomentGaussianDecoder(nn.Module):
             chunks.append(self._run_chunk(
                 self._allocation_chunk, points[start:stop], source_projection[start:stop],
                 budget[start:stop], points, destination_projection, neighbors[start:stop], return_appearance,
+                None if source_relation is None else source_relation[start:stop],
+                destination_relation, collect_statistics,
             ))
+        if collect_statistics:
+            with torch.no_grad():
+                squared = torch.stack([values[-1] for values in chunks]).sum(0)
+                count = neighbors.numel() * self.cfg.hidden_dim
+                diagnostics['relation_gate_rms'] = (squared[0] / count).sqrt()
+                diagnostics['relation_update_rms'] = (squared[1] / count).sqrt()
+                diagnostics['relation_relative_update'] = (
+                    squared[1] / squared[2].clamp_min(1e-12)
+                ).sqrt()
+            chunks = [values[:-1] if return_appearance else values[0] for values in chunks]
         if return_appearance:
             return tuple(torch.cat(values, dim=0) for values in zip(*chunks))
         return torch.cat(chunks, dim=0)
@@ -456,12 +500,15 @@ class MomentGaussianDecoder(nn.Module):
                                       query_backend=self.cfg.knn_query_backend)
                 normalized = scene_points / scene_scale
                 scene_stats = {}
+                allocation_kwargs = {}
+                if self.geometry_relation is not None and diagnostics is not None:
+                    allocation_kwargs['diagnostics'] = scene_stats
                 if self.appearance_head is None:
-                    q = self.predict_allocation(normalized, scene_features, neighbors)
+                    q = self.predict_allocation(normalized, scene_features, neighbors, **allocation_kwargs)
                     scene_moments = self.aggregate_moments(normalized, scene_features, neighbors, q)
                 else:
                     q, scores = self.predict_allocation(normalized, scene_features, neighbors,
-                                                        return_appearance=True)
+                                                        return_appearance=True, **allocation_kwargs)
                     *scene_moments, geometry = self.aggregate_moments(
                         normalized, scene_features, neighbors, q, return_weights=True,
                     )
@@ -471,16 +518,18 @@ class MomentGaussianDecoder(nn.Module):
                                 neighbors, image, diagnostics is not None)
                         if (self.cfg.checkpoint_appearance and self.training
                                 and torch.is_grad_enabled()):
-                            raw_sh, scene_stats = checkpoint(
+                            raw_sh, capacity_stats = checkpoint(
                                 self._capacity_scene, *args,
                                 use_reentrant=False, preserve_rng_state=False,
                             )
                         else:
-                            raw_sh, scene_stats = self._capacity_scene(*args)
+                            raw_sh, capacity_stats = self._capacity_scene(*args)
+                        if capacity_stats is not None:
+                            scene_stats.update(capacity_stats)
                         completed_scenes.append(self.build_gaussians(
                             *scene_moments, scene_scale, appearance_harmonics=raw_sh,
                         ))
-                        if scene_stats is not None:
+                        if scene_stats:
                             statistics.append(scene_stats)
                         # No Python list of per-scene DPT256/context tensors,
                         # and no full-batch copies of those tensors via stack.
