@@ -16,11 +16,12 @@ set -euo pipefail
 #   sbatch scripts/eval_gaussian_control.sh
 # Optional environment overrides:
 #   CHECKPOINT=/path/Final.ckpt DATASET_ROOT=/path/re10k sbatch scripts/eval_gaussian_control.sh
-#   ALIGN_POSE=false sbatch scripts/eval_gaussian_control.sh
+#   REFERENCE_RUN=/path/to/previous/shared_final_pose sbatch scripts/eval_gaussian_control.sh
 #   MAX_SCENES=2 sbatch scripts/eval_gaussian_control.sh  # smoke test, not full results
 # Extra arguments are Hydra overrides, e.g. data_loader.test.num_workers=2.
 # This job uses ONE GPU, caches one scene's encoding/allocation, and evaluates
-# all seven conditions on that scene before advancing. No training/W&B login.
+# only 5%/10% pruning and redistribution. Previous cameras and Final metrics
+# are reused; there is no full-Final render/evaluation or camera optimization.
 
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 mkdir -p logs
@@ -31,6 +32,7 @@ export WANDB_MODE=disabled
 CHECKPOINT="${CHECKPOINT:-/nas2/data/tmdwo8814/research/GaussianGenerator/outputs/exp_final/2026-10-12_16-47-16/checkpoints/epoch_2-step_140000.ckpt}"
 DATASET_ROOT="${DATASET_ROOT:-/local_datasets/3dgs/re10k/re10k}"
 INDEX_PATH="${INDEX_PATH:-$PWD/assets/evaluation_index_re10k.json}"
+REFERENCE_RUN="${REFERENCE_RUN:-/nas2/data/tmdwo8814/research/GaussianGenerator/outputs/gaussian_control/458185_2026-10-20_04-58-00/shared_final_pose}"
 ALIGN_POSE="${ALIGN_POSE:-true}"
 MAX_SCENES="${MAX_SCENES:-0}"
 case "$ALIGN_POSE" in
@@ -56,6 +58,12 @@ if [[ ! -f "$INDEX_PATH" ]]; then
     echo "Evaluation index does not exist: $INDEX_PATH (set INDEX_PATH)" >&2
     exit 1
 fi
+for required in metadata.json per_scene.jsonl run_status.txt; do
+    if [[ ! -f "$REFERENCE_RUN/$required" ]]; then
+        echo "Reference evaluation file does not exist: $REFERENCE_RUN/$required (set REFERENCE_RUN)" >&2
+        exit 1
+    fi
+done
 if [[ -e "$EVAL_OUTPUT_DIR/per_scene.jsonl" ]]; then
     echo "Output already contains an evaluation: $EVAL_OUTPUT_DIR (set a new EVAL_OUTPUT_DIR)" >&2
     exit 1
@@ -69,6 +77,8 @@ echo "Checkpoint: $CHECKPOINT"
 echo "Dataset root: $DATASET_ROOT"
 echo "Evaluation index: $INDEX_PATH"
 echo "Camera protocol: $PROTOCOL"
+echo "Retention fractions: 5%, 10% (pruning and redistribution only)"
+echo "Reuse cameras and per-scene Final metrics from: $REFERENCE_RUN"
 echo "Output directory: $EVAL_OUTPUT_DIR"
 python --version
 nvidia-smi
@@ -81,6 +91,8 @@ python -m src.eval_gaussian_control \
     "+gaussian_control.checkpoint=$CHECKPOINT" \
     "+gaussian_control.index_path=$INDEX_PATH" \
     "+gaussian_control.max_scenes=$MAX_SCENES" \
+    "+gaussian_control.fractions=[0.05,0.10]" \
+    "+gaussian_control.reference_run=$REFERENCE_RUN" \
     "test.align_pose=$ALIGN_POSE" \
     test.compute_scores=true \
     test.save_image=false \

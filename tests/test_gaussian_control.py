@@ -5,6 +5,7 @@ import copy
 import contextlib
 import importlib
 import io
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from test_moment_gaussian_decoder import ROOT, Cfg, Decoder, attributes
 control = importlib.import_module('_moment_test.encoder.heads.gaussian_control')
 neighborhood = importlib.import_module('_moment_test.encoder.common.appearance_neighborhood')
 from src.evaluation.gaussian_control_report import CONDITIONS, GaussianControlReport
+from src.evaluation.gaussian_control_reference import GaussianControlReference, scene_key
 
 
 class GaussianControlTests(unittest.TestCase):
@@ -89,6 +91,24 @@ class GaussianControlTests(unittest.TestCase):
             stats = control.gaussian_statistics(result, self.cache, slots, mass, fallback)
             self.assertLess(stats['budget_error_relative'], 1e-5)
             self.assertEqual(stats['retained_fraction'], fraction)
+
+    def test_five_and_ten_percent_conserve_budget_and_use_floor_counts(self):
+        cache = {}
+        with torch.no_grad():
+            self.model(torch.randn(1, 40, 3), torch.randn(1, 40, 5), image_shape=(2, 4, 5),
+                       rgb=torch.rand(1, 40, 3), analysis_cache=cache)
+        for fraction, count in ((.05, 2), (.10, 4)):
+            slots = control.select_slots(cache['mass'], fraction)
+            result, mass, fallback = control.redistribute_gaussians(self.model, cache, slots)
+            self.assertEqual(result.means.shape[1], count)
+            self.assertGreater(fallback, 0.)
+            # FP32 scatter accumulation is checked at the runtime conservation tolerance.
+            torch.testing.assert_close(mass.double().sum(), cache['budget'].double().sum(),
+                                       rtol=1e-5, atol=1e-6)
+        # The real two-view 256x256 slot counts are floored, not rounded.
+        mass = torch.ones(131072)
+        self.assertEqual(len(control.select_slots(mass, .05)), 6553)
+        self.assertEqual(len(control.select_slots(mass, .10)), 13107)
 
     def test_masked_softmax_recovers_survivor_even_after_original_underflow(self):
         cache = dict(self.cache)
@@ -188,11 +208,13 @@ class GaussianControlTests(unittest.TestCase):
                 camera_dump['extrinsics'] = batch['target']['extrinsics'] + .25
 
         tree = ast.parse((ROOT / 'src/eval_gaussian_control.py').read_text(encoding='utf-8'))
-        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'elapsed_ms'
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in ('elapsed_ms', 'load_reference_camera')
                  or isinstance(node, ast.ClassDef) and node.name == 'GaussianControlModel']
         namespace = dict(torch=torch, Path=Path, contextmanager=contextmanager, perf_counter=perf_counter,
                          ModelWrapper=FakeWrapper, GaussianControlReport=GaussianControlReport,
                          FRACTIONS=(.75, .5, .25),
+                         scene_key=scene_key,
                          compute_psnr=lambda a, b: torch.ones(len(a)) * 25,
                          compute_ssim=lambda a, b: torch.ones(len(a)) * .8,
                          compute_lpips=lambda a, b: torch.ones(len(a)) * .2,
@@ -200,8 +222,9 @@ class GaussianControlTests(unittest.TestCase):
                          **{name: getattr(control, name) for name in (
                              'select_slots', 'subset_gaussians', 'redistribute_gaussians', 'gaussian_statistics')})
         exec(compile(ast.Module(body=nodes, type_ignores=[]), 'control_eval', 'exec'), namespace)
-        for align in (True, False):
-            with self.subTest(align=align), TemporaryDirectory() as temporary:
+        for mode in ('align', 'dataset', 'reuse'):
+            align = mode != 'dataset'
+            with self.subTest(mode=mode), TemporaryDirectory() as temporary:
                 model = namespace['GaussianControlModel']()
                 model.encoder, model.decoder = FakeEncoder(), FakeRenderer()
                 model.test_cfg = SimpleNamespace(align_pose=align)
@@ -218,19 +241,47 @@ class GaussianControlTests(unittest.TestCase):
                                     'intrinsics': torch.eye(3).reshape(1, 1, 3, 3).repeat(1, 2, 1, 1),
                                     'near': torch.ones(1, 2), 'far': torch.ones(1, 2) * 100,
                                     'index': torch.tensor([[5, 7]])}}
+                if mode == 'reuse':
+                    previous = Path(temporary) / 'previous'
+                    (previous / 'cameras').mkdir(parents=True)
+                    (previous / 'metadata.json').write_text(json.dumps(model.analysis_metadata))
+                    (previous / 'run_status.txt').write_text('COMPLETE\n')
+                    source_camera = 'cameras/000123.pt'  # Deliberately different from batch_idx.
+                    torch.save({'scene': 'test-scene', 'protocol': 'shared_final_pose',
+                                'context_indices': batch['context']['index'],
+                                'target_indices': batch['target']['index'],
+                                'extrinsics': extrinsics + .25,
+                                **{key: batch['target'][key] for key in ('intrinsics', 'near', 'far')}},
+                               previous / source_camera)
+                    (previous / 'per_scene.jsonl').write_text(json.dumps({
+                        'scene': 'test-scene', 'context_indices': [4, 9], 'target_indices': [5, 7],
+                        'overlap_group': 'medium', 'camera_file': source_camera,
+                        'conditions': {'final_100': {'psnr': 27., 'ssim': .9, 'lpips': .1}},
+                    }) + '\n')
+                    model.analysis_reference = GaussianControlReference(previous, model.analysis_metadata)
+                    model.analysis_fractions = (.05, .10)
                 with contextlib.redirect_stdout(io.StringIO()):
                     model.on_test_start()
                     model.test_step(batch, 0)
                     model.on_test_end()
                 self.assertEqual(model.encoder.calls, 1)
-                self.assertEqual(model.align_calls, int(align))
-                self.assertEqual(model.decoder.counts, [12, 9, 9, 6, 6, 3, 3])
+                self.assertEqual(model.align_calls, int(mode == 'align'))
+                self.assertEqual(model.decoder.counts, [1, 1, 1, 1] if mode == 'reuse'
+                                 else [12, 9, 9, 6, 6, 3, 3])
                 expected = extrinsics + .25 if align else extrinsics
                 for camera in model.decoder.cameras:
                     torch.testing.assert_close(camera, expected, rtol=0, atol=0)
                 stored = torch.load(Path(temporary) / 'cameras/000000.pt', weights_only=True)
                 torch.testing.assert_close(stored['extrinsics'], expected, rtol=0, atol=0)
-                self.assertTrue(all((Path(temporary) / f'{name}.txt').is_file() for name in CONDITIONS))
+                names = ('prune_005', 'redistribute_005', 'prune_010', 'redistribute_010') if mode == 'reuse' else CONDITIONS
+                self.assertTrue(all((Path(temporary) / f'{name}.txt').is_file() for name in names))
+                if mode == 'reuse':
+                    self.assertFalse((Path(temporary) / 'final_100.txt').exists())
+                    records = json.loads((Path(temporary) / 'per_scene.jsonl').read_text())
+                    self.assertEqual(records['reference_final_100']['psnr'], 27.)
+                    self.assertEqual(set(records['conditions']), set(names))
+                    self.assertIn('-2.000000', (Path(temporary) / 'prune_005.txt').read_text())
+                    self.assertEqual(model.report.average('prune_005')['shared_pose_alignment_ms'], 0.)
 
 
 if __name__ == '__main__':

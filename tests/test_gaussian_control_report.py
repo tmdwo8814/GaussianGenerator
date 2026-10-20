@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from src.evaluation.gaussian_control_report import CONDITIONS, GaussianControlReport
+from src.evaluation.gaussian_control_report import CONDITIONS, GaussianControlReport, retention_fractions
 
 
 class GaussianControlReportTests(unittest.TestCase):
@@ -43,6 +43,35 @@ class GaussianControlReportTests(unittest.TestCase):
             self.assertFalse((Path(temporary) / 'summary.txt').exists())
             with self.assertRaises(ValueError):
                 report.add_scene({}, 'small', {'final_100': {}})
+
+    def test_only_five_and_ten_percent_files_and_matched_reused_baseline_deltas(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = GaussianControlReport(root, {'checkpoint': 'Final.ckpt', 'camera_protocol': 'shared_final_pose',
+                                                  'reference_run': '/previous/run'},
+                                           fractions=[.05, .10], reuse_baseline=True)
+            names = ('prune_005', 'redistribute_005', 'prune_010', 'redistribute_010')
+            values = {name: {'psnr': 20., 'ssim': .7, 'lpips': .3} for name in names}
+            for index, group in enumerate(('small', 'medium')):
+                report.add_scene({'scene': str(index)}, group, values,
+                                 reference_final={'psnr': 30. + index * 10, 'ssim': .9, 'lpips': .1})
+            self.assertEqual(report.average('final_100')['psnr'], 35.)
+            self.assertEqual(report.average('final_100', 'small')['psnr'], 30.)
+            summary = report.finish()
+            self.assertIn('-15.000000', summary)
+            self.assertIn('Baseline: reused', summary)
+            self.assertFalse((root / 'final_100.txt').exists())
+            self.assertFalse((root / 'prune_025.txt').exists())
+            self.assertTrue(all((root / f'{name}.txt').exists() for name in names))
+            record = json.loads((root / 'per_scene.jsonl').read_text().splitlines()[0])
+            self.assertEqual(set(record['conditions']), set(names))
+            self.assertEqual(record['reference_final_100']['psnr'], 30.)
+
+    def test_fraction_configuration_is_unambiguous(self):
+        self.assertEqual(retention_fractions([.05, .10]), (.05, .10))
+        for invalid in ([], [1.], [0], [-.1], [.05, .05], [True], [.005], [float('nan')]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                retention_fractions(invalid)
 
 
 if __name__ == '__main__':

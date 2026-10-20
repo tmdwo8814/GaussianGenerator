@@ -13,6 +13,8 @@ import hydra
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
+from src.evaluation.gaussian_control_report import retention_fractions
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,7 +43,8 @@ class GaussianControlEntrypointTests(unittest.TestCase):
                  and node.name in ('prepare_config', 'evaluate')]
         for node in nodes:
             node.decorator_list = []
-        self.namespace = {'Path': Path, 'DictConfig': DictConfig, 'OmegaConf': OmegaConf}
+        self.namespace = {'Path': Path, 'DictConfig': DictConfig, 'OmegaConf': OmegaConf,
+                          'retention_fractions': retention_fractions}
         exec(compile(ast.Module(body=nodes, type_ignores=[]), 'control_entrypoint', 'exec'), self.namespace)
 
     def test_compose_final_and_replace_only_test_sampler(self):
@@ -61,6 +64,13 @@ class GaussianControlEntrypointTests(unittest.TestCase):
             self.namespace['prepare_config'](self.cfg)
         self.cfg.model.encoder.gs_params_head_type = 'moment'
         self.checkpoint.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.namespace['prepare_config'](self.cfg)
+
+    def test_reference_must_exist_instead_of_silently_rerunning_final(self):
+        OmegaConf.update(self.cfg, 'gaussian_control.reference_run',
+                         str(self.directory / 'missing-reference'), force_add=True)
+        OmegaConf.update(self.cfg, 'gaussian_control.fractions', [.05, .10], force_add=True)
         with self.assertRaises(FileNotFoundError):
             self.namespace['prepare_config'](self.cfg)
 
