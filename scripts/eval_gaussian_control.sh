@@ -2,7 +2,7 @@
 #SBATCH -J GaussianGenerator-control
 #SBATCH --gres=gpu:high_perf:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=60G
+#SBATCH --mem=45G
 #SBATCH -p batch_grad
 #SBATCH -w ariel-n1
 #SBATCH -t 6-00:00:00
