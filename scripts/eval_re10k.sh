@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH -J FinalPlus-eval
-#SBATCH --gres=gpu:high_perf:3
+#SBATCH --gres=gpu:high_perf:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH -p batch_grad
