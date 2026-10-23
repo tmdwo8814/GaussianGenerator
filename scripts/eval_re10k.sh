@@ -28,7 +28,7 @@ export HYDRA_FULL_ERROR=1
 
 TRAIN_RUN_DIR="${TRAIN_RUN_DIR:-/nas2/data/tmdwo8814/research/GaussianGenerator/outputs/exp_final_plus/2026-10-16_18-35-06}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$TRAIN_RUN_DIR/checkpoints}"
-EVAL_STEPS="${EVAL_STEPS:-[80000,100000,120000,140000]}"
+EVAL_STEPS="${EVAL_STEPS:-[140000]}"
 EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-$PWD/outputs/resume_eval/$WANDB_RUN_ID/${SLURM_JOB_ID:-$(date +%Y-%m-%d_%H-%M-%S)}}"
 
 # Slurm opens its stdout BEFORE this script runs. Its path above deliberately
