@@ -183,7 +183,8 @@ class MomentGaussianDecoder(nn.Module):
         return function(*args)
 
     def _allocation_chunk(self, source_points, source_projection, budget,
-                          points, destination_projection, neighbors, return_appearance=False):
+                          points, destination_projection, neighbors, return_appearance=False,
+                          return_logits=False):
         delta = source_points[:, None] - points[neighbors]
         geometry = torch.cat((delta, delta.square().sum(-1, keepdim=True)), dim=-1)
         first = self.allocation_head[0]
@@ -195,12 +196,16 @@ class MomentGaussianDecoder(nn.Module):
         logits = self.allocation_head[2](hidden).squeeze(-1)
         allocation = logits.softmax(dim=-1)  # sum_k A[j, k] = 1
         mass = allocation * budget  # q[j, k] = A_ij * b_j
+        if return_logits:
+            scores = self.appearance_head(hidden).squeeze(-1) if return_appearance else logits.new_zeros(logits.shape)
+            return mass, scores, logits
         if return_appearance:
             return mass, self.appearance_head(hidden).squeeze(-1)
         return mass
 
     def predict_allocation(self, points: Tensor, features: Tensor,
-                           neighbors: Tensor, return_appearance: bool = False):
+                           neighbors: Tensor, return_appearance: bool = False,
+                           return_logits: bool = False):
         """Normalized coordinates in; sparse outgoing mass q [M, K] out."""
         # Project each support once instead of repeating a 128->64 projection
         # for every edge. These projections remain in the autograd graph.
@@ -218,11 +223,13 @@ class MomentGaussianDecoder(nn.Module):
         chunks = []
         for start in range(0, len(points), self.cfg.chunk_size):
             stop = start + self.cfg.chunk_size
+            extra = (True,) if return_logits else ()
             chunks.append(self._run_chunk(
                 self._allocation_chunk, points[start:stop], source_projection[start:stop],
                 budget[start:stop], points, destination_projection, neighbors[start:stop], return_appearance,
+                *extra,
             ))
-        if return_appearance:
+        if return_appearance or return_logits:
             return tuple(torch.cat(values, dim=0) for values in zip(*chunks))
         return torch.cat(chunks, dim=0)
 
@@ -239,7 +246,8 @@ class MomentGaussianDecoder(nn.Module):
         return weights[..., None, None] * delta[..., :, None] * delta[..., None, :]
 
     def aggregate_moments(self, points: Tensor, features: Tensor,
-                          neighbors: Tensor, mass_per_edge: Tensor, return_weights: bool = False):
+                          neighbors: Tensor, mass_per_edge: Tensor, return_weights: bool = False,
+                          destination_mask: Tensor | None = None):
         """Incoming mass, weighted mean, CENTRAL covariance and pooled feature.
 
         All tensors use FP32 in forward. The epsilon self contribution only
@@ -252,6 +260,13 @@ class MomentGaussianDecoder(nn.Module):
         )
         self_prior = mass_per_edge.new_zeros(1, neighbors.shape[1])
         self_prior[:, 0] = self.cfg.mass_epsilon  # build_knn guarantees self first
+        if destination_mask is not None:
+            # Closed sources can fall back to an open destination in column 0.
+            # Only a real, open self edge receives the stabilizing prior.
+            self_prior = self.cfg.mass_epsilon * (
+                (neighbors == torch.arange(count, device=points.device)[:, None])
+                & destination_mask[neighbors]
+            ).to(mass_per_edge.dtype)
         weights = (mass_per_edge + self_prior) / (
             mass[neighbors] + self.cfg.mass_epsilon
         )
@@ -413,7 +428,8 @@ class MomentGaussianDecoder(nn.Module):
 
     def forward(self, points: Tensor, features: Tensor, *,
                 image_shape: tuple[int, int, int] | None = None,
-                rgb: Tensor | None = None, diagnostics: dict | None = None) -> Gaussians:
+                rgb: Tensor | None = None, diagnostics: dict | None = None,
+                control_cache: dict | None = None) -> Gaussians:
         """[B, M, 3] points + [B, M, D] features -> standard Gaussians.
 
         M can represent pixels, voxels or tokens from any number of views.
@@ -428,6 +444,10 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError("features must have shape [B, M, feature_dim]")
         if points.device != features.device:
             raise ValueError("points and features must share a device")
+        if control_cache is not None and (points.shape[0] != 1 or self.training or torch.is_grad_enabled()):
+            raise ValueError("Control caching requires one scene, eval mode and no_grad")
+        if control_cache is not None and diagnostics is not None:
+            raise ValueError("Control caching and training diagnostics must run separately")
         image = None
         if self.appearance_reader is not None:
             if (image_shape is None or len(image_shape) != 3 or min(image_shape) < 1
@@ -456,7 +476,35 @@ class MomentGaussianDecoder(nn.Module):
                                       query_backend=self.cfg.knn_query_backend)
                 normalized = scene_points / scene_scale
                 scene_stats = {}
-                if self.appearance_head is None:
+                if control_cache is not None:
+                    q, scores, logits = self.predict_allocation(
+                        normalized, scene_features, neighbors,
+                        return_appearance=self.appearance_head is not None, return_logits=True,
+                    )
+                    *scene_moments, geometry = self.aggregate_moments(
+                        normalized, scene_features, neighbors, q, return_weights=True,
+                    )
+                    control_cache.update({
+                        'points': normalized.detach(), 'features': scene_features.detach(),
+                        'neighbors': neighbors.detach(), 'logits': logits.detach(),
+                        'appearance_scores': scores.detach(),
+                        'budget': (self.cfg.budget_max * self.budget_head(scene_features).sigmoid()).detach(),
+                        'mass': scene_moments[0].detach(), 'scene_scale': scene_scale.detach(),
+                        'image_shape': image_shape,
+                        'rgb': None if rgb is None else rgb[scene_index].float().detach(),
+                    })
+                    if self.cfg.appearance_capacity:
+                        raw_sh, _ = self._capacity_scene(
+                            normalized, scene_features, rgb[scene_index].float(),
+                            scene_moments[1], scene_moments[3], geometry, scores,
+                            neighbors, image, False,
+                        )
+                        completed_scenes.append(self.build_gaussians(
+                            *scene_moments, scene_scale, appearance_harmonics=raw_sh,
+                        ))
+                        continue
+                    raise ValueError("Gaussian control caching currently requires the Final/Final++ capacity decoder")
+                elif self.appearance_head is None:
                     q = self.predict_allocation(normalized, scene_features, neighbors)
                     scene_moments = self.aggregate_moments(normalized, scene_features, neighbors, q)
                 else:

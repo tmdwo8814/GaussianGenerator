@@ -1,0 +1,37 @@
+defaults:
+  - main
+  - experiment: re10k_moment
+  - override dataset/view_sampler@dataset.re10k.view_sampler: evaluation
+  - _self_
+
+mode: test
+wandb:
+  mode: disabled
+checkpointing:
+  load: /workspace/research/GaussianGenerator/pretrained_weights/Final++_RE10k.ckpt
+model:
+  encoder:
+    pretrained_weights: ''
+    moment_decoder:
+      compile_kernels: false  # Avoid counting compilation as adaptation.
+data_loader:
+  test:
+    batch_size: 1
+    num_workers: 4
+    persistent_workers: false
+
+control:
+  stage: all  # all | cache | evaluate; evaluate needs no dataset or checkpoint.
+  cache_dir: outputs/gaussian_control/final_plus_cache
+  output_dir: outputs/gaussian_control/final_plus_results
+  percentages: [100, 75, 50, 25, 10, 5, 1]
+  methods: [prune, merge, redistribute]
+  max_scenes: null  # Deterministic first N scene names; null = full index.
+  warmup_runs: 1  # Once per method/budget per process, using the first cached scene.
+  timing_repeats: 1  # Each scene contributes one sample by default.
+  render_chunk_size: 1  # Bound renderer memory, identical for every condition.
+  save_variants: false  # Full Gaussian + support state are always saved in cache_dir.
+
+hydra:
+  run:
+    dir: ${control.output_dir}/hydra

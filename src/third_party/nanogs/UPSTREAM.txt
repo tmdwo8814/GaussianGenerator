@@ -1,0 +1,6 @@
+NanoGS by Butian Xiong, Rong Liu, Tiantian Zhou, Meida Chen, Zhiwen Fan, Andrew Feng
+https://github.com/saliteta/NanoGS
+Commit: cc64a752b5def8d17f9992216bfbb9e533f8364f
+Paper: https://arxiv.org/abs/2603.16103
+License: CC BY-NC 4.0; see LICENSE.
+The vendored Python files are unmodified. Only the in-memory adapter in src/gaussian_control/nanogs.py changes target-count handling and disables opacity pre-pruning.
