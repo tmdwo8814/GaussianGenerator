@@ -23,7 +23,9 @@ mkdir -p logs
 sbatch exp3/run_exp3.sh
 ```
 
-두 decoder를 순서대로 GPU에 올리므로 GPU 하나로 실행한다. Checkpoint의 모든 `encoder.*` weight를 **strict=True**로 복원하고, `eval()` / `no_grad()` / `requires_grad_(False)`를 적용한다. MASt3R pretrained 초기값으로 대체하지 않는다. 최종 covariance와 opacity는 기존 encoder의 최종 반환 tensor에서 읽는다.
+두 decoder를 순서대로 GPU에 올리므로 GPU 하나로 실행한다. Original은 checkpoint의 모든 `encoder.*` weight를 **strict=True**로 복원한다. Ours는 그림에 필요한 geometry 경로를 사용한다. `appearance_2d`, `separate_appearance`, `appearance_capacity`를 끄고 checkpoint에서 `gaussian_decoder.appearance_head.*`, `appearance_reader.*`, `appearance_sh_head.*`만 제외한 뒤 **나머지 encoder state 전체를 strict=True로 복원**한다. 따라서 학습 시 사용한 색상 MLP의 폭·깊이가 현재 코드와 달라도 geometry를 추출할 수 있으며, backbone·point/feature head·allocation·budget·scale weight가 없거나 크기가 다르면 오류로 보고한다. 제외한 key는 `checkpoint_load_ours.json`에 기록한다.
+
+이 경로는 기존 moment decoder의 kNN·allocation·moment·최종 covariance/opacity 계산을 그대로 사용한다. 실제 decoder의 전체 appearance 경로와 geometry 경로의 mean/covariance/opacity 일치는 CPU 테스트로 확인한다. SH 색상 출력은 이번 분석에 사용하지 않는다. 모든 추론에 `eval()` / `no_grad()` / `requires_grad_(False)`를 적용하고 MASt3R 초기값으로 학습 weight를 대체하지 않는다.
 
 기본적으로 `opacity >= 1/255`인 active Gaussian을 사용한다. 전체 선택 장면의 active Gaussian에 무작위 priority를 부여하여 패널당 최대 60,000개를 균일 표본 추출한다. Scene별 동일 quota가 아니므로 장면마다 active 개수가 달라도 pooled 분포를 반영한다. 전체 개수와 장면별 median은 표본이 아닌 전체 active Gaussian에서 계산한다. 다른 장면이 dataset 내부에서 누락되면 `failures.txt`에 기록하고 그림 생성을 중단한다.
 
@@ -43,11 +45,16 @@ bash exp3/run_exp3.sh --include-inactive --save-gaussians
 # 추론 없이 저장된 표본으로 그림만 다시 생성
 python -m exp3.plot_scale_opacity --plot-only --output-dir exp3/output/my_run
 
+# Original 완료 후 Ours에서 실패했다면 같은 결과 폴더에서 재개
+OUTPUT_DIR=exp3/output/my_run sbatch exp3/run_exp3.sh --resume
+
 # checkpoint 생성 당시 추가 Hydra override가 있었을 경우
 bash exp3/run_exp3.sh --ours-override model.encoder.moment_decoder.scale_max=3.0
 ```
 
 `--override`는 두 모델에 공통 적용하고 `--original-override` / `--ours-override`는 해당 모델에만 적용한다. 각 옵션은 여러 번 쓸 수 있다. 동일 장면·256×256 해상도·실험별 head 설정은 실행 시 검증한다. 모든 slot을 포함할 때 scale이 정확히 0이면 log가 정의되지 않으므로 오류로 보고한다.
+
+`--resume`은 지정된 폴더의 metadata, 완료된 decoder의 표본과 장면별 개수를 확인해 재사용한다. 이전 버전에서 original만 완료한 결과도 사용할 수 있다. Index·선택 장면/view·seed·표본 수·checkpoint 경로 등 분석 설정은 같아야 한다. 미완료 decoder의 CSV 행은 재개 시 정리하고 해당 decoder를 처음부터 다시 실행한다. 완료된 original 표본은 다시 생성하지 않는다. `failures.txt`는 이전 실패 이력을 보존하며, 최종 성공 여부는 `status.txt`로 확인한다.
 
 이번 그림은 camera-dependent 투영이나 렌더링을 사용하지 않아 pose alignment가 필요하지 않다. 원래 요청의 PSNR/gap 실험으로 확장할 때는 사용자가 선택한 target/context 각각의 pose alignment를 적용한다.
 
@@ -61,6 +68,7 @@ bash exp3/run_exp3.sh --ours-override model.encoder.moment_decoder.scale_max=3.0
 - `index_exclusions.json`: null index 및 subset 미선정 장면을 명시.
 - `per_scene.csv`: 전체/active/선택 Gaussian 개수와 전체 선택 Gaussian의 median log scale.
 - `metadata.json`, `config_{original,ours}.yaml`, `env.txt`: 정의·설정·seed·checkpoint step·패키지 버전·git commit.
+- `checkpoint_load_{original,ours}.json`: strict 복원 여부 및 geometry 추출에서 제외한 appearance key. 재개 시 현재 환경은 `env_resume.txt`에 기록.
 - `failures.txt`, `status.txt`: 실패 정보와 `RUNNING` / `FAILED` / `COMPLETE` 상태.
 - `dumps/<decoder>/<scene_index:06d>.npz`: `--save-gaussians` 선택 시 전체 slot의 최종 `means`, `cov`, `opacity`, float32. 이 파일만으로 RGB 재렌더링하는 기능은 범위에 포함하지 않는다.
 
@@ -70,4 +78,4 @@ bash exp3/run_exp3.sh --ours-override model.encoder.moment_decoder.scale_max=3.0
 python -m unittest discover -s exp3/tests -v
 ```
 
-테스트는 합성 covariance의 알려진 scale·회전/배율 불변 관계, pooled 표본 추출, 공통 장면 선택, strict checkpoint 복원 경계, 실제 PNG/PDF 출력을 검증한다. 서버 checkpoint를 이용한 GPU 추론은 서버에서 실행해야 한다. 테스트의 합성 값은 실제 분석 결과로 저장하지 않는다.
+테스트는 합성 covariance의 알려진 scale·회전/배율 불변 관계, pooled 표본 추출, 공통 장면 선택, strict checkpoint 복원 경계, 실제 PNG/PDF 출력을 검증한다. 추가로 보고된 SH shape mismatch를 가진 checkpoint fixture와 실제 moment decoder로 geometry 일치를 확인하고, original 완료 후 실패한 실행의 재개를 검증한다. 서버 checkpoint를 이용한 GPU 추론은 서버에서 실행해야 한다. 테스트의 합성 값은 실제 분석 결과로 저장하지 않는다.

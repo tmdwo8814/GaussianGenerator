@@ -29,6 +29,8 @@ ORIGINAL = ("/nas2/data/tmdwo8814/research/GaussianGenerator/outputs/exp_nopospl
             "2026-10-12_16-46-59/checkpoints/epoch_0-step_60000.ckpt")
 OURS = ("/nas2/data/tmdwo8814/research/GaussianGenerator/outputs/exp_final_plus/"
         "2026-10-16_18-35-06/checkpoints/epoch_2-step_140000.ckpt")
+APPEARANCE_PREFIXES = tuple(f"gaussian_decoder.{name}." for name in
+                            ("appearance_head", "appearance_reader", "appearance_sh_head"))
 
 
 def write_json(path: Path, value):
@@ -96,6 +98,8 @@ def parser():
     result.add_argument("--save-gaussians", action="store_true",
                         help="Also save final means/covariance/opacity per scene (float32)")
     result.add_argument("--plot-only", action="store_true", help="Replot cached output-dir samples")
+    result.add_argument("--resume", action="store_true",
+                        help="Reuse completed decoder samples in the specified output-dir")
     result.add_argument("--override", action="append", default=[], metavar="KEY=VALUE",
                         help="Additional Hydra override shared by both models; repeat as needed")
     result.add_argument("--original-override", action="append", default=[], metavar="KEY=VALUE")
@@ -119,6 +123,10 @@ def compose_config(args, name, selected_index):
     # torch.compile is unnecessary for this inference-only visualization.
     if cfg.model.encoder.gs_params_head_type == "moment":
         cfg.model.encoder.moment_decoder.compile_kernels = False
+        # Appearance has no path into mass/means/covariance. Use the repository's
+        # geometry branch so SH architectures from older checkpoints are irrelevant.
+        for flag in ("appearance_2d", "separate_appearance", "appearance_capacity"):
+            cfg.model.encoder.moment_decoder[flag] = False
     if len(cfg.dataset) != 1 or "re10k" not in cfg.dataset:
         raise ValueError("This entrypoint supports the supplied NoPoSplat RE10K experiments")
     cfg.dataset.re10k.roots = [str(args.data_root.resolve())]
@@ -132,8 +140,8 @@ def compose_config(args, name, selected_index):
     return cfg, OmegaConf
 
 
-def restore_encoder(encoder, checkpoint_path):
-    """Strictly restore all encoder weights; never use MASt3R initialization."""
+def restore_encoder(encoder, checkpoint_path, *, geometry_only=False, load_info=None):
+    """Strictly restore used modules; only explicitly unused appearance may be omitted."""
     import torch
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -142,7 +150,17 @@ def restore_encoder(encoder, checkpoint_path):
              if key.startswith("encoder.")}
     if not state:
         raise ValueError(f"Checkpoint has no Lightning encoder.* state: {checkpoint_path}")
+    omitted = []
+    if geometry_only:
+        cfg = encoder.gaussian_decoder.cfg
+        if any(getattr(cfg, flag) for flag in
+               ("appearance_2d", "separate_appearance", "appearance_capacity")):
+            raise ValueError("Disable appearance modules before geometry-only restore")
+        omitted = sorted(key for key in state if key.startswith(APPEARANCE_PREFIXES))
+        state = {key: value for key, value in state.items() if key not in omitted}
     encoder.load_state_dict(state, strict=True)
+    if load_info is not None:
+        load_info.update(strict=True, geometry_only=geometry_only, omitted_appearance_keys=omitted)
     return int(checkpoint.get("global_step", 0))
 
 
@@ -183,7 +201,10 @@ def extract(args, name, scenes, directory):
     cfg = load_typed_root_config(cfg_dict)
     set_cfg(cfg_dict)
     encoder, _ = get_encoder(cfg.model.encoder)
-    step = restore_encoder(encoder, getattr(args, f"{name}_checkpoint"))
+    load_info = {}
+    step = restore_encoder(encoder, getattr(args, f"{name}_checkpoint"),
+                           geometry_only=(name == "ours"), load_info=load_info)
+    write_json(directory / f"checkpoint_load_{name}.json", load_info)
     encoder = encoder.to(args.device).eval().requires_grad_(False)
     shim = get_data_shim(encoder)
     loader = DataModule(cfg.dataset, cfg.data_loader).test_dataloader()
@@ -255,6 +276,51 @@ def extract(args, name, scenes, directory):
     return {**counts, "checkpoint_step": step, "scenes": len(seen)}
 
 
+def resume_metadata(args, directory, scenes):
+    """Reuse only a complete decoder with identical selection and input settings."""
+    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    previous = metadata["arguments"]
+    operational = {"output_dir", "resume", "plot_only", "device", "num_workers"}
+    for key, value in vars(args).items():
+        if key not in operational:
+            value = str(value) if isinstance(value, Path) else value
+            if previous.get(key) != value:
+                raise ValueError(f"Cannot resume with changed {key}: {previous.get(key)!r} -> {value!r}")
+    if metadata["index_sha256"] != hashlib.sha256(args.index.read_bytes()).hexdigest():
+        raise ValueError("Evaluation index changed since the saved run")
+    saved_scenes = json.loads((directory / "scenes.json").read_text(encoding="utf-8"))
+    if list(saved_scenes.items()) != list(scenes.items()):
+        raise ValueError("Saved scene/view manifest differs from this run")
+    with (directory / "per_scene.csv").open(newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        fields, rows = reader.fieldnames, list(reader)
+    completed = metadata["counts"]
+    if not set(completed).issubset({"original", "ours"}):
+        raise ValueError("Unknown cached decoder")
+    for name, counts in completed.items():
+        name_rows = [row for row in rows if row["decoder"] == name]
+        if (counts["scenes"] != len(scenes) or len(name_rows) != len(scenes)
+                or {row["scene"] for row in name_rows} != set(scenes)):
+            raise ValueError(f"Incomplete cached scene records for {name}")
+        for key in ("N_total", "N_active", "N_selected"):
+            if sum(int(row[key]) for row in name_rows) != counts[key]:
+                raise ValueError(f"Cached {key} differs from scene records for {name}")
+        with np.load(directory / "samples" / f"{name}.npz", allow_pickle=False) as data:
+            length = min(args.sample_size, counts["N_selected"])
+            for key in ("log_s_max", "opacity", "scene_index", "gaussian_index"):
+                if data[key].shape != (length,) or not np.isfinite(data[key]).all():
+                    raise ValueError(f"Invalid cached {key} for {name}")
+    # A failed decoder may have partial CSV rows. Retry that decoder from its
+    # first scene, retaining completed decoders and their samples unchanged.
+    temporary = directory / "per_scene.csv.tmp"
+    with temporary.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(row for row in rows if row["decoder"] in completed)
+    temporary.replace(directory / "per_scene.csv")
+    return metadata
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     directory = args.output_dir.resolve()
@@ -269,46 +335,59 @@ def main(argv=None):
             raise FileNotFoundError(path)
     if not args.data_root.is_dir():
         raise FileNotFoundError(args.data_root)
-    if directory.exists() and any(directory.iterdir()):
+    if not args.resume and directory.exists() and any(directory.iterdir()):
         raise FileExistsError(f"Use an empty output directory: {directory}")
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "samples").mkdir()
     index = json.loads(args.index.read_text(encoding="utf-8"))
     scenes = select_scenes(index, args.num_scenes, args.seed)
-    write_json(directory / "scenes.json", scenes)
-    write_json(directory / "index_exclusions.json", {
-        "null_entries": sorted(scene for scene, entry in index.items() if entry is None),
-        "not_selected_by_fixed_subset": sorted(set(index) - set(scenes)
-                                               - {s for s, e in index.items() if e is None}),
-    })
-    (directory / "failures.txt").touch()
+    if args.resume:
+        metadata = resume_metadata(args, directory, scenes)
+    else:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "samples").mkdir()
+        write_json(directory / "scenes.json", scenes)
+        write_json(directory / "index_exclusions.json", {
+            "null_entries": sorted(scene for scene, entry in index.items() if entry is None),
+            "not_selected_by_fixed_subset": sorted(set(index) - set(scenes)
+                                                   - {s for s, e in index.items() if e is None}),
+        })
+        (directory / "failures.txt").touch()
+        fields = ("decoder", "scene", "overlap", "N_total", "N_active", "N_selected", "median_log_s_max")
+        with (directory / "per_scene.csv").open("w", newline="", encoding="utf-8") as file:
+            csv.writer(file).writerow(fields)
+    print(f"[exp3] output={directory}; scenes={len(scenes)}; resume={args.resume}", flush=True)
     (directory / "status.txt").write_text("RUNNING\n", encoding="utf-8")
-    fields = ("decoder", "scene", "overlap", "N_total", "N_active", "N_selected", "median_log_s_max")
-    with (directory / "per_scene.csv").open("w", newline="", encoding="utf-8") as file:
-        csv.writer(file).writerow(fields)
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True,
                             text=True, check=False).stdout.strip()
     versions = sorted(f"{item.metadata['Name']}=={item.version}"
                       for item in importlib.metadata.distributions())
-    (directory / "env.txt").write_text(
+    (directory / ("env_resume.txt" if args.resume else "env.txt")).write_text(
         f"git_commit={commit}\npython={platform.python_version()}\nseed={args.seed}\n"
         + "\n".join(versions) + "\n", encoding="utf-8")
-    metadata = {
-        "arguments": {key: str(value) if isinstance(value, Path) else value
-                      for key, value in vars(args).items()},
-        "index_sha256": hashlib.sha256(args.index.read_bytes()).hexdigest(),
-        "git_commit": commit, "num_scenes": len(scenes),
-        "scale_definition": "log10(max_k sqrt(eig_k(final covariance)))",
-        "coordinate_system": "encoder canonical world frame, before renderer near rescaling",
-        "opacity_definition": "final encoder output passed unchanged to the rasterizer",
-        "selection": "all slots" if args.include_inactive else "final opacity >= 1/255",
-        "sampling": "uniform pooled Gaussian priorities, fixed seed and scene identity",
-        "comparison": "user-specified converged checkpoints; unequal steps accepted",
-        "counts": {},
-    }
+    if not args.resume:
+        metadata = {
+            "arguments": {key: str(value) if isinstance(value, Path) else value
+                          for key, value in vars(args).items()},
+            "index_sha256": hashlib.sha256(args.index.read_bytes()).hexdigest(),
+            "git_commit": commit, "num_scenes": len(scenes),
+            "scale_definition": "log10(max_k sqrt(eig_k(final covariance)))",
+            "coordinate_system": "encoder canonical world frame, before renderer near rescaling",
+            "opacity_definition": "final encoder output passed unchanged to the rasterizer",
+            "selection": "all slots" if args.include_inactive else "final opacity >= 1/255",
+            "sampling": "uniform pooled Gaussian priorities, fixed seed and scene identity",
+            "comparison": "user-specified converged checkpoints; unequal steps accepted",
+            "counts": {},
+        }
+    else:
+        metadata.setdefault("resumes", []).append({"git_commit": commit, "device": args.device,
+                                                   "num_workers": args.num_workers})
+    metadata["ours_extraction"] = "appearance disabled; remaining encoder state loaded with strict=True"
     write_json(directory / "metadata.json", metadata)
     try:
         for name in ("original", "ours"):
+            if name in metadata["counts"]:
+                print(f"[{name}] reusing completed samples ({metadata['counts'][name]['scenes']} scenes)",
+                      flush=True)
+                continue
             metadata["counts"][name] = extract(args, name, scenes, directory)
             write_json(directory / "metadata.json", metadata)
         make_figure(directory)

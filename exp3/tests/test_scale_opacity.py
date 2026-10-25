@@ -126,6 +126,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(ours.model.encoder.moment_decoder.feature_dim, 256)
         self.assertEqual(ours.model.encoder.moment_decoder.scale_max, 3.0)
         self.assertFalse(ours.model.encoder.moment_decoder.compile_kernels)
+        for flag in ("appearance_2d", "separate_appearance", "appearance_capacity"):
+            self.assertFalse(ours.model.encoder.moment_decoder[flag])
         for cfg in (original, ours):
             self.assertEqual(cfg.model.encoder.pretrained_weights, "")
             self.assertEqual(cfg.dataset.re10k.view_sampler.index_path, str(index))
