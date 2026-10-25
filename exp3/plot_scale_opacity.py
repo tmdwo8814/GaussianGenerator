@@ -81,6 +81,8 @@ def parser():
     result.add_argument("--device", default="cuda:0")
     result.add_argument("--include-inactive", action="store_true")
     result.add_argument("--save-gaussians", action="store_true")
+    result.add_argument("--lbf", action="store_true", help="Full-population projected/world LBF analysis")
+    result.add_argument("--bootstrap-samples", type=int, default=10000)
     modes = result.add_mutually_exclusive_group()
     modes.add_argument("--plot-only", action="store_true")
     modes.add_argument("--resume", action="store_true")
@@ -176,6 +178,10 @@ def extract(args, name, scenes, directory):
     shim = get_data_shim(encoder)
     loader = DataModule(cfg.dataset, cfg.data_loader).test_dataloader()
     sampler = PrioritySample(args.sample_size)
+    collector = None
+    if args.lbf:
+        from exp3.lbf_metrics import LBFCollector
+        collector = LBFCollector(directory, name, scenes, args.seed, args.sample_size)
     counts = dict.fromkeys(("N_total", "N_active", "N_selected"), 0)
     ordered = {scene: i for i, scene in enumerate(scenes)}
     seen, scene = set(), "__loader__"
@@ -197,6 +203,13 @@ def extract(args, name, scenes, directory):
             selected = np.ones(len(opacity), dtype=bool) if args.include_inactive else active
             covariance = gaussians.covariances[0].detach().float().cpu().numpy()
             x = log_max_scale(covariance[selected])
+            if collector is not None:
+                context = batch["context"]
+                collector.add(
+                    ordered[scene], scene, gaussians.means[0].detach().float().cpu().numpy(),
+                    covariance, opacity, x, context["extrinsics"][0].detach().cpu().numpy(),
+                    context["intrinsics"][0].detach().cpu().numpy(), tuple(context["image"].shape[-2:]),
+                )
             digest = hashlib.sha256(f"{args.seed}:{scene}".encode()).digest()
             rng = np.random.default_rng(int.from_bytes(digest[:8], "little"))
             sampler.add(rng.random(len(opacity))[selected], log_s_max=x,
@@ -230,6 +243,9 @@ def extract(args, name, scenes, directory):
     if missing:
         raise RuntimeError(f"{name}: {len(missing)} selected scenes missing; see failures.txt")
     np.savez_compressed(directory / "samples" / f"{name}.npz", **sampler.arrays())
+    if collector is not None:
+        collector.finish()
+        counts["N_lbf_analysis"] = collector.n_projected
     del encoder, loader, shim
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -238,10 +254,11 @@ def extract(args, name, scenes, directory):
 
 def resume_metadata(args, directory, scenes):
     metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
-    operational = {"output_dir", "resume", "plot_only", "num_workers", "device"}
+    operational = {"output_dir", "resume", "plot_only", "num_workers", "device", "bootstrap_samples"}
     for key, value in vars(args).items():
         value = str(value) if isinstance(value, Path) else value
-        if key not in operational and metadata["arguments"].get(key) != value:
+        previous = metadata["arguments"].get(key, False if key == "lbf" else None)
+        if key not in operational and previous != value:
             raise ValueError(f"Cannot resume with changed {key}")
     if metadata["index_sha256"] != hashlib.sha256(args.index.read_bytes()).hexdigest():
         raise ValueError("Evaluation index changed")
@@ -254,6 +271,9 @@ def resume_metadata(args, directory, scenes):
     if not set(completed).issubset({"original", "ours"}):
         raise ValueError("Unknown cached decoder")
     for name, counts in completed.items():
+        if args.lbf:
+            from exp3.lbf_metrics import validate_cache
+            validate_cache(directory, name, scenes)
         if name == "ours":
             info = json.loads((directory / "checkpoint_load_ours.json").read_text(encoding="utf-8"))
             if not info.get("all_encoder_weights") or not info.get("strict"):
@@ -284,9 +304,19 @@ def main(argv=None):
     directory = args.output_dir.resolve()
     if args.plot_only:
         make_figure(directory)
+        metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+        if args.lbf and not metadata["arguments"].get("lbf", False):
+            raise ValueError("This raw-only run has no full LBF cache; use a new output directory with --lbf")
+        if metadata["arguments"].get("lbf", False):
+            from exp3.lbf_report import run_report
+            scenes = json.loads((directory / "scenes.json").read_text(encoding="utf-8"))
+            run_report(directory, scenes, args.bootstrap_samples, metadata["arguments"]["seed"])
         return
-    if args.num_scenes < 0 or args.sample_size < 1 or args.num_workers < 0 or args.seed < 0:
+    if (args.num_scenes < 0 or args.sample_size < 1 or args.num_workers < 0 or args.seed < 0
+            or args.bootstrap_samples < 1):
         raise ValueError("Invalid scene/sample/worker count or seed")
+    if args.lbf and args.include_inactive:
+        raise ValueError("LBF uses active Gaussians (opacity >= 1/255); omit --include-inactive")
     for path in (args.original_checkpoint, args.ours_checkpoint, args.index):
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -335,12 +365,18 @@ def main(argv=None):
     (directory / "status.txt").write_text("RUNNING\n", encoding="utf-8")
     try:
         for name in ("original", "ours"):
+            if args.lbf and name == "ours":
+                from exp3.lbf_metrics import freeze_thresholds
+                freeze_thresholds(directory, scenes)
             if name in metadata["counts"]:
                 print(f"[{name}] reusing completed samples ({metadata['counts'][name]['scenes']} scenes)", flush=True)
                 continue
             metadata["counts"][name] = extract(args, name, scenes, directory)
             write_json(directory / "metadata.json", metadata)
         make_figure(directory)
+        if args.lbf:
+            from exp3.lbf_report import run_report
+            run_report(directory, scenes, args.bootstrap_samples, args.seed)
     except Exception:
         append_failure(directory, "run", "__run__", traceback.format_exc())
         (directory / "status.txt").write_text("FAILED\n", encoding="utf-8")
