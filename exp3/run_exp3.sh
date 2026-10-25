@@ -19,7 +19,7 @@ export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 export WANDB_MODE=disabled
 
-ORIGINAL_CHECKPOINT="${ORIGINAL_CHECKPOINT:-/nas2/data/tmdwo8814/research/GaussianGenerator/outputs/exp_noposplat/2026-10-12_16-46-59/checkpoints/epoch_0-step_60000.ckpt}"
+ORIGINAL_CHECKPOINT="${ORIGINAL_CHECKPOINT:-/nas2/data/tmdwo8814/research/GaussianGenerator/outputs/exp_noposplat/2026-10-12_16-46-59/checkpoints/epoch_2-step_140000.ckpt}"
 OURS_CHECKPOINT="${OURS_CHECKPOINT:-/nas2/data/tmdwo8814/research/GaussianGenerator/outputs/exp_final_plus/2026-10-16_18-35-06/checkpoints/epoch_2-step_140000.ckpt}"
 DATASET_ROOT="${DATASET_ROOT:-/local_datasets/3dgs/re10k/re10k}"
 INDEX_PATH="${INDEX_PATH:-$PWD/assets/evaluation_index_re10k.json}"
