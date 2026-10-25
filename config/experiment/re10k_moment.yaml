@@ -5,7 +5,7 @@ defaults:
   - _self_
 
 wandb:
-  name: final_plus_acid
+  name: final_plus
   tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus]
 
 # Final++: Final + wider/deeper SH MLP (A) + appearance feature std (B).
