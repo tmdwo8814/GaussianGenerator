@@ -37,16 +37,17 @@ def write_json(path: Path, value):
 
 
 def overlap_group(value):
+    """Stratify the entire valid overlap range without discarding its tails."""
     if isinstance(value, str) and value in ("small", "medium", "large"):
         return value
     value = float(value)
-    if 0.05 <= value <= 0.3:
+    if not np.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(f"Overlap must be finite and within [0, 1]: {value}")
+    if value <= 0.3:
         return "small"
-    if 0.3 < value <= 0.55:
+    if value <= 0.55:
         return "medium"
-    if 0.55 < value <= 0.8:
-        return "large"
-    raise ValueError(f"Unexpected overlap: {value}")
+    return "large"
 
 
 def select_scenes(index, count, seed):

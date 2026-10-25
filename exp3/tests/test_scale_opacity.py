@@ -8,7 +8,9 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from exp3.plot import make_figure
-from exp3.plot_scale_opacity import compose_config, main, parser, restore_encoder, select_scenes
+from exp3.plot_scale_opacity import (
+    ROOT, compose_config, main, overlap_group, parser, restore_encoder, select_scenes,
+)
 from exp3.scale_opacity import PrioritySample, log_max_scale
 
 
@@ -35,6 +37,30 @@ class ScaleTests(unittest.TestCase):
 
 
 class SamplingTests(unittest.TestCase):
+    def test_overlap_tails_and_boundaries_remain_eligible(self):
+        cases = ((0, "small"), (0.04031, "small"), (0.05, "small"),
+                 (0.3, "small"), (0.30001, "medium"), (0.55, "medium"),
+                 (0.55001, "large"), (0.8, "large"), (0.95, "large"), (1, "large"))
+        index = {}
+        for i, (value, expected) in enumerate(cases):
+            with self.subTest(overlap=value):
+                self.assertEqual(overlap_group(value), expected)
+            index[str(i)] = {"overlap": value, "context": [0, 10], "target": [5]}
+        self.assertEqual(set(select_scenes(index, 0, 0)), set(index))
+
+    def test_overlap_rejects_nonfinite_and_nonphysical_values(self):
+        for value in (-0.01, 1.01, float("nan"), float("inf")):
+            with self.subTest(overlap=value), self.assertRaises(ValueError):
+                overlap_group(value)
+
+    def test_actual_evaluation_index_supports_full_and_subset_selection(self):
+        index = json.loads((ROOT / "assets/evaluation_index_re10k.json").read_text(encoding="utf-8"))
+        valid = {scene for scene, entry in index.items() if entry is not None}
+        self.assertEqual(set(select_scenes(index, 0, 0)), valid)
+        subset = select_scenes(index, 500, 0)
+        self.assertEqual(len(subset), 500)
+        self.assertTrue(set(subset).issubset(valid))
+
     def test_pooled_sample_does_not_depend_on_chunk_order(self):
         rng = np.random.default_rng(42)
         priority = rng.random(10000)

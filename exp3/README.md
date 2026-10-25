@@ -27,6 +27,8 @@ sbatch exp3/run_exp3.sh
 
 기본적으로 `opacity >= 1/255`인 active Gaussian을 사용한다. 전체 선택 장면의 active Gaussian에 무작위 priority를 부여하여 패널당 최대 60,000개를 균일 표본 추출한다. Scene별 동일 quota가 아니므로 장면마다 active 개수가 달라도 pooled 분포를 반영한다. 전체 개수와 장면별 median은 표본이 아닌 전체 active Gaussian에서 계산한다. 다른 장면이 dataset 내부에서 누락되면 `failures.txt`에 기록하고 그림 생성을 중단한다.
 
+장면 층화 구간은 small `[0, 0.3]`, medium `(0.3, 0.55]`, large `(0.55, 1]`이다. `0.04031`처럼 0.05보다 작거나 0.8보다 큰 유효 overlap도 포함한다. NaN/무한대와 `[0,1]` 밖의 잘못된 값은 오류로 보고한다.
+
 ```bash
 # 경로 및 표본 수 변경
 ORIGINAL_CHECKPOINT=/path/original.ckpt \
