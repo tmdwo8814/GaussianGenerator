@@ -1,0 +1,23 @@
+{
+  "status": "complete",
+  "processed_scenes": 900,
+  "overlap_counts": {
+    "small": 300,
+    "medium": 300,
+    "large": 300
+  },
+  "checkpoint_sha256": "d75546770682f629973ed6fd9fc5a64daf5b83ff32bde17522e46b1af0844bc9",
+  "scene_split_sha256": "0d2cdcf1fa94394351430521a195db76c749a482183f8a00b8e3961a64575b03",
+  "calibration_sha256": "336a369c4076d63702979fc6772959173abbad722398b6bfab918d545b4a312e",
+  "beta_file_sha256": "ddf5cbb384ff1d8bff1c9eed4bdf30d224d051139e77e7565b683b8a1dbcb8d2",
+  "diagonal_recovery_median": {
+    "size": 1.0,
+    "shape": 1.0,
+    "rotation": 1.0,
+    "opacity": 1.0,
+    "base_color": 1.0,
+    "view_color": 1.0
+  },
+  "diagonal_warnings": [],
+  "primary_table": "compensation_summary.csv"
+}

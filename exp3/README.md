@@ -129,6 +129,21 @@ Checkpoint 학습 당시 override가 있었다면 `--override KEY=VALUE`(공통)
 
 ## 검증
 
+### 저장된 수치 결과 검토
+
+전체 scalar cache나 checkpoint 없이 `results/`의 CSV/JSON만으로 장면별 상관·개선율, 크기별 LBF tail, 기존 LBF 유지/신규 분류, 면적 합계의 장면 집중도를 검토할 수 있다.
+
+```bash
+python -m exp3.review_lbf_results --results-dir exp3/results \
+    --output-dir exp3/output/lbf_review
+```
+
+출력은 `review.{md,json}` 및 네 종류의 PNG/PDF다. 입력 파일 hash와 CSV/보고서 population 일치를 확인하며 입력 통계·임계값은 수정하지 않는다. `fig_lbf_evidence`는 장면별 Spearman rho, 비율 분해, paired scene scatter를 보여준다. `fig_lbf_tail_robustness`는 크기 임계값에 따른 효과를, `fig_lbf_coupling_and_incidence`는 상관 분포와 원본/ours LBF slot의 중첩을 보여준다. `fig_lbf_area_diagnostics`는 면적 비율·장면 집중도·절대 잠재 면적을 함께 보여준다. 이 검토 스크립트의 해석 문구는 현재 500장면 결과를 검토하기 위한 것이며, 새 실험의 통계적 결론은 생성된 수치를 다시 확인해야 한다.
+
+Raw Jacobian area 합계가 소수 장면에 집중되면 pooled area fraction이 크게 줄어도 실제 LBF 면적 감소의 증거가 되지 않는다. 분자/분모의 절대 합계, 장면별 평균/paired CI 및 depth/화면 밖 support를 함께 확인해야 한다. 화면에서 보이는 footprint를 평가하려면 renderer와 동일한 culling/projection과 화면 경계를 반영하는 별도 분석이 필요하다.
+
+### 로컬 테스트
+
 ```bash
 python -m unittest discover -s exp3/tests -v
 ```

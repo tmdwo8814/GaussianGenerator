@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "baseline_cache": {
+    "schema": 1,
+    "manifest_hash": "e15b167898ceef6e378ea8496e93ace0cd6d934c2a6922cb3a9ab193ca7b1793",
+    "n_scenes": 500,
+    "N_projected": 65125114,
+    "N_world": 65176850,
+    "sample_size": 60000
+  },
+  "source": "original only; full population",
+  "alpha_main": 0.25,
+  "active_cutoff": 0.00392156862745098,
+  "reference_camera": "origin context view; exclude nonpositive origin depth",
+  "focal": "horizontal pixel focal implied by repo get_fov",
+  "area": "pi*sqrt(det(J R Sigma R^T J^T)); unfiltered 1-sigma ellipse",
+  "projected": {
+    "P80": 2.7250227840341874,
+    "P90": 3.9782864152315462,
+    "P95": 5.666723402178076,
+    "4px": 4.0,
+    "8px": 8.0,
+    "16px": 16.0
+  },
+  "world": {
+    "P80": 0.05020148802927128,
+    "P90": 0.08546429609582938,
+    "P95": 0.1294778954431296
+  }
+}

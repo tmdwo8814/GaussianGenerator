@@ -1,0 +1,162 @@
+{
+  "status": "complete",
+  "analysis": {
+    "output_dir": "outputs/gaussian_decoder_analysis/compensation/step_80000",
+    "scene_split_path": "outputs/gaussian_decoder_analysis/splits/gradient_900.json",
+    "phase": "finalize",
+    "fold_id": 0,
+    "num_folds": 3,
+    "calibration_scenes_per_overlap": 30,
+    "target_perturbation_mse": 0.0001,
+    "calibration_fractions": [
+      0.125,
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "size_cap": 0.22314355131420976,
+    "shape_cap": 0.2,
+    "rotation_cap_radians": 0.17453292519943295,
+    "opacity_cap": 0.5,
+    "base_color_cap": 0.22314355131420976,
+    "view_color_cap": 0.6931471805599453,
+    "beta_abs_max": 2.0,
+    "minimum_damage": 1e-12,
+    "bootstrap_samples": 2000,
+    "seed": 20260823,
+    "diagonal_recovery_warning": 0.99,
+    "allow_checkpoint_mismatch": false,
+    "resume": true,
+    "fail_fast": true
+  },
+  "mode_definition": {
+    "size": "additive isotropic log-scale field",
+    "shape": "zero-sum [-1,0,1] log-eigenscale field",
+    "rotation": "axis-angle covariance rotation around fixed [1,2,3] axis",
+    "opacity": "additive final-opacity logit field",
+    "base_color": "multiplicative SH-DC log-gain field",
+    "view_color": "multiplicative non-DC SH log-gain field"
+  },
+  "calibration": {
+    "status": "complete",
+    "target_perturbation_mse": 0.0001,
+    "calibration_scenes": 90,
+    "amplitudes": {
+      "size": 0.22314355131420976,
+      "shape": 0.2,
+      "rotation": 0.17453292519943295,
+      "opacity": 0.5,
+      "base_color": 0.11157177565710488,
+      "view_color": 0.6931471805599453
+    },
+    "choices": {
+      "size": {
+        "mode": "size",
+        "fraction": 1.0,
+        "amplitude": 0.22314355131420976,
+        "damage_mean": 8.083421237070843e-05,
+        "damage_median": 6.369757678301098e-05,
+        "count": 90
+      },
+      "shape": {
+        "mode": "shape",
+        "fraction": 1.0,
+        "amplitude": 0.2,
+        "damage_mean": 1.6893898073158658e-05,
+        "damage_median": 1.309102826139404e-05,
+        "count": 90
+      },
+      "rotation": {
+        "mode": "rotation",
+        "fraction": 1.0,
+        "amplitude": 0.17453292519943295,
+        "damage_mean": 1.2134037313963703e-05,
+        "damage_median": 5.995489723600552e-06,
+        "count": 90
+      },
+      "opacity": {
+        "mode": "opacity",
+        "fraction": 1.0,
+        "amplitude": 0.5,
+        "damage_mean": 0.00011940490557865683,
+        "damage_median": 9.88619665639281e-05,
+        "count": 90
+      },
+      "base_color": {
+        "mode": "base_color",
+        "fraction": 0.5,
+        "amplitude": 0.11157177565710488,
+        "damage_mean": 0.00011600019304077475,
+        "damage_median": 0.00010533014039452441,
+        "count": 90
+      },
+      "view_color": {
+        "mode": "view_color",
+        "fraction": 1.0,
+        "amplitude": 0.6931471805599453,
+        "damage_mean": 0.00010492798851973725,
+        "damage_median": 7.406993238254635e-05,
+        "count": 90
+      }
+    },
+    "caps": {
+      "size": 0.22314355131420976,
+      "shape": 0.2,
+      "rotation": 0.17453292519943295,
+      "opacity": 0.5,
+      "base_color": 0.22314355131420976,
+      "view_color": 0.6931471805599453
+    },
+    "mode_definition": {
+      "size": "additive isotropic log-scale field",
+      "shape": "zero-sum [-1,0,1] log-eigenscale field",
+      "rotation": "axis-angle covariance rotation around fixed [1,2,3] axis",
+      "opacity": "additive final-opacity logit field",
+      "base_color": "multiplicative SH-DC log-gain field",
+      "view_color": "multiplicative non-DC SH log-gain field"
+    },
+    "checkpoint": {
+      "path": "/workspace/research/NoPoSplat/outputs/exp_reproduce5/2026-05-06_14-37-24/checkpoints/epoch_1-step_80000.ckpt",
+      "sha256": "d75546770682f629973ed6fd9fc5a64daf5b83ff32bde17522e46b1af0844bc9",
+      "global_step": 80000,
+      "missing_encoder_keys": [],
+      "unexpected_encoder_keys": []
+    },
+    "scene_split": {
+      "path": "/workspace/research/NoPoSplat/outputs/gaussian_decoder_analysis/splits/gradient_900.json",
+      "sha256": "0d2cdcf1fa94394351430521a195db76c749a482183f8a00b8e3961a64575b03",
+      "scenes": 900
+    },
+    "sha256": "336a369c4076d63702979fc6772959173abbad722398b6bfab918d545b4a312e"
+  },
+  "summary": {
+    "status": "complete",
+    "processed_scenes": 900,
+    "overlap_counts": {
+      "small": 300,
+      "medium": 300,
+      "large": 300
+    },
+    "checkpoint_sha256": "d75546770682f629973ed6fd9fc5a64daf5b83ff32bde17522e46b1af0844bc9",
+    "scene_split_sha256": "0d2cdcf1fa94394351430521a195db76c749a482183f8a00b8e3961a64575b03",
+    "calibration_sha256": "336a369c4076d63702979fc6772959173abbad722398b6bfab918d545b4a312e",
+    "beta_file_sha256": "ddf5cbb384ff1d8bff1c9eed4bdf30d224d051139e77e7565b683b8a1dbcb8d2",
+    "diagonal_recovery_median": {
+      "size": 1.0,
+      "shape": 1.0,
+      "rotation": 1.0,
+      "opacity": 1.0,
+      "base_color": 1.0,
+      "view_color": 1.0
+    },
+    "diagonal_warnings": [],
+    "primary_table": "compensation_summary.csv"
+  },
+  "git": {
+    "commit": "22c60910aa0e5ec413d9434a328e55dcf3784337",
+    "branch": "baseline_analysis",
+    "dirty": false,
+    "status": ""
+  }
+}
