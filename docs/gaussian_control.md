@@ -146,6 +146,23 @@ in implementation details that opacity pre-pruning is disabled.
 
 ## Verification
 
+Read current cache/evaluation progress without interrupting the experiment:
+
+```bash
+python scripts/gaussian_control_status.py
+```
+
+The helper uses only the Python standard library and reads manifests and small
+per-scene result JSON files. It counts fully completed requested conditions,
+reports partial scenes, and estimates remaining time from the most recent 50
+completed-scene file timestamps, including rendering, metrics and reporting.
+It also reports merging-only time from completed scenes. Custom paths and a
+different recent window are supported with `--cache-dir`, `--output-dir`, and
+`--window`. `--json` emits machine-readable output. Displayed finish times use
+Asia/Seoul. ETA is a projection, not a process-liveness check; pauses/restarts
+or parallel jobs writing the same directory can invalidate the estimate.
+This helper does not change any inference, timing or cache-signature source.
+
 ```bash
 python -m unittest discover -s tests -p 'test_gaussian_control.py' -v
 python -m unittest discover -s tests -p 'test_moment*.py' -v
