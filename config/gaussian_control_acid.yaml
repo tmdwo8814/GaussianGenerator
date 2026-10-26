@@ -1,0 +1,17 @@
+# RE10K-trained Final++ evaluated on ACID, with the RE10K control algorithms.
+# ACID uses DatasetRE10k and the dataset.re10k config key in this repository.
+defaults:
+  - gaussian_control
+  - _self_
+
+dataset:
+  re10k:
+    roots: [/workspace/datasets/acid]
+    view_sampler:
+      index_path: assets/evaluation_index_acid.json
+
+# Keep the RE10K experiment/model/checkpoint inherited from gaussian_control.
+# In particular, do not select experiment=acid_moment or an ACID-trained weight.
+control:
+  cache_dir: outputs/gaussian_control/re10k_to_acid/cache
+  output_dir: outputs/gaussian_control/re10k_to_acid/controls
