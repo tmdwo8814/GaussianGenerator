@@ -1,0 +1,24 @@
+{
+  "repository": "https://github.com/Kevin-2017/compress-diff-gaussian-rasterization",
+  "commit": "9893d8c607684bc1a432e179cc97035d72d84520",
+  "glm_commit": "5c46b9c07008ae65cb81ab79cd677ecc1934b903",
+  "files": [
+    "LICENSE.md",
+    "cuda_rasterizer/auxiliary.h",
+    "cuda_rasterizer/backward.cu",
+    "cuda_rasterizer/backward.h",
+    "cuda_rasterizer/config.h",
+    "cuda_rasterizer/forward.cu",
+    "cuda_rasterizer/forward.h",
+    "cuda_rasterizer/rasterizer.h",
+    "cuda_rasterizer/rasterizer_impl.cu",
+    "cuda_rasterizer/rasterizer_impl.h",
+    "ext.cpp",
+    "rasterize_points.cu",
+    "rasterize_points.h"
+  ],
+  "glm_files": 429,
+  "modifications": [
+    "forward.cu: use atomicAdd for per-Gaussian hit and importance accumulation; mathematical summation unchanged."
+  ]
+}
