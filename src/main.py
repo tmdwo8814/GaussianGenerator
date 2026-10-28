@@ -46,8 +46,16 @@ def get_ckpt_step(path: Path) -> int:
     return int(match.group(1))
 
 
-def get_eval_checkpoints(checkpoint_dir: Path, eval_every_n_steps: int) -> list[Path]:
+def get_eval_checkpoints(
+    checkpoint_dir: Path, eval_every_n_steps: int, auto_eval_steps: list[int] | None = None
+) -> list[Path]:
     ckpts = sorted(checkpoint_dir.glob("*.ckpt"), key=get_ckpt_step)
+    if auto_eval_steps is not None:
+        requested = set(auto_eval_steps)
+        missing = requested - {get_ckpt_step(ckpt) for ckpt in ckpts}
+        if missing:
+            raise FileNotFoundError(f"Missing auto-eval checkpoints for steps {sorted(missing)} in {checkpoint_dir}")
+        return [ckpt for ckpt in ckpts if get_ckpt_step(ckpt) in requested]
     return [
         ckpt for ckpt in ckpts
         if get_ckpt_step(ckpt) % eval_every_n_steps == 0
@@ -190,12 +198,14 @@ def train(cfg_dict: DictConfig):
             )
 
             checkpoint_dir = output_dir / "checkpoints"
-            eval_ckpts = get_eval_checkpoints(checkpoint_dir, eval_every_n_steps)
+            eval_ckpts = get_eval_checkpoints(
+                checkpoint_dir, eval_every_n_steps, cfg.trainer.auto_eval_steps
+            )
 
             if trainer.global_rank == 0:
                 print(
                     f"[PostEval] Found {len(eval_ckpts)} checkpoints "
-                    f"for eval_every_n_steps={eval_every_n_steps}"
+                    f"for steps={[get_ckpt_step(ckpt) for ckpt in eval_ckpts]}"
                 )
 
             # evaluation용 view sampler를 command-line override처럼 강제로 설정

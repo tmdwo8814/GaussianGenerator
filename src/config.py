@@ -37,6 +37,7 @@ class TrainerCfg:
     # auto evaluation during training
     auto_eval: bool = False
     eval_every_n_steps: int | None = None
+    auto_eval_steps: list[int] | None = None  # Explicit steps override the interval.
     auto_eval_index_path: Optional[Path] = None
     auto_eval_save_image: bool = False
     auto_eval_save_video: bool = False
