@@ -5,7 +5,7 @@ defaults:
   - _self_
 
 wandb:
-  name: final_plus_budget1
+  name: final_plus_budget4
   tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus]
 
 # Final++: Final + wider/deeper SH MLP (A) + appearance feature std (B).
@@ -37,7 +37,7 @@ model:
       knn_backend: auto  # Exact CuPy GPU KD-tree on CUDA; SciPy on CPU.
       knn_query_backend: specialized  # Exact FP64 3D/K=16 query; cupy restores the previous query.
       knn_workers: 1  # Used only by the explicit SciPy backend.
-      budget_max: 1.0
+      budget_max: 4.0
       budget_init: 0.6931471805599453
       scale_min: 1.0
       scale_max: 3.0
