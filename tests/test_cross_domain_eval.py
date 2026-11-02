@@ -245,20 +245,21 @@ class CrossDomainTests(unittest.TestCase):
             self.assertEqual(cfg.cross_domain.evaluation_dataset, "acid")
             self.assertEqual(cfg.cross_domain.experiment, evaluation.EXPERIMENTS[label])
 
-    def test_acid_benchmark_index_keeps_context_endpoints_and_ignores_null_scenes(self):
-        path = evaluation.REPO_ROOT / "assets/evaluation_index_acid.json"
-        original = json.loads(path.read_text())
-        evaluation.write_json(self.scene_index, {
-            scene: "000000.torch" for scene, entry in original.items() if entry is not None
-        })
-        actual = evaluation.read_view_index(path, self.dataset, evaluation_dataset="acid")
-        self.assertEqual(actual, original)
-        self.assertTrue(any(entry is None for entry in actual.values()))
-        self.assertTrue(any(set(entry["context"]) & set(entry["target"])
-                            for entry in actual.values() if entry is not None))
-        # A benchmark exception for ACID must not weaken the DL3DV protocol.
-        with self.assertRaisesRegex(ValueError, "context and target"):
-            evaluation.read_view_index(path, self.dataset)
+    def test_benchmark_indices_keep_context_endpoints_and_ignore_null_scenes(self):
+        for dataset in ("acid", "re10k"):
+            path = evaluation.REPO_ROOT / f"assets/evaluation_index_{dataset}.json"
+            original = json.loads(path.read_text())
+            evaluation.write_json(self.scene_index, {
+                scene: "000000.torch" for scene, entry in original.items() if entry is not None
+            })
+            actual = evaluation.read_view_index(path, self.dataset, evaluation_dataset=dataset)
+            self.assertEqual(actual, original)
+            self.assertTrue(any(entry is None for entry in actual.values()))
+            self.assertTrue(any(set(entry["context"]) & set(entry["target"])
+                                for entry in actual.values() if entry is not None))
+            # Benchmark endpoints must not weaken the generated DL3DV protocol.
+            with self.assertRaisesRegex(ValueError, "context and target"):
+                evaluation.read_view_index(path, self.dataset)
 
     def test_re10k_to_acid_launcher_defaults_and_separate_output(self):
         with contextlib.redirect_stdout(io.StringIO()) as help_output:

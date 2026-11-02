@@ -25,7 +25,7 @@ CHECKPOINT_NAMES = {
     "re10k": {"ours": "Final++_re10k.ckpt", "baseline": "re10k.ckpt"},
     "acid": {"ours": "Final++_acid.ckpt", "baseline": "noposplat_acid.ckpt"},
 }
-EVALUATION_LOADERS = {"dl3dv": "dl3dv", "acid": "re10k"}
+EVALUATION_LOADERS = {"dl3dv": "dl3dv", "acid": "re10k", "re10k": "re10k"}
 
 
 def write_json(path: Path, value) -> None:
@@ -111,6 +111,52 @@ def monitor_jobs(jobs, output_dir: Path):
     return failures
 
 
+def run_evaluations(configs, gpus, output_dir: Path) -> None:
+    """Start every configured experiment before waiting, one GPU per worker."""
+    from omegaconf import OmegaConf
+
+    if len(configs) != len(gpus):
+        raise ValueError("Require one GPU for each evaluation config")
+    jobs = []
+    try:
+        for (label, config), gpu in zip(configs.items(), gpus):
+            model_dir = output_dir / label
+            model_dir.mkdir(parents=True)
+            config_path = model_dir / "config.yaml"
+            OmegaConf.save(config, config_path)
+            env = os.environ.copy()
+            env.update(CUDA_VISIBLE_DEVICES=gpu, WANDB_MODE="disabled", PYTHONUNBUFFERED="1",
+                       OMP_NUM_THREADS="1", HYDRA_FULL_ERROR="1")
+            for name in ("WANDB_RUN_ID", "WANDB_RESUME"):
+                env.pop(name, None)
+            log = (model_dir / "console.log").open("w", encoding="utf-8")
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, "-u", "-m", "scripts.eval_re10k2dl3dv",
+                     "--worker-config", str(config_path)],
+                    cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                )
+            finally:
+                log.close()
+            jobs.append((label, process))
+            print(
+                f"[CrossDomain] Started {label} PID={process.pid}; "
+                f"log={model_dir / 'console.log'}", flush=True,
+            )
+        failures = monitor_jobs(jobs, output_dir)
+        if failures:
+            raise RuntimeError(
+                f"Evaluation failed: {failures}. "
+                f"Inspect each model's console.log in {output_dir}"
+            )
+    finally:
+        for _, process in jobs:
+            if process.poll() is None:
+                process.terminate()
+        for _, process in jobs:
+            process.wait()
+
+
 def fixed_views(num_frames: int, context_gap: int, num_targets: int):
     """Match DL3DV's bounded-test context [0, gap], with novel targets only."""
     if context_gap < 2 or not 1 <= num_targets < context_gap:
@@ -153,10 +199,10 @@ def read_view_index(
             raise ValueError(f"Scene {scene}: view indices must be nonnegative integers")
         if len(set(context)) != len(context) or len(set(target)) != len(target):
             raise ValueError(f"Scene {scene}: repeated indices within context or target")
-        # Keep the supplied ACID benchmark unchanged: some entries intentionally
+        # Keep the supplied ACID/RE10K benchmarks unchanged: some entries
         # include a context endpoint among their targets. Generated DL3DV views
         # continue to require separate context and target sets.
-        if evaluation_dataset != "acid" and set(context) & set(target):
+        if evaluation_dataset not in ("acid", "re10k") and set(context) & set(target):
             raise ValueError(f"Scene {scene}: context and target views must be distinct")
     if not any(entry is not None for entry in index.values()):
         raise ValueError(f"No evaluable scenes in {path}")
@@ -208,7 +254,7 @@ def compose_config(
     experiment = EXPERIMENTS_BY_SOURCE[training_dataset][label]
     loader_key = EVALUATION_LOADERS[evaluation_dataset]
     overrides = [f"+experiment={experiment}"]
-    # ACID uses the RE10K loader and preprocessing. DL3DV has its own dataset
+    # ACID and RE10K share the RE10K loader. DL3DV has its own dataset
     # defaults, so replace the source dataset node for that destination.
     if evaluation_dataset == "dl3dv":
         overrides += [
@@ -371,8 +417,8 @@ def main(argv=None, *, training_dataset="re10k", evaluation_dataset="dl3dv") -> 
     checkpoint_names = CHECKPOINT_NAMES[training_dataset]
     loader_key = EVALUATION_LOADERS[evaluation_dataset]
     default_index = (
-        REPO_ROOT / "assets/evaluation_index_acid.json"
-        if evaluation_dataset == "acid" else None
+        REPO_ROOT / f"assets/evaluation_index_{evaluation_dataset}.json"
+        if evaluation_dataset in ("acid", "re10k") else None
     )
     parser = argparse.ArgumentParser(
         description=(
@@ -404,8 +450,8 @@ def main(argv=None, *, training_dataset="re10k", evaluation_dataset="dl3dv") -> 
     )
     parser.add_argument(
         "--index", type=Path, default=default_index,
-        help=("ACID benchmark context/target index, shared by both models"
-              if evaluation_dataset == "acid" else
+        help=(f"{evaluation_dataset.upper()} benchmark context/target index, shared by both models"
+              if default_index is not None else
               "Existing scene -> context/target JSON; otherwise generate once for both models"),
     )
     parser.add_argument("--context-gap", type=int, default=22)
@@ -496,49 +542,9 @@ def main(argv=None, *, training_dataset="re10k", evaluation_dataset="dl3dv") -> 
     frozen_index = output_dir / f"evaluation_index_{evaluation_dataset}.json"
     if index_path != frozen_index:
         frozen_index.write_bytes(index_path.read_bytes())
-    from omegaconf import OmegaConf
-
-    jobs = []
-    try:
-        for label, gpu in zip(args.models, gpus):
-            model_dir = output_dir / label
-            model_dir.mkdir()
-            config = configs[label]
-            config.dataset[loader_key].view_sampler.index_path = str(frozen_index)
-            config_path = model_dir / "config.yaml"
-            OmegaConf.save(config, config_path)
-            env = os.environ.copy()
-            env.update(CUDA_VISIBLE_DEVICES=gpu, WANDB_MODE="disabled", PYTHONUNBUFFERED="1",
-                       OMP_NUM_THREADS="1", HYDRA_FULL_ERROR="1")
-            # A worker needs no experiment tracker and never resumes a training run.
-            for name in ("WANDB_RUN_ID", "WANDB_RESUME"):
-                env.pop(name, None)
-            log = (model_dir / "console.log").open("w", encoding="utf-8")
-            try:
-                process = subprocess.Popen(
-                    [sys.executable, "-u", "-m", "scripts.eval_re10k2dl3dv",
-                     "--worker-config", str(config_path)],
-                    cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
-                )
-            finally:
-                log.close()
-            jobs.append((label, process))
-            print(
-                f"[CrossDomain] Started {label} PID={process.pid}; "
-                f"log={model_dir / 'console.log'}", flush=True,
-            )
-        failures = monitor_jobs(jobs, output_dir)
-        if failures:
-            raise RuntimeError(
-                f"Evaluation failed: {failures}. "
-                f"Inspect each model's console.log in {output_dir}"
-            )
-    finally:
-        for _, process in jobs:
-            if process.poll() is None:
-                process.terminate()
-        for _, process in jobs:
-            process.wait()
+    for config in configs.values():
+        config.dataset[loader_key].view_sampler.index_path = str(frozen_index)
+    run_evaluations(configs, gpus, output_dir)
     summarize(output_dir, args.models)
     print(f"[CrossDomain] Results: {output_dir / 'summary.csv'}", flush=True)
 

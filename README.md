@@ -124,6 +124,9 @@ You can refer to the [re10k_1x8](config/experiment/re10k_1x8.yaml) for training 
 
 
 ### Evaluation
+To run all four RE10K ↔ ACID cross-domain experiments on four GPUs, see
+[the four-experiment launcher](docs/re10k_acid_eval.md).
+
 For RE10K-trained Final++ and NoPoSplat evaluation on DL3DV, see
 [the cross-domain evaluation instructions](docs/re10k2dl3dv_eval.md).
 For ACID-trained checkpoints, see
