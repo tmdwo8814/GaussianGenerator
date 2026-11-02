@@ -25,6 +25,7 @@ CHECKPOINT_NAMES = {
     "re10k": {"ours": "Final++_re10k.ckpt", "baseline": "re10k.ckpt"},
     "acid": {"ours": "Final++_acid.ckpt", "baseline": "noposplat_acid.ckpt"},
 }
+EVALUATION_LOADERS = {"dl3dv": "dl3dv", "acid": "re10k"}
 
 
 def write_json(path: Path, value) -> None:
@@ -123,28 +124,40 @@ def fixed_views(num_frames: int, context_gap: int, num_targets: int):
     }
 
 
-def read_view_index(path: Path, dataset_root: Path) -> dict:
+def read_view_index(
+    path: Path, dataset_root: Path, *, evaluation_dataset="dl3dv"
+) -> dict:
     index = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(index, dict) or not index:
         raise ValueError(f"Empty or invalid evaluation index: {path}")
     scene_index = json.loads((dataset_root / "test/index.json").read_text(encoding="utf-8"))
     for scene, entry in index.items():
-        if scene not in scene_index:
-            raise ValueError(f"Evaluation scene {scene!r} is absent from DL3DV test/index.json")
         if entry is None:
             continue
+        if scene not in scene_index:
+            raise ValueError(
+                f"Evaluation scene {scene!r} is absent from "
+                f"{evaluation_dataset.upper()} test/index.json"
+            )
         if not isinstance(entry, dict):
             raise ValueError(
                 f"{path} must contain scene -> {{context: [...], target: [...]}}. "
-                "DL3DV's test/index.json maps scenes to chunks; it is not a view index."
+                "The dataset's test/index.json maps scenes to chunks; it is not a view index."
             )
         context, target = entry.get("context"), entry.get("target")
         if (not isinstance(context, list) or len(context) != 2
                 or not isinstance(target, list) or not target):
             raise ValueError(f"Scene {scene}: require exactly two context views and nonempty targets")
         indices = context + target
-        if any(type(i) is not int or i < 0 for i in indices) or len(set(indices)) != len(indices):
-            raise ValueError(f"Scene {scene}: view indices must be distinct nonnegative integers")
+        if any(type(i) is not int or i < 0 for i in indices):
+            raise ValueError(f"Scene {scene}: view indices must be nonnegative integers")
+        if len(set(context)) != len(context) or len(set(target)) != len(target):
+            raise ValueError(f"Scene {scene}: repeated indices within context or target")
+        # Keep the supplied ACID benchmark unchanged: some entries intentionally
+        # include a context endpoint among their targets. Generated DL3DV views
+        # continue to require separate context and target sets.
+        if evaluation_dataset != "acid" and set(context) & set(target):
+            raise ValueError(f"Scene {scene}: context and target views must be distinct")
     if not any(entry is not None for entry in index.values()):
         raise ValueError(f"No evaluable scenes in {path}")
     return index
@@ -187,26 +200,30 @@ def generate_view_index(dataset_root: Path, path: Path, context_gap: int, num_ta
 
 def compose_config(
     label, checkpoint, dataset_root, index_path, output_dir, args,
-    *, training_dataset="re10k",
+    *, training_dataset="re10k", evaluation_dataset="dl3dv",
 ):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
-    with initialize_config_dir(version_base=None, config_dir=str(REPO_ROOT / "config")):
-        # Preserve the source model/loss configuration, including scale
-        # invariance. Both ACID and RE10K use the dataset.re10k node internally;
-        # remove that node and evaluate only the DL3DV test loader.
-        config = compose(config_name="main", overrides=[
-            f"+experiment={EXPERIMENTS_BY_SOURCE[training_dataset][label]}",
+    experiment = EXPERIMENTS_BY_SOURCE[training_dataset][label]
+    loader_key = EVALUATION_LOADERS[evaluation_dataset]
+    overrides = [f"+experiment={experiment}"]
+    # ACID uses the RE10K loader and preprocessing. DL3DV has its own dataset
+    # defaults, so replace the source dataset node for that destination.
+    if evaluation_dataset == "dl3dv":
+        overrides += [
             "~dataset.re10k",
             "+dataset@dataset.dl3dv=dl3dv",
-            "dataset/view_sampler@dataset.dl3dv.view_sampler=evaluation",
-        ])
+        ]
+    overrides.append(f"dataset/view_sampler@dataset.{loader_key}.view_sampler=evaluation")
+    with initialize_config_dir(version_base=None, config_dir=str(REPO_ROOT / "config")):
+        config = compose(config_name="main", overrides=overrides)
     config.mode = "test"
-    config.dataset.dl3dv.roots = [str(dataset_root)]
-    # DL3DV's optional bounded-specific defaults also merge sampler keys.
+    dataset = config.dataset[loader_key]
+    dataset.roots = [str(dataset_root)]
+    # Optional bounded-specific defaults also merge sampler keys.
     # Replace the whole node so no training sampler settings survive.
-    config.dataset.dl3dv.view_sampler = {
+    dataset.view_sampler = {
         "name": "evaluation", "index_path": str(index_path), "num_context_views": 2,
     }
     config.checkpointing.load = str(checkpoint)
@@ -224,6 +241,10 @@ def compose_config(
     config.test.save_image = args.save_image
     config.test.save_compare = args.save_image
     config.test.save_video = False
+    OmegaConf.update(config, "cross_domain", {
+        "training_dataset": training_dataset, "evaluation_dataset": evaluation_dataset,
+        "experiment": experiment,
+    }, force_add=True)
     OmegaConf.resolve(config)
     return config
 
@@ -232,8 +253,13 @@ def evaluate_worker(config_path: Path) -> None:
     from omegaconf import OmegaConf
 
     config = OmegaConf.load(config_path)
-    index_path = Path(config.dataset.dl3dv.view_sampler.index_path)
-    index = read_view_index(index_path, Path(config.dataset.dl3dv.roots[0]))
+    domain = config.get("cross_domain", {})
+    evaluation_dataset = domain.get("evaluation_dataset", "dl3dv")
+    (dataset,) = config.dataset.values()
+    index_path = Path(dataset.view_sampler.index_path)
+    index = read_view_index(
+        index_path, Path(dataset.roots[0]), evaluation_dataset=evaluation_dataset
+    )
     expected = {scene: entry for scene, entry in index.items() if entry is not None}
     progress = EvaluationProgress(
         config.wandb.name, len(expected), config_path.parent / "progress.json"
@@ -307,6 +333,8 @@ def evaluate_worker(config_path: Path) -> None:
                for name, total in model._test_metric_sums.items()}
     write_json(output_dir / "metrics.json", {
         "model": config.wandb.name, "checkpoint": cfg.checkpointing.load,
+        "training_dataset": domain.get("training_dataset"),
+        "evaluation_dataset": evaluation_dataset, "experiment": domain.get("experiment"),
         "evaluation_index": str(index_path),
         "evaluation_index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest(),
         "align_pose": cfg.test.align_pose, "pose_align_steps": cfg.test.pose_align_steps,
@@ -338,13 +366,19 @@ def summarize(output_dir: Path, labels: list[str]) -> None:
     (output_dir / "summary.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def main(argv=None, *, training_dataset="re10k") -> None:
+def main(argv=None, *, training_dataset="re10k", evaluation_dataset="dl3dv") -> None:
     experiments = EXPERIMENTS_BY_SOURCE[training_dataset]
     checkpoint_names = CHECKPOINT_NAMES[training_dataset]
+    loader_key = EVALUATION_LOADERS[evaluation_dataset]
+    default_index = (
+        REPO_ROOT / "assets/evaluation_index_acid.json"
+        if evaluation_dataset == "acid" else None
+    )
     parser = argparse.ArgumentParser(
         description=(
             f"Evaluate {training_dataset.upper()}-trained Final++ and NoPoSplat "
-            "on identical DL3DV test views, with per-model progress and ETA."
+            f"on identical {evaluation_dataset.upper()} test views, "
+            "with per-model progress and ETA."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -353,7 +387,11 @@ def main(argv=None, *, training_dataset="re10k") -> None:
         "--gpus", nargs="+", default=["0", "1"],
         help="One physical GPU ID per model, in model order",
     )
-    parser.add_argument("--dataset-root", type=Path, default=Path("/workspace/datasets/dl3dv"))
+    parser.add_argument(
+        "--dataset-root", type=Path,
+        default=Path("/workspace/datasets") / evaluation_dataset,
+        help="Evaluation dataset root (contains test/)",
+    )
     parser.add_argument(
         "--ours-checkpoint", type=Path,
         default=REPO_ROOT / "pretrained_weights" / checkpoint_names["ours"],
@@ -365,8 +403,10 @@ def main(argv=None, *, training_dataset="re10k") -> None:
         help=f"{training_dataset.upper()}-trained NoPoSplat checkpoint",
     )
     parser.add_argument(
-        "--index", type=Path,
-        help="Existing scene -> context/target JSON; otherwise generate once for both models",
+        "--index", type=Path, default=default_index,
+        help=("ACID benchmark context/target index, shared by both models"
+              if evaluation_dataset == "acid" else
+              "Existing scene -> context/target JSON; otherwise generate once for both models"),
     )
     parser.add_argument("--context-gap", type=int, default=22)
     parser.add_argument("--num-targets", type=int, default=3)
@@ -412,7 +452,8 @@ def main(argv=None, *, training_dataset="re10k") -> None:
                 f"Checkpoint not found: {path}; set --ours-checkpoint / --baseline-checkpoint"
             )
     output_dir = (
-        args.output_dir or REPO_ROOT / "outputs/cross_domain" / f"{training_dataset}2dl3dv"
+        args.output_dir or REPO_ROOT / "outputs/cross_domain"
+        / f"{training_dataset}2{evaluation_dataset}"
         / datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     ).expanduser().resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -421,14 +462,14 @@ def main(argv=None, *, training_dataset="re10k") -> None:
         )
     index_path = (
         args.index.expanduser().resolve() if args.index
-        else output_dir / "evaluation_index_dl3dv.json"
+        else output_dir / f"evaluation_index_{evaluation_dataset}.json"
     )
     if args.index:
-        read_view_index(index_path, dataset_root)
+        read_view_index(index_path, dataset_root, evaluation_dataset=evaluation_dataset)
     configs = {
         label: compose_config(
             label, checkpoints[label], dataset_root, index_path, output_dir, args,
-            training_dataset=training_dataset,
+            training_dataset=training_dataset, evaluation_dataset=evaluation_dataset,
         ) for label in args.models
     }
     for label, gpu in zip(args.models, gpus):
@@ -436,7 +477,10 @@ def main(argv=None, *, training_dataset="re10k") -> None:
             f"[CrossDomain] {label}: experiment={experiments[label]}, "
             f"GPU={gpu}, checkpoint={checkpoints[label]}", flush=True,
         )
-    print(f"[CrossDomain] DL3DV={dataset_root}; index={index_path}; output={output_dir}", flush=True)
+    print(
+        f"[CrossDomain] {evaluation_dataset.upper()}={dataset_root}; "
+        f"index={index_path}; output={output_dir}", flush=True,
+    )
     print(
         f"[CrossDomain] align_pose={not args.no_align_pose}; "
         f"context gap={args.context_gap}, targets={args.num_targets} "
@@ -449,7 +493,7 @@ def main(argv=None, *, training_dataset="re10k") -> None:
     if not args.index:
         generate_view_index(dataset_root, index_path, args.context_gap, args.num_targets)
     # Freeze even a supplied index into this run so both workers read identical bytes.
-    frozen_index = output_dir / "evaluation_index_dl3dv.json"
+    frozen_index = output_dir / f"evaluation_index_{evaluation_dataset}.json"
     if index_path != frozen_index:
         frozen_index.write_bytes(index_path.read_bytes())
     from omegaconf import OmegaConf
@@ -460,7 +504,7 @@ def main(argv=None, *, training_dataset="re10k") -> None:
             model_dir = output_dir / label
             model_dir.mkdir()
             config = configs[label]
-            config.dataset.dl3dv.view_sampler.index_path = str(frozen_index)
+            config.dataset[loader_key].view_sampler.index_path = str(frozen_index)
             config_path = model_dir / "config.yaml"
             OmegaConf.save(config, config_path)
             env = os.environ.copy()

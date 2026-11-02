@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from scripts import eval_re10k2dl3dv as evaluation
 from scripts import eval_acid2dl3dv as acid_evaluation
+from scripts import eval_re10k2acid as re10k_acid_evaluation
 
 
 class CrossDomainTests(unittest.TestCase):
@@ -218,6 +219,95 @@ class CrossDomainTests(unittest.TestCase):
             self.assertEqual(call.kwargs["env"]["CUDA_VISIBLE_DEVICES"], gpu)
         summarize.assert_called_once_with(self.output, ["ours", "baseline"])
 
+    def test_re10k_to_acid_preserves_models_and_native_acid_preprocessing(self):
+        for label in ("ours", "baseline"):
+            cfg = evaluation.compose_config(
+                label, self.checkpoint, self.dataset, self.index, self.output, self.args(),
+                evaluation_dataset="acid",
+            )
+            source = evaluation.compose_config(
+                label, self.checkpoint, self.dataset, self.index, self.output, self.args()
+            )
+            native_acid = evaluation.compose_config(
+                label, self.checkpoint, self.dataset, self.index, self.output, self.args(),
+                training_dataset="acid", evaluation_dataset="acid",
+            )
+            self.assertEqual(cfg.model, source.model)
+            self.assertEqual(cfg.loss, source.loss)
+            self.assertEqual(cfg.dataset, native_acid.dataset)
+            self.assertEqual(list(cfg.dataset), ["re10k"])
+            self.assertEqual(cfg.dataset.re10k.roots, [str(self.dataset)])
+            self.assertEqual(cfg.dataset.re10k.original_image_shape, [360, 640])
+            self.assertEqual(cfg.dataset.re10k.input_image_shape, [256, 256])
+            self.assertEqual(cfg.dataset.re10k.view_sampler.name, "evaluation")
+            self.assertEqual(cfg.test, source.test)
+            self.assertEqual(cfg.cross_domain.training_dataset, "re10k")
+            self.assertEqual(cfg.cross_domain.evaluation_dataset, "acid")
+            self.assertEqual(cfg.cross_domain.experiment, evaluation.EXPERIMENTS[label])
+
+    def test_acid_benchmark_index_keeps_context_endpoints_and_ignores_null_scenes(self):
+        path = evaluation.REPO_ROOT / "assets/evaluation_index_acid.json"
+        original = json.loads(path.read_text())
+        evaluation.write_json(self.scene_index, {
+            scene: "000000.torch" for scene, entry in original.items() if entry is not None
+        })
+        actual = evaluation.read_view_index(path, self.dataset, evaluation_dataset="acid")
+        self.assertEqual(actual, original)
+        self.assertTrue(any(entry is None for entry in actual.values()))
+        self.assertTrue(any(set(entry["context"]) & set(entry["target"])
+                            for entry in actual.values() if entry is not None))
+        # A benchmark exception for ACID must not weaken the DL3DV protocol.
+        with self.assertRaisesRegex(ValueError, "context and target"):
+            evaluation.read_view_index(path, self.dataset)
+
+    def test_re10k_to_acid_launcher_defaults_and_separate_output(self):
+        with contextlib.redirect_stdout(io.StringIO()) as help_output:
+            with self.assertRaises(SystemExit) as exit_status:
+                re10k_acid_evaluation.main(["--help"])
+        self.assertEqual(exit_status.exception.code, 0)
+        self.assertIn("Final++_re10k.ckpt", help_output.getvalue())
+        self.assertIn("evaluation_index_acid.json", help_output.getvalue())
+        self.assertNotIn("Final++_acid.ckpt", help_output.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+             patch.object(evaluation.subprocess, "Popen") as popen:
+            re10k_acid_evaluation.main(self.argv()[:-2] + ["--dry-run"])
+        self.assertIn("re10k2acid", output.getvalue())
+        self.assertIn("ACID=", output.getvalue())
+        self.assertIn("experiment=re10k_moment", output.getvalue())
+        popen.assert_not_called()
+
+    def test_re10k_to_acid_launches_with_frozen_default_benchmark_and_one_gpu_each(self):
+        from omegaconf import OmegaConf
+
+        benchmark = evaluation.REPO_ROOT / "assets/evaluation_index_acid.json"
+        entries = json.loads(benchmark.read_text())
+        evaluation.write_json(self.scene_index, {
+            scene: "000000.torch" for scene, entry in entries.items() if entry is not None
+        })
+        argv = self.argv()
+        position = argv.index("--index")
+        del argv[position:position + 2]
+        process = Mock(pid=1)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with patch.object(evaluation.subprocess, "Popen", return_value=process) as popen, \
+             patch.object(evaluation, "generate_view_index") as generate, \
+             patch.object(evaluation, "summarize") as summarize, \
+             contextlib.redirect_stdout(io.StringIO()):
+            re10k_acid_evaluation.main(argv + ["--gpus", "0", "1"])
+        generate.assert_not_called()
+        self.assertEqual(popen.call_count, 2)
+        frozen = self.output / "evaluation_index_acid.json"
+        self.assertEqual(frozen.read_bytes(), benchmark.read_bytes())
+        self.assertFalse((self.output / "evaluation_index_dl3dv.json").exists())
+        for label, call, gpu in zip(("ours", "baseline"), popen.call_args_list, ("0", "1")):
+            cfg = OmegaConf.load(self.output / label / "config.yaml")
+            self.assertEqual(list(cfg.dataset), ["re10k"])
+            self.assertEqual(cfg.dataset.re10k.view_sampler.index_path, str(frozen))
+            self.assertEqual(cfg.cross_domain.experiment, evaluation.EXPERIMENTS[label])
+            self.assertEqual(call.kwargs["env"]["CUDA_VISIBLE_DEVICES"], gpu)
+        summarize.assert_called_once_with(self.output, ["ours", "baseline"])
+
     def test_dry_run_has_no_gpu_import_process_or_output_writes(self):
         with patch.object(evaluation.subprocess, "Popen") as popen, \
              patch.object(evaluation, "generate_view_index") as generate, \
@@ -292,11 +382,13 @@ class CrossDomainTests(unittest.TestCase):
             evaluation.summarize(self.output, ["ours", "baseline"])
         self.assertFalse((self.output / "summary.csv").exists())
 
-    def run_worker(self, scenes):
+    def run_worker(self, scenes, *, evaluation_dataset="dl3dv"):
         from omegaconf import OmegaConf
 
-        cfg = evaluation.compose_config("ours", self.checkpoint, self.dataset, self.index,
-                                        self.output, self.args())
+        cfg = evaluation.compose_config(
+            "ours", self.checkpoint, self.dataset, self.index, self.output, self.args(),
+            evaluation_dataset=evaluation_dataset,
+        )
         self.output.mkdir()
         config_path = self.output / "config.yaml"
         OmegaConf.save(cfg, config_path)
@@ -368,6 +460,18 @@ class CrossDomainTests(unittest.TestCase):
         coverage = json.loads((self.output / "coverage.json").read_text())
         self.assertEqual(coverage["skipped_scenes"], ["scene-a"])
         self.assertFalse((self.output / "metrics.json").exists())
+
+    def test_worker_evaluates_acid_loader_and_records_source_and_destination(self):
+        factories, model, _ = self.run_worker(["scene-a"], evaluation_dataset="acid")
+        self.assertTrue(model.strict_loading)
+        self.assertEqual(list(factories.DataModule.call_args.args[0]), ["re10k"])
+        result = json.loads((self.output / "metrics.json").read_text())
+        self.assertEqual(result["training_dataset"], "re10k")
+        self.assertEqual(result["evaluation_dataset"], "acid")
+        self.assertEqual(result["experiment"], "re10k_moment")
+        self.assertEqual(result["num_scenes"], 1)
+        progress = json.loads((self.output / "progress.json").read_text())
+        self.assertEqual(progress["phase"], "complete")
 
 
 if __name__ == "__main__":
