@@ -126,6 +126,8 @@ You can refer to the [re10k_1x8](config/experiment/re10k_1x8.yaml) for training 
 ### Evaluation
 For RE10K-trained Final++ and NoPoSplat evaluation on DL3DV, see
 [the cross-domain evaluation instructions](docs/re10k2dl3dv_eval.md).
+For ACID-trained checkpoints, see
+[ACID → DL3DV evaluation](docs/acid2dl3dv_eval.md).
 
 #### Novel View Synthesis
 ```bash

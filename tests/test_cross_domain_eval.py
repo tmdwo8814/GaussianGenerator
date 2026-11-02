@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from scripts import eval_re10k2dl3dv as evaluation
+from scripts import eval_acid2dl3dv as acid_evaluation
 
 
 class CrossDomainTests(unittest.TestCase):
@@ -149,6 +150,73 @@ class CrossDomainTests(unittest.TestCase):
             if label == "ours":
                 self.assertTrue(cfg.model.encoder.moment_decoder.appearance_moments)
                 self.assertEqual(cfg.model.encoder.moment_decoder.appearance_mlp_depth, 2)
+
+    def test_acid_preserves_trained_model_and_uses_identical_dl3dv_protocol(self):
+        from hydra import compose, initialize_config_dir
+        from omegaconf import OmegaConf
+
+        for label, experiment in evaluation.EXPERIMENTS_BY_SOURCE["acid"].items():
+            with initialize_config_dir(
+                version_base=None, config_dir=str(evaluation.REPO_ROOT / "config")
+            ):
+                original = compose(config_name="main", overrides=[f"+experiment={experiment}"])
+            cfg = evaluation.compose_config(
+                label, self.checkpoint, self.dataset, self.index, self.output, self.args(),
+                training_dataset="acid",
+            )
+            re10k = evaluation.compose_config(
+                label, self.checkpoint, self.dataset, self.index, self.output, self.args()
+            )
+            original.model.encoder.pretrained_weights = ""
+            self.assertEqual(OmegaConf.to_container(cfg.model), OmegaConf.to_container(original.model))
+            self.assertEqual(cfg.loss, original.loss)
+            self.assertEqual(list(cfg.dataset), ["dl3dv"])
+            self.assertEqual(cfg.dataset, re10k.dataset)
+            self.assertEqual(cfg.test, re10k.test)
+            self.assertEqual(cfg.data_loader.test, re10k.data_loader.test)
+            self.assertEqual(cfg.seed, re10k.seed)
+            self.assertIn("acid", cfg.wandb.tags)
+            self.assertFalse(cfg.trainer.auto_eval)
+            self.assertEqual(cfg.checkpointing.load, str(self.checkpoint))
+            self.assertEqual(cfg.model.encoder.gs_params_head_type,
+                             "moment" if label == "ours" else "dpt_gs")
+
+    def test_acid_entry_point_defaults_and_dry_run_output(self):
+        with contextlib.redirect_stdout(io.StringIO()) as help_output:
+            with self.assertRaises(SystemExit) as exit_status:
+                acid_evaluation.main(["--help"])
+        self.assertEqual(exit_status.exception.code, 0)
+        self.assertIn("Final++_acid.ckpt", help_output.getvalue())
+        self.assertIn("noposplat_acid.ckpt", help_output.getvalue())
+        self.assertNotIn("Final++_re10k.ckpt", help_output.getvalue())
+        # Omit --output-dir to verify ACID results go into their own directory.
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+             patch.object(evaluation.subprocess, "Popen") as popen:
+            acid_evaluation.main(self.argv()[:-2] + ["--dry-run"])
+        self.assertIn("experiment=acid_moment", output.getvalue())
+        self.assertIn("baseline: experiment=acid,", output.getvalue())
+        self.assertIn("acid2dl3dv", output.getvalue())
+        popen.assert_not_called()
+
+    def test_acid_launches_both_models_with_correct_configs_and_shared_views(self):
+        from omegaconf import OmegaConf
+
+        process = Mock(pid=1)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with patch.object(evaluation.subprocess, "Popen", return_value=process) as popen, \
+             patch.object(evaluation, "summarize") as summarize, \
+             contextlib.redirect_stdout(io.StringIO()):
+            acid_evaluation.main(self.argv() + ["--gpus", "0", "1"])
+        self.assertEqual(popen.call_count, 2)
+        for label, call, gpu in zip(("ours", "baseline"), popen.call_args_list, ("0", "1")):
+            cfg = OmegaConf.load(self.output / label / "config.yaml")
+            self.assertIn("acid", cfg.wandb.tags)
+            self.assertEqual(list(cfg.dataset), ["dl3dv"])
+            self.assertEqual(cfg.dataset.dl3dv.view_sampler.index_path,
+                             str(self.output / "evaluation_index_dl3dv.json"))
+            self.assertEqual(call.kwargs["env"]["CUDA_VISIBLE_DEVICES"], gpu)
+        summarize.assert_called_once_with(self.output, ["ours", "baseline"])
 
     def test_dry_run_has_no_gpu_import_process_or_output_writes(self):
         with patch.object(evaluation.subprocess, "Popen") as popen, \

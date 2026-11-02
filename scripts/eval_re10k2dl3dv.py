@@ -17,6 +17,14 @@ from time import monotonic, sleep
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENTS = {"ours": "re10k_moment", "baseline": "re10k"}
+EXPERIMENTS_BY_SOURCE = {
+    "re10k": EXPERIMENTS,
+    "acid": {"ours": "acid_moment", "baseline": "acid"},
+}
+CHECKPOINT_NAMES = {
+    "re10k": {"ours": "Final++_re10k.ckpt", "baseline": "re10k.ckpt"},
+    "acid": {"ours": "Final++_acid.ckpt", "baseline": "noposplat_acid.ckpt"},
+}
 
 
 def write_json(path: Path, value) -> None:
@@ -177,15 +185,19 @@ def generate_view_index(dataset_root: Path, path: Path, context_gap: int, num_ta
     return read_view_index(path, dataset_root)
 
 
-def compose_config(label, checkpoint, dataset_root, index_path, output_dir, args):
+def compose_config(
+    label, checkpoint, dataset_root, index_path, output_dir, args,
+    *, training_dataset="re10k",
+):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
     with initialize_config_dir(version_base=None, config_dir=str(REPO_ROOT / "config")):
-        # Keep the complete RE10K model/loss configuration (including scale
-        # invariance); remove the RE10K dataset and add only the DL3DV loader.
+        # Preserve the source model/loss configuration, including scale
+        # invariance. Both ACID and RE10K use the dataset.re10k node internally;
+        # remove that node and evaluate only the DL3DV test loader.
         config = compose(config_name="main", overrides=[
-            f"+experiment={EXPERIMENTS[label]}",
+            f"+experiment={EXPERIMENTS_BY_SOURCE[training_dataset][label]}",
             "~dataset.re10k",
             "+dataset@dataset.dl3dv=dl3dv",
             "dataset/view_sampler@dataset.dl3dv.view_sampler=evaluation",
@@ -326,9 +338,17 @@ def summarize(output_dir: Path, labels: list[str]) -> None:
     (output_dir / "summary.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--models", nargs="+", choices=list(EXPERIMENTS), default=list(EXPERIMENTS))
+def main(argv=None, *, training_dataset="re10k") -> None:
+    experiments = EXPERIMENTS_BY_SOURCE[training_dataset]
+    checkpoint_names = CHECKPOINT_NAMES[training_dataset]
+    parser = argparse.ArgumentParser(
+        description=(
+            f"Evaluate {training_dataset.upper()}-trained Final++ and NoPoSplat "
+            "on identical DL3DV test views, with per-model progress and ETA."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--models", nargs="+", choices=list(experiments), default=list(experiments))
     parser.add_argument(
         "--gpus", nargs="+", default=["0", "1"],
         help="One physical GPU ID per model, in model order",
@@ -336,11 +356,13 @@ def main(argv=None) -> None:
     parser.add_argument("--dataset-root", type=Path, default=Path("/workspace/datasets/dl3dv"))
     parser.add_argument(
         "--ours-checkpoint", type=Path,
-        default=REPO_ROOT / "pretrained_weights/Final++_re10k.ckpt",
+        default=REPO_ROOT / "pretrained_weights" / checkpoint_names["ours"],
+        help=f"{training_dataset.upper()}-trained Final++ checkpoint",
     )
     parser.add_argument(
         "--baseline-checkpoint", type=Path,
-        default=REPO_ROOT / "pretrained_weights/re10k.ckpt",
+        default=REPO_ROOT / "pretrained_weights" / checkpoint_names["baseline"],
+        help=f"{training_dataset.upper()}-trained NoPoSplat checkpoint",
     )
     parser.add_argument(
         "--index", type=Path,
@@ -390,7 +412,7 @@ def main(argv=None) -> None:
                 f"Checkpoint not found: {path}; set --ours-checkpoint / --baseline-checkpoint"
             )
     output_dir = (
-        args.output_dir or REPO_ROOT / "outputs/cross_domain/re10k2dl3dv"
+        args.output_dir or REPO_ROOT / "outputs/cross_domain" / f"{training_dataset}2dl3dv"
         / datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     ).expanduser().resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -405,12 +427,13 @@ def main(argv=None) -> None:
         read_view_index(index_path, dataset_root)
     configs = {
         label: compose_config(
-            label, checkpoints[label], dataset_root, index_path, output_dir, args
+            label, checkpoints[label], dataset_root, index_path, output_dir, args,
+            training_dataset=training_dataset,
         ) for label in args.models
     }
     for label, gpu in zip(args.models, gpus):
         print(
-            f"[CrossDomain] {label}: experiment={EXPERIMENTS[label]}, "
+            f"[CrossDomain] {label}: experiment={experiments[label]}, "
             f"GPU={gpu}, checkpoint={checkpoints[label]}", flush=True,
         )
     print(f"[CrossDomain] DL3DV={dataset_root}; index={index_path}; output={output_dir}", flush=True)
