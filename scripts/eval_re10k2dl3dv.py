@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from time import monotonic, sleep
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,80 @@ def write_json(path: Path, value) -> None:
         json.dumps(value, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8"
     )
     temporary.replace(path)
+
+
+def format_duration(seconds) -> str:
+    if seconds is None:
+        return "--:--:--"
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def format_progress(label: str, progress: dict) -> str:
+    completed, total = progress["completed"], progress["total"]
+    return (
+        f"[Progress][{label}] {progress['phase']} | "
+        f"{completed}/{total} scenes ({100 * completed / total:.1f}%) | "
+        f"elapsed={format_duration(progress['elapsed_seconds'])} | "
+        f"ETA={format_duration(progress['eta_seconds'])}"
+    )
+
+
+class EvaluationProgress:
+    """Report completed scenes without needing IterableDataset.__len__."""
+
+    def __init__(self, label: str, total: int, path: Path, interval: float = 10):
+        self.label = label
+        self.total = total
+        self.path = path
+        self.interval = interval
+        self.started = None
+        self.last_report = None
+
+    def report(self, completed: int, phase: str = "evaluating", force: bool = False):
+        now = monotonic()
+        if phase == "evaluating" and self.started is None:
+            self.started = now
+        if (not force and completed != self.total and self.last_report is not None
+                and now - self.last_report < self.interval):
+            return
+        elapsed = 0 if self.started is None else now - self.started
+        eta = elapsed * (self.total - completed) / completed if completed else None
+        progress = {
+            "phase": phase, "completed": completed, "total": self.total,
+            "elapsed_seconds": elapsed, "eta_seconds": eta,
+        }
+        write_json(self.path, progress)
+        print(format_progress(self.label, progress), flush=True)
+        self.last_report = now
+
+
+def monitor_jobs(jobs, output_dir: Path):
+    """Mirror worker progress to the launcher while preserving separate logs."""
+    pending = list(jobs)
+    previous, failures = {}, []
+    while pending:
+        for label, process in pending[:]:
+            path = output_dir / label / "progress.json"
+            try:
+                progress = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                progress = None
+            if progress is not None and progress != previous.get(label):
+                print(format_progress(label, progress), flush=True)
+                previous[label] = progress
+            if process.poll() is not None:
+                code = process.wait()
+                if code != 0:
+                    failures.append((label, code))
+                status = "finished" if code == 0 else f"FAILED (exit={code})"
+                print(f"[CrossDomain] {label} {status}; log={path.parent / 'console.log'}",
+                      flush=True)
+                pending.remove((label, process))
+        if pending:
+            sleep(1)
+    return failures
 
 
 def fixed_views(num_frames: int, context_gap: int, num_targets: int):
@@ -143,6 +218,15 @@ def compose_config(label, checkpoint, dataset_root, index_path, output_dir, args
 
 def evaluate_worker(config_path: Path) -> None:
     from omegaconf import OmegaConf
+
+    config = OmegaConf.load(config_path)
+    index_path = Path(config.dataset.dl3dv.view_sampler.index_path)
+    index = read_view_index(index_path, Path(config.dataset.dl3dv.roots[0]))
+    expected = {scene: entry for scene, entry in index.items() if entry is not None}
+    progress = EvaluationProgress(
+        config.wandb.name, len(expected), config_path.parent / "progress.json"
+    )
+    progress.report(0, phase="initializing", force=True)
     # Use exactly the same factories, type checking, and test_step as src.main.
     from src.main import (
         DataModule, ModelWrapper, Trainer, get_decoder, get_encoder, get_losses,
@@ -150,18 +234,17 @@ def evaluate_worker(config_path: Path) -> None:
     )
     from lightning.pytorch import Callback
 
-    config = OmegaConf.load(config_path)
     set_cfg(config)
     cfg = load_typed_root_config(config)
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("Each evaluation worker requires exactly one visible CUDA GPU")
     torch.manual_seed(cfg.seed)
-    index_path = Path(config.dataset.dl3dv.view_sampler.index_path)
-    index = read_view_index(index_path, Path(config.dataset.dl3dv.roots[0]))
-    expected = {scene: entry for scene, entry in index.items() if entry is not None}
     evaluated = {}
 
     class CoverageCallback(Callback):
+        def on_test_start(self, trainer, pl_module):
+            progress.report(0, force=True)
+
         def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
             scene = batch["scene"][0]
             if scene in evaluated:
@@ -170,6 +253,7 @@ def evaluate_worker(config_path: Path) -> None:
                 "context": batch["context"]["index"][0].tolist(),
                 "target": batch["target"]["index"][0].tolist(),
             }
+            progress.report(len(evaluated))
 
     trainer = Trainer(
         accelerator="gpu", devices=1, num_nodes=1, strategy="auto",
@@ -187,6 +271,7 @@ def evaluate_worker(config_path: Path) -> None:
         model._test_overlap_tags = ()
     data_module = DataModule(cfg.dataset, cfg.data_loader, step_tracker=None)
     trainer.test(model, datamodule=data_module, ckpt_path=cfg.checkpointing.load)
+    progress.report(len(evaluated), phase="checking coverage", force=True)
     output_dir = config_path.parent
     write_json(output_dir / "evaluated_scenes.json", evaluated)
     missing = sorted(set(expected) - set(evaluated))
@@ -217,6 +302,7 @@ def evaluate_worker(config_path: Path) -> None:
         "num_target_views": sum(len(entry["target"]) for entry in evaluated.values()),
         "metrics": metrics,
     })
+    progress.report(count, phase="complete", force=True)
     print(f"[CrossDomain] Saved {output_dir / 'metrics.json'}", flush=True)
 
 
@@ -374,7 +460,7 @@ def main(argv=None) -> None:
                 f"[CrossDomain] Started {label} PID={process.pid}; "
                 f"log={model_dir / 'console.log'}", flush=True,
             )
-        failures = [(label, code) for label, process in jobs if (code := process.wait()) != 0]
+        failures = monitor_jobs(jobs, output_dir)
         if failures:
             raise RuntimeError(
                 f"Evaluation failed: {failures}. "

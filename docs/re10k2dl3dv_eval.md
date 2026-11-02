@@ -84,12 +84,14 @@ pose alignment 없이 평가하려면 두 모델에 공통으로 `--no-align-pos
   ours/
     config.yaml
     console.log
+    progress.json
     evaluated_scenes.json
     coverage.json
     metrics.json
   baseline/
     config.yaml
     console.log
+    progress.json
     evaluated_scenes.json
     coverage.json
     metrics.json
@@ -98,7 +100,28 @@ pose alignment 없이 평가하려면 두 모델에 공통으로 `--no-align-pos
   summary.csv
 ```
 
-실행 중에는 각 모델의 `console.log`를 확인한다. `metrics.json`에는 체크포인트 경로,
+실행 터미널에 모델별 완료 장면 수, 진행률, 경과 시간과 ETA를 출력한다.
+평가 장면이 완료될 때 이전 출력으로부터 10초 이상 지났으면 갱신하며,
+시작/종료 상태는 즉시 기록한다.
+같은 정보는 각 모델의 `console.log`와 `progress.json`에도 저장한다.
+
+```text
+[Progress][ours] evaluating | 35/140 scenes (25.0%) | elapsed=00:05:00 | ETA=00:15:00
+[Progress][baseline] evaluating | 70/140 scenes (50.0%) | elapsed=00:04:00 | ETA=00:04:00
+```
+
+ETA는 평가 시작 이후 장면당 평균 시간으로 계산한 추정치이다. 첫 장면이 완료되기 전에는
+`--:--:--`로 표시하며, 초기 CUDA/컴파일 및 장면별 처리 시간 차이로 초반 추정은 변동될 수 있다.
+모델/체크포인트 초기화 시간은 평가 경과 시간에 포함하지 않는다.
+
+이미 실행 중인 이전 버전 프로세스에는 새 ETA 표시가 적용되지 않는다.
+해당 실행의 기존 로그는 별도 터미널에서 다음과 같이 확인한다.
+
+```bash
+tail -f <run>/ours/console.log <run>/baseline/console.log
+```
+
+`metrics.json`에는 체크포인트 경로,
 평가 인덱스 SHA-256, pose alignment 설정, 장면/target 수, 최종 점수가 저장된다.
 두 모델이 동일한 모든 요청 장면과 뷰를 평가했을 때만 비교표를 저장한다.
 shape/FOV/baseline/손상 이미지 필터 때문에 요청한 장면이 누락되면 `coverage.json`과 로그를

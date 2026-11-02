@@ -36,6 +36,50 @@ class CrossDomainTests(unittest.TestCase):
                 "--baseline-checkpoint", str(self.checkpoint), "--index", str(self.index),
                 "--output-dir", str(self.output)]
 
+    def test_progress_eta_excludes_initialization_and_throttles_updates(self):
+        path = self.root / "progress.json"
+        progress = evaluation.EvaluationProgress("ours", 4, path)
+        with patch.object(evaluation, "monotonic", side_effect=[100, 200, 201, 210, 220]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            progress.report(0, phase="initializing", force=True)
+            self.assertIsNone(json.loads(path.read_text())["eta_seconds"])
+            progress.report(0, force=True)
+            progress.report(1)  # Avoid printing on every fast scene.
+            self.assertEqual(json.loads(path.read_text())["completed"], 0)
+            progress.report(2)
+            snapshot = json.loads(path.read_text())
+            self.assertEqual(snapshot["elapsed_seconds"], 10)
+            self.assertEqual(snapshot["eta_seconds"], 10)
+            progress.report(4)
+        self.assertIn("2/4 scenes (50.0%)", output.getvalue())
+        self.assertIn("elapsed=00:00:10 | ETA=00:00:10", output.getvalue())
+        self.assertEqual(json.loads(path.read_text())["eta_seconds"], 0)
+
+    def test_monitor_displays_each_model_and_keeps_waiting_after_one_fails(self):
+        ours = Mock()
+        ours.poll.side_effect = [None, 0]
+        ours.wait.return_value = 0
+        baseline = Mock()
+        baseline.poll.return_value = 1
+        baseline.wait.return_value = 1
+        for label in ("ours", "baseline"):
+            evaluation.write_json(self.output / label / "progress.json", {
+                "phase": "evaluating", "completed": 1, "total": 4,
+                "elapsed_seconds": 5, "eta_seconds": 15,
+            })
+        with patch.object(evaluation, "sleep") as sleep, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            failures = evaluation.monitor_jobs(
+                [("ours", ours), ("baseline", baseline)], self.output
+            )
+        self.assertEqual(failures, [("baseline", 1)])
+        sleep.assert_called_once_with(1)
+        self.assertEqual(output.getvalue().count("[Progress][ours]"), 1)
+        self.assertIn("[Progress][baseline]", output.getvalue())
+        self.assertIn("ETA=00:00:15", output.getvalue())
+        self.assertIn("baseline FAILED", output.getvalue())
+        self.assertIn("ours finished", output.getvalue())
+
     def test_protocol_uses_two_inputs_and_distinct_novel_targets(self):
         self.assertEqual(evaluation.fixed_views(100, 22, 3),
                          {"context": [0, 22], "target": [5, 11, 16]})
@@ -209,6 +253,7 @@ class CrossDomainTests(unittest.TestCase):
 
         def test(model, datamodule, ckpt_path):
             callback = factories.Trainer.call_args.kwargs["callbacks"][0]
+            callback.on_test_start(None, model)
             for scene in scenes:
                 batch = {"scene": [scene], "context": {"index": [Indices([0, 22])]},
                          "target": {"index": [Indices([5, 11, 16])]}}
@@ -244,6 +289,10 @@ class CrossDomainTests(unittest.TestCase):
         self.assertEqual(result["num_target_views"], 3)
         self.assertEqual(result["metrics"], {"psnr": 25, "ssim": .8, "lpips": .2})
         self.assertEqual(len(result["evaluation_index_sha256"]), 64)
+        progress = json.loads((self.output / "progress.json").read_text())
+        self.assertEqual(progress["phase"], "complete")
+        self.assertEqual(progress["completed"], 1)
+        self.assertEqual(progress["eta_seconds"], 0)
 
     def test_worker_rejects_silently_filtered_scenes(self):
         with self.assertRaisesRegex(RuntimeError, "requested scenes were skipped"):
