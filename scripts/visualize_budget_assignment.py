@@ -10,10 +10,14 @@ infers Gaussians from the original .torch context frames, then rasterizes plots.
 Missing inputs or mismatched weights stop execution; no synthetic-data fallback
 exists. --dry-run only validates selections and never generates plots.
 
-Outputs per sample: comparison.png/pdf, evidence.csv/npz, attributes.json and
-selected_gaussians.pt. Evidence markers show source-feature locations and actual
-incoming GEOMETRY weights, not the encoder's complete receptive field. No surface
-purity metric is inferred from the user's surface names alone.
+Each comparison has two image columns: the full selected context and the same
+20x20 crop around the selected pixel. Red crosses mark Gaussian centers; blue
+points mark input feature locations. Ours opacity uses q=budget*softmax, on one
+shared scale for both Ours conditions. Baseline shows k*k feature locations and
+uses the kernel L2 norm over input/output channels at each offset. That static
+kernel strength is not a sample-specific attribution or comparable in units to q.
+All Ours 3D supports, including those from the other view, are projected into the
+selected context. No surface purity is inferred from surface names alone.
 
 The Ours control reuses the exact points/features, kNN graph, and assignment,
 replacing every point budget by its scene-wide mean. All downstream attributes,
@@ -276,26 +280,94 @@ def project_means(means: Any, cameras: Any, intrinsics: Any, shape: tuple[int, i
     return xy.detach().cpu().numpy()
 
 
-def crop_bounds(points: Any, width: int, height: int, radius: int = 32):
+def fixed_crop_bounds(pixel_xy, size=20):
+    """Exact pixel-cell bounds, shared across conditions; do not recenter on mu."""
+    x, y = pixel_xy
+    left, top = x - size // 2, y - size // 2
+    return left - .5, left + size - .5, top - .5, top + size - .5
+
+
+def kernel_input_mapping(
+    weights, pixel_xy, shape, stride=(1, 1), padding=(1, 1), dilation=(1, 1),
+):
+    """One static, nonnegative kernel norm for each spatial feature offset."""
     import numpy as np
 
-    points = np.asarray(points).reshape(-1, 2)
-    points = points[np.isfinite(points).all(-1)]
-    inside = points[
-        (points[:, 0] >= 0) & (points[:, 0] < width)
-        & (points[:, 1] >= 0) & (points[:, 1] < height)
-    ]
-    if not len(inside):
-        inside = np.array([[(width - 1) / 2, (height - 1) / 2]])
-    low, high = inside.min(0) - 12, inside.max(0) + 12
-    center = (low + high) / 2
-    half = np.maximum((high - low) / 2, radius)
-    return (
-        max(-0.5, center[0] - half[0]),
-        min(width - 0.5, center[0] + half[0]),
-        max(-0.5, center[1] - half[1]),
-        min(height - 0.5, center[1] + half[1]),
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.ndim != 4:
+        raise ValueError("Expected Conv2d weights [out, in, kernel_h, kernel_w]")
+    height, width = shape
+    kh, kw = weights.shape[-2:]
+    ky, kx = np.mgrid[:kh, :kw]
+    x, y = pixel_xy
+    source_x = x * stride[1] - padding[1] + kx * dilation[1]
+    source_y = y * stride[0] - padding[0] + ky * dilation[0]
+    valid = ((source_x >= 0) & (source_x < width)
+             & (source_y >= 0) & (source_y < height))
+    norms = np.sqrt(np.square(weights).sum(axis=(0, 1)))
+    return {
+        "mapped_x": source_x.ravel(), "mapped_y": source_y.ravel(),
+        "kernel_norm": norms.ravel(), "valid": valid.ravel(),
+        "kernel_size_hw": np.array([kh, kw]),
+    }
+
+
+def baseline_input_mapping(encoder, sample, shape):
+    """Read the loaded spatial CNN kernel for the selected view's Gaussian head."""
+    head = (encoder.gaussian_param_head if sample["context_view"] == 0
+            else encoder.gaussian_param_head2)
+    conv = head.dpt.head[0]
+    if not hasattr(conv, "kernel_size"):
+        raise ValueError("Expected the baseline Gaussian head's first Conv2d")
+    return kernel_input_mapping(
+        conv.weight.detach().float().cpu().numpy(), sample["pixel_xy"], shape,
+        stride=conv.stride, padding=conv.padding, dilation=conv.dilation,
     )
+
+
+def project_input_mapping(evidence, cameras, intrinsics, view, shape):
+    """Project every incoming 3D support into the selected display image."""
+    import torch
+
+    points = torch.as_tensor(evidence["point_xyz"], device=cameras.device,
+                             dtype=cameras.dtype)
+    count = len(points)
+    coordinates = project_means(
+        points, cameras[0, view].expand(count, -1, -1),
+        intrinsics[0, view].expand(count, -1, -1), shape,
+    )
+    evidence["mapped_x"], evidence["mapped_y"] = coordinates.T
+
+
+def comparison_rows(results, evidence):
+    """Raw measures and alpha scales; never normalize the two Ours rows separately."""
+    import numpy as np
+
+    baseline = results["baseline"]["input_mapping"]
+    kh, kw = baseline["kernel_size_hw"]
+    kernel_max = float(np.max(baseline["kernel_norm"])) or 1.
+    q_max = max(float(np.max(evidence[f"q_{name}"]))
+                for name in ("constant", "learned")) or 1.
+    rows = [{
+        "name": "baseline", "label": f"Baseline ({kh} x {kw} kernel)",
+        "xy": np.column_stack((baseline["mapped_x"], baseline["mapped_y"])),
+        "values": baseline["kernel_norm"], "vmax": kernel_max,
+        "valid": baseline["valid"], "measure": "Kernel L2 norm",
+    }]
+    for name in ("constant", "learned"):
+        rows.append({
+            "name": name, "label": f"Ours: {name} budget",
+            "xy": np.column_stack((evidence["mapped_x"], evidence["mapped_y"])),
+            "values": evidence[f"q_{name}"], "vmax": q_max,
+            "valid": np.isfinite(evidence["mapped_x"])
+            & np.isfinite(evidence["mapped_y"]),
+            "measure": "q = budget x softmax",
+        })
+    for row in rows:
+        row["alpha"] = np.where(
+            row["valid"], np.clip(row["values"] / row["vmax"], 0, 1), 0,
+        )
+    return rows
 
 
 def save_evidence(directory: Path, evidence: dict, shape: tuple[int, int]) -> None:
@@ -315,133 +387,110 @@ def save_evidence(directory: Path, evidence: dict, shape: tuple[int, int]) -> No
             writer.writerow({key: evidence[key][i].item() for key in columns})
 
 
-def plot_comparison(sample: dict, results: dict, evidence: dict, directory: Path):
+def save_baseline_evidence(directory, mapping):
+    import numpy as np
+
+    np.savez_compressed(directory / "baseline_evidence.npz", **mapping)
+    columns = ("mapped_x", "mapped_y", "kernel_norm", "valid", "display_alpha")
+    with (directory / "baseline_evidence.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        for i in range(len(mapping["kernel_norm"])):
+            writer.writerow({key: mapping[key][i].item() for key in columns})
+
+
+def comparison_figure(sample, results, evidence):
     import matplotlib
     matplotlib.use("Agg")
     import numpy as np
     from matplotlib import pyplot as plt
-    from matplotlib.colors import Normalize
+    from matplotlib.colors import ListedColormap, Normalize
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Rectangle
 
-    order = ("baseline", "constant", "learned")
-    labels = ("Baseline", "Ours: constant budget", "Ours: learned budget")
-    reference = results["learned"]
-    height, width = reference["context_rgb"].shape[1:3]
-    xy = np.column_stack((evidence["source_x"], evidence["source_y"]))
-    vmax = max(
-        float(evidence["weight_constant"].max()),
-        float(evidence["weight_learned"].max()), 1e-8,
-    )
-    norm, cmap = Normalize(0, vmax), plt.get_cmap("magma")
-    bounds = []
-    for view in range(2):
-        points = list(xy[evidence["source_view"] == view])
-        points.extend(results[name]["centers"][view] for name in order)
-        if view == sample["context_view"]:
-            points.append(sample["pixel_xy"])
-        bounds.append(crop_bounds(points, width, height))
-    source_points = [sample["pixel_xy"]]
-    for name in order:
-        source_points.append(results[name]["centers"][sample["context_view"]])
-        ys, xs = np.nonzero(results[name]["isolated_alpha"] > 0)
-        if len(xs):
-            source_points.extend(([xs.min(), ys.min()], [xs.max(), ys.max()]))
-    source_bounds = crop_bounds(source_points, width, height)
-    novel_bounds = crop_bounds(
-        [results[name]["centers"][2] for name in order], width, height
-    )
-    fig, axes = plt.subplots(3, 4, figsize=(17, 12), squeeze=False)
-
-    def setup(axis, image, bounds):
-        axis.imshow(np.clip(image, 0, 1), interpolation="nearest")
-        axis.set_xlim(bounds[0], bounds[1])
-        axis.set_ylim(bounds[3], bounds[2])
-        axis.set_aspect("equal")
-        axis.tick_params(labelsize=7)
-
-    def star(axis, center):
-        if np.isfinite(center).all():
-            axis.scatter(*center, marker="*", s=180, c="white",
-                         edgecolors="black", linewidths=1, zorder=6)
-
-    for row, (name, label) in enumerate(zip(order, labels)):
-        result = results[name]
-        for view in range(2):
-            axis = axes[row, view]
-            setup(axis, reference["context_rgb"][view], bounds[view])
-            if name == "baseline":
-                if view == sample["context_view"]:
-                    x, y = sample["pixel_xy"]
-                    axis.add_patch(Rectangle(
-                        (x - 1.5, y - 1.5), 3, 3, fill=False,
-                        edgecolor="cyan", linewidth=1.5,
-                    ))
-                else:
-                    axis.text(0.02, 0.03, "No direct head input in this view",
-                              transform=axis.transAxes, fontsize=8,
-                              bbox=dict(facecolor="white", alpha=0.8))
+    view = sample["context_view"]
+    image = results["learned"]["context_rgb"][view]
+    height, width = image.shape[:2]
+    bounds = fixed_crop_bounds(sample["pixel_xy"])
+    rows = comparison_rows(results, evidence)
+    # A pure blue colormap whose alpha increases linearly with the raw value.
+    rgba = np.zeros((256, 4))
+    rgba[:, 2], rgba[:, 3] = 1, np.linspace(0, 1, 256)
+    cmap = ListedColormap(rgba)
+    fig = plt.figure(figsize=(10.5, 13))
+    grid = fig.add_gridspec(3, 3, width_ratios=(1, 1, .045),
+                           left=.12, right=.88, bottom=.13, top=.88,
+                           wspace=.13, hspace=.24)
+    axes = np.empty((3, 2), dtype=object)
+    for row_index, row in enumerate(rows):
+        valid = row["valid"] & np.isfinite(row["xy"]).all(-1)
+        colors = np.zeros((int(valid.sum()), 4))
+        colors[:, 2], colors[:, 3] = 1, row["alpha"][valid]
+        center = results[row["name"]]["centers"][view]
+        for column in range(2):
+            axis = fig.add_subplot(grid[row_index, column])
+            axes[row_index, column] = axis
+            axis.set_facecolor("white")
+            axis.imshow(np.clip(image, 0, 1), interpolation="nearest")
+            axis.scatter(*row["xy"][valid].T, c=colors,
+                         s=18 if column == 0 else 65,
+                         edgecolors="none", zorder=3)
+            if np.isfinite(center).all():
+                axis.scatter(*center, c="red", marker="+", zorder=5,
+                             s=95 if column == 0 else 155, linewidths=1.7)
             else:
-                mask = evidence["source_view"] == view
-                weights = evidence[f"weight_{name}"][mask]
-                axis.scatter(xy[mask, 0], xy[mask, 1], s=13, c="gray", zorder=3)
-                axis.scatter(
-                    xy[mask, 0], xy[mask, 1], s=350 * weights / vmax,
-                    c=weights, cmap=cmap, norm=norm, edgecolors="white",
-                    linewidths=0.3, zorder=4,
-                )
-                changes = np.abs(
-                    evidence["weight_learned"] - evidence["weight_constant"]
-                )
-                candidates = np.flatnonzero(mask)
-                for i in candidates[np.argsort(changes[mask])[-2:]]:
-                    axis.annotate(
-                        f"b={evidence[f'budget_{name}'][i]:.2f}", xy[i],
-                        xytext=(4, 5), textcoords="offset points", fontsize=7,
-                        bbox=dict(facecolor="white", alpha=0.8, linewidth=0),
-                    )
-            star(axis, result["centers"][view])
-            if view == sample["context_view"]:
-                axis.scatter(*sample["pixel_xy"], s=80, facecolors="none",
-                             edgecolors="cyan", linewidths=1.4, zorder=7)
-            if row == 0:
-                axis.set_title(
-                    f"Evidence: context {view} / frame {sample['context'][view]}"
-                )
-        axes[row, 0].set_ylabel(label, fontsize=11)
-        axis = axes[row, 2]
-        setup(axis, result["isolated_composite"], source_bounds)
-        alpha = result["isolated_alpha"]
-        level = result["attributes"]["opacity"] * math.exp(-2)
-        if float(alpha.min()) < level < float(alpha.max()):
-            axis.contour(alpha, levels=[level], colors="cyan", linewidths=0.8)
-        star(axis, result["centers"][sample["context_view"]])
-        axis.set_xlabel(f"opacity = {result['attributes']['opacity']:.4f}", fontsize=9)
-        setup(axes[row, 3], result["novel_render"], novel_bounds)
-        star(axes[row, 3], result["centers"][2])
-    axes[0, 2].set_title("Isolated Gaussian / source context")
-    axes[0, 3].set_title(f"Novel view / frame {sample['target'][0]}")
+                axis.text(.02, .02, "Center behind camera",
+                          transform=axis.transAxes, color="red", fontsize=8)
+            if column == 0:
+                axis.set_xlim(-.5, width - .5)
+                axis.set_ylim(height - .5, -.5)
+                axis.add_patch(Rectangle(
+                    (bounds[0], bounds[2]), 20, 20, fill=False,
+                    edgecolor="black", linestyle="--", linewidth=.8,
+                ))
+                axis.set_ylabel(row["label"], fontsize=11)
+            else:
+                # Exactly the same 20 pixel cells for every condition.
+                # At image edges the uncovered area stays white; never resize.
+                axis.set_xlim(bounds[0], bounds[1])
+                axis.set_ylim(bounds[3], bounds[2])
+            axis.set_aspect("equal")
+            axis.tick_params(labelsize=8)
+        bar_axis = fig.add_subplot(grid[row_index, 2])
+        bar_axis.set_facecolor("white")
+        fig.colorbar(plt.cm.ScalarMappable(norm=Normalize(0, row["vmax"]), cmap=cmap),
+                     cax=bar_axis, label=row["measure"])
+        bar_axis.tick_params(labelsize=8)
+    axes[0, 0].set_title(
+        f"Full image (context {view}, frame {sample['context'][view]})", fontsize=11,
+    )
+    axes[0, 1].set_title(f"20 x 20 crop at {sample['pixel_xy']}", fontsize=11)
     fig.suptitle(
-        f"{sample['id']}: {sample['label']} | {sample['scene']} | "
-        f"context {sample['context_view']}, pixel {sample['pixel_xy']}",
-        fontsize=13,
+        f"{sample['id']}: {sample['label']}\n{sample['scene']}",
+        fontsize=13, y=.97,
     )
-    fig.text(
-        0.04, 0.025,
-        "Star: projected Gaussian center; cyan circle: selected source pixel. "
-        "Marker area/color: incoming geometry weight (shared scale); "
-        "gray: candidates.\n"
-        "Baseline box: structural 3x3 feature input, not an attribution weight. "
-        "Cyan contour: raster alpha = opacity * exp(-2).\n"
-        "Ours cameras and assignment are frozen across budget conditions. "
-        "Color also uses separate appearance paths. Surface labels are not masks.",
-        fontsize=8,
-    )
-    fig.tight_layout(rect=(0, 0.09, 0.95, 0.96))
-    color_axis = fig.add_axes((0.96, 0.23, 0.012, 0.45))
-    fig.colorbar(
-        plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=color_axis,
-        label="Geometry contribution",
-    )
+    fig.legend(handles=[
+        Line2D([], [], color="red", marker="+", linestyle="none",
+               markersize=10, label="Gaussian center"),
+        Line2D([], [], color="blue", marker="o", linestyle="none",
+               markersize=6, label="Input feature mapping"),
+    ], loc="upper center", bbox_to_anchor=(.5, .935), ncol=2, frameon=False)
+    fig.text(.12, .04,
+             "Transparency = value / bar maximum. Ours rows share the same range.\n"
+             "Baseline: kernel L2 norm over input/output channels (static weights).\n"
+             "Ours: q = budget x softmax; all incoming 3D evidence is projected "
+             "into this context.\n"
+             "The crop is centered on the selected pixel and fixed across rows.",
+             fontsize=9)
+    return fig, axes
+
+
+def plot_comparison(sample: dict, results: dict, evidence: dict, directory: Path):
+    fig, _ = comparison_figure(sample, results, evidence)
+    from matplotlib import pyplot as plt
+
     fig.savefig(directory / "comparison.png", dpi=180)
     fig.savefig(directory / "comparison.pdf")
     plt.close(fig)
@@ -587,6 +636,7 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
     write_json(output / "selection_plan.json", {"samples": plan})
     run_metadata = {
         "source": "real_checkpoint_inference",
+        "comparison_layout": "full context + fixed 20x20 crop; red center, blue inputs",
         "checkpoints": {name: str(path) for name, path in checkpoints.items()},
         "data_root": str(data_root),
         "pose_align_steps": args.pose_align_steps,
@@ -685,6 +735,9 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
             else:
                 with torch.no_grad():
                     original = encoder(batch["context"], step)
+                kernel_mapping = baseline_input_mapping(
+                    encoder, sample, tuple(context_rgb.shape[-2:])
+                )
             display = {**batch, "target": {}}
             for key in ("image", "extrinsics", "intrinsics", "near", "far", "index"):
                 context_value = (
@@ -699,6 +752,11 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
                 decoder, losses, display, original, step, args.pose_align_steps > 0,
                 args.pose_align_steps, cfg.test.rot_opt_lr, cfg.test.trans_opt_lr,
             )
+            if model == "ours":
+                project_input_mapping(
+                    evidence, cameras, display["target"]["intrinsics"],
+                    sample["context_view"], tuple(context_rgb.shape[-2:]),
+                )
             variants = {"baseline": original} if model == "baseline" else {
                 "learned": original, "constant": constant,
             }
@@ -707,12 +765,20 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
                 results[sample["id"]][name] = render_result(
                     decoder, gaussians, sample, display, cameras, context_rgb
                 )
+            if model == "baseline":
+                results[sample["id"]]["baseline"]["input_mapping"] = kernel_mapping
             run_metadata["models"][model]["inferred_scenes"].append(scene)
             write_json(output / "run_metadata.json", run_metadata)
             if model == "ours":
                 directory = output / sample["id"]
                 directory.mkdir()
                 evidence = evidence_by_id[sample["id"]]
+                rows = comparison_rows(results[sample["id"]], evidence)
+                for row in rows[1:]:
+                    evidence[f"display_alpha_{row['name']}"] = row["alpha"]
+                kernel_mapping = results[sample["id"]]["baseline"]["input_mapping"]
+                kernel_mapping["display_alpha"] = rows[0]["alpha"]
+                save_baseline_evidence(directory, kernel_mapping)
                 save_evidence(directory, evidence, tuple(context_rgb.shape[-2:]))
                 total = float(learned_trace["mass"].sum())
                 attributes = {
@@ -728,6 +794,18 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
                     "assignment_identical": True,
                     "incoming_supports": len(evidence["source_index"]),
                     "surface_purity_computed": False,
+                    "visualization": {
+                        "crop_size_wh": [20, 20],
+                        "crop_center_xy": sample["pixel_xy"],
+                        "baseline_kernel_size_hw": kernel_mapping[
+                            "kernel_size_hw"
+                        ].tolist(),
+                        "baseline_weight": "L2 norm over both kernel channel axes",
+                        "ours_weight": "q = budget * outgoing softmax",
+                        "ours_mapping": "all 3D supports projected to selected context",
+                        "alpha_rule": "raw value / bar maximum",
+                        "bar_maxima": {row["name"]: row["vmax"] for row in rows},
+                    },
                     "camera_alignment": (
                         "Original model only; frozen for constant budget"
                     ),

@@ -11,13 +11,110 @@ from pathlib import Path
 
 from scripts.visualize_budget_assignment import (
     ROOT,
+    baseline_input_mapping,
     budget_intervention,
+    comparison_figure,
+    comparison_rows,
     encoder_weights,
+    fixed_crop_bounds,
     incoming_evidence,
+    kernel_input_mapping,
     load_encoder_checkpoint,
     main,
     selection_plan,
 )
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("numpy") and importlib.util.find_spec("matplotlib"),
+    "requires numpy and matplotlib",
+)
+class MappingVisualizationTests(unittest.TestCase):
+    def test_kernel_mapping_has_nine_locations_and_uses_all_signed_channels(self):
+        import numpy as np
+
+        kernel = np.zeros((2, 2, 3, 3))
+        kernel[0, 0, 0, 0], kernel[1, 1, 0, 0] = -3, 4
+        kernel[0, 1, 2, 2] = -12
+        mapping = kernel_input_mapping(kernel, [74, 145], (256, 256))
+        self.assertEqual(len(mapping["kernel_norm"]), 9)
+        np.testing.assert_array_equal(mapping["mapped_x"], [73, 74, 75] * 3)
+        np.testing.assert_array_equal(mapping["mapped_y"], [144] * 3 + [145] * 3
+                                      + [146] * 3)
+        self.assertEqual(mapping["kernel_norm"][0], 5)
+        self.assertEqual(mapping["kernel_norm"][-1], 12)
+        self.assertTrue(mapping["valid"].all())
+        edge = kernel_input_mapping(kernel, [0, 0], (256, 256))
+        self.assertEqual(len(edge["kernel_norm"]), 9)
+        self.assertEqual(edge["valid"].sum(), 4)
+
+    def inputs(self):
+        import numpy as np
+
+        sample = dict(context_view=1, context=[0, 127], pixel_xy=[74, 145],
+                      id="test", label="Unit test only", scene="test-scene")
+        mapping = kernel_input_mapping(np.ones((2, 2, 3, 3)),
+                                       sample["pixel_xy"], (256, 256))
+        results = {
+            name: dict(context_rgb=np.ones((2, 256, 256, 3)),
+                       centers=np.array([[64, 64], [74.2, 146.], [99, 99]]))
+            for name in ("baseline", "constant", "learned")
+        }
+        results["baseline"]["input_mapping"] = mapping
+        evidence = dict(mapped_x=np.array([73.1, 75.2]),
+                        mapped_y=np.array([144., 146.]),
+                        source_view=np.array([0, 1]),
+                        q_constant=np.array([.8, .4]), q_learned=np.array([.008, .004]),
+                        weight_constant=np.array([2/3, 1/3]),
+                        weight_learned=np.array([2/3, 1/3]))
+        return sample, results, evidence
+
+    def test_ours_uses_raw_mass_and_shared_alpha_scale_without_filtering_views(self):
+        import numpy as np
+
+        _, results, evidence = self.inputs()
+        rows = comparison_rows(results, evidence)
+        self.assertEqual(rows[1]["vmax"], .8)
+        self.assertEqual(rows[2]["vmax"], .8)
+        np.testing.assert_allclose(rows[1]["alpha"], [1., .5])
+        np.testing.assert_allclose(rows[2]["alpha"], [.01, .005])
+        self.assertEqual(len(rows[2]["xy"]), 2)
+
+    def test_two_image_columns_red_centers_blue_alpha_and_exact_twenty_pixel_crop(self):
+        import numpy as np
+        from matplotlib import pyplot as plt
+
+        sample, results, evidence = self.inputs()
+        fig, axes = comparison_figure(sample, results, evidence)
+        try:
+            self.assertEqual(axes.shape, (3, 2))
+            self.assertEqual(len(fig.axes), 9)  # Six images and three opacity bars.
+            self.assertEqual(fixed_crop_bounds([74, 145]),
+                             (63.5, 83.5, 134.5, 154.5))
+            for row in range(3):
+                np.testing.assert_allclose(axes[row, 0].get_xlim(), [-.5, 255.5])
+                np.testing.assert_allclose(axes[row, 0].get_ylim(), [255.5, -.5])
+                np.testing.assert_allclose(axes[row, 1].get_xlim(), [63.5, 83.5])
+                np.testing.assert_allclose(axes[row, 1].get_ylim(), [154.5, 134.5])
+                colors = axes[row, 1].collections[0].get_facecolors()
+                np.testing.assert_allclose(colors[:, :3],
+                                           np.tile([0, 0, 1], (len(colors), 1)))
+                center = axes[row, 1].collections[1]
+                np.testing.assert_allclose(center.get_offsets(), [[74.2, 146.]])
+                np.testing.assert_allclose(center.get_facecolors()[0, :3], [1, 0, 0])
+            self.assertEqual(len(axes[0, 1].collections[0].get_offsets()), 9)
+            np.testing.assert_allclose(
+                axes[2, 1].collections[0].get_facecolors()[:, 3], [.01, .005],
+            )
+            # Exercise the renderer in memory; do not write synthetic plot files.
+            fig.canvas.draw()
+        finally:
+            plt.close(fig)
+
+    def test_crop_keeps_twenty_pixels_at_the_image_edge(self):
+        left, right, top, bottom = fixed_crop_bounds([0, 0])
+        self.assertEqual((right - left, bottom - top), (20, 20))
+        self.assertEqual((left, top), (-10.5, -10.5))
 
 
 class SelectionTests(unittest.TestCase):
@@ -95,6 +192,24 @@ class SelectionTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires PyTorch")
 class BudgetInterventionTests(unittest.TestCase):
+    def test_baseline_kernel_is_taken_from_the_selected_view(self):
+        from types import SimpleNamespace
+
+        import numpy as np
+        import torch
+
+        convs = [torch.nn.Conv2d(2, 2, 3, padding=1) for _ in range(2)]
+        with torch.no_grad():
+            convs[0].weight.fill_(1)
+            convs[1].weight.fill_(2)
+        heads = [SimpleNamespace(dpt=SimpleNamespace(head=[conv])) for conv in convs]
+        encoder = SimpleNamespace(gaussian_param_head=heads[0],
+                                  gaussian_param_head2=heads[1])
+        mapping = baseline_input_mapping(
+            encoder, dict(context_view=1, pixel_xy=[74, 145]), (256, 256),
+        )
+        np.testing.assert_allclose(mapping["kernel_norm"], np.full(9, 4.))
+
     def test_checkpoint_loading_is_strict(self):
         import torch
 
