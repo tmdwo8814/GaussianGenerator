@@ -1,14 +1,21 @@
 """Selection checks and budget intervention invariants (no CUDA needed)."""
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.visualize_budget_assignment import (
     ROOT,
     budget_intervention,
+    encoder_weights,
     incoming_evidence,
+    load_encoder_checkpoint,
+    main,
     selection_plan,
 )
 
@@ -44,9 +51,70 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing or changed"):
             selection_plan(self.config, self.index, {"samples": []})
 
+    def test_encoder_checkpoint_formats(self):
+        self.assertEqual(encoder_weights({"state_dict": {
+            "encoder.a": 1, "encoder.b": 2, "losses.c": 3,
+        }}), {"a": 1, "b": 2})
+        self.assertEqual(encoder_weights({"model": {"a": 1}}), {"a": 1})
+        self.assertEqual(encoder_weights({"a": 1}), {"a": 1})
+        with self.assertRaisesRegex(ValueError, "state dictionary"):
+            encoder_weights({"state_dict": {}})
+
+    def test_missing_server_checkpoint_stops_before_model_import_or_plot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = root / "missing.ckpt"
+            config = dict(self.config, baseline_checkpoint=str(missing),
+                          ours_checkpoint=str(missing))
+            source = root / "samples.json"
+            source.write_text(json.dumps(config), encoding="utf-8")
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                with self.assertRaises(SystemExit) as caught:
+                    main(["--samples", str(source),
+                          "--output-dir", str(root / "output")])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("No plots were generated", errors.getvalue())
+            self.assertFalse((root / "output").exists())
+
+    def test_long_checkpoint_options_resolve_to_supplied_server_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "samples.json"
+            source.write_text(json.dumps(self.config), encoding="utf-8")
+            ours, baseline = root / "ours.ckpt", root / "baseline.ckpt"
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                with self.assertRaises(SystemExit) as caught:
+                    main(["--samples", str(source),
+                          "--ours-checkpoint", str(ours),
+                          "--baseline-checkpoint", str(baseline)])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn(str(baseline), errors.getvalue())
+
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "requires PyTorch")
 class BudgetInterventionTests(unittest.TestCase):
+    def test_checkpoint_loading_is_strict(self):
+        import torch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "model.ckpt"
+            reference = torch.nn.Linear(3, 1)
+            model = torch.nn.Linear(3, 1)
+            state = {f"encoder.{k}": v for k, v in reference.state_dict().items()}
+            torch.save({"state_dict": state, "global_step": 17}, path)
+            step, count = load_encoder_checkpoint(model, path)
+            self.assertEqual((step, count), (17, 2))
+            for key, value in model.state_dict().items():
+                torch.testing.assert_close(value, reference.state_dict()[key])
+            with self.assertRaisesRegex(ValueError, "no learned budget head"):
+                load_encoder_checkpoint(model, path, require_budget=True)
+            del state["encoder.bias"]
+            torch.save({"state_dict": state}, path)
+            with self.assertRaises(RuntimeError):
+                load_encoder_checkpoint(model, path)
+
     def test_budget_control_keeps_assignment_and_total_mass(self):
         import torch
         from torch import nn

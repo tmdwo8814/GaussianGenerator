@@ -1,22 +1,28 @@
-r"""Visualize fixed-slot Gaussians and a budget-only intervention on RE10K.
+r"""Run real checkpoint inference and visualize selected RE10K Gaussians.
 
 Run from the repository root, in the existing CUDA evaluation environment:
 
     python scripts/visualize_budget_assignment.py
 
-The default selections/checkpoints are in assets/budget_analysis_samples.json.
---dry-run validates selections against the evaluation index without importing
-PyTorch. Full execution uses the export manifest to find the original chunks.
+The five selections and server checkpoint paths are already configured in
+assets/budget_analysis_samples.json. Default execution strictly loads each model,
+infers Gaussians from the original .torch context frames, then rasterizes plots.
+Missing inputs or mismatched weights stop execution; no synthetic-data fallback
+exists. --dry-run only validates selections and never generates plots.
 
-Outputs per sample: comparison.png/pdf, evidence.csv, evidence.npz, and
-attributes.json. Evidence markers show source-feature locations and actual
-incoming GEOMETRY weights, not the encoder's complete receptive field. No
-surface-purity metric is inferred from the user's surface names alone.
+Outputs per sample: comparison.png/pdf, evidence.csv/npz, attributes.json and
+selected_gaussians.pt. Evidence markers show source-feature locations and actual
+incoming GEOMETRY weights, not the encoder's complete receptive field. No surface
+purity metric is inferred from the user's surface names alone.
 
 The Ours control reuses the exact points/features, kNN graph, and assignment,
 replacing every point budget by its scene-wide mean. All downstream attributes,
 including appearance, are recomputed. Display cameras are aligned once with
 the original model, then frozen for its constant-budget control.
+
+The default budget_max=2 matches this branch's original Final++ experiment.
+Use --ours-config TRAIN_RUN/.hydra/config.yaml or --budget-max VALUE when the
+checkpoint's training settings differ; budget_max is not a checkpoint tensor.
 """
 
 from __future__ import annotations
@@ -47,6 +53,53 @@ def write_json(path: Path, value: Any) -> None:
         json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
+
+
+def encoder_weights(checkpoint: dict) -> dict:
+    """Extract encoder weights from Lightning, model, or plain state dictionaries."""
+    state = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+    if not isinstance(state, dict) or not state:
+        raise ValueError("Checkpoint does not contain an encoder state dictionary")
+    encoder = {
+        key[len("encoder."):]: value
+        for key, value in state.items() if key.startswith("encoder.")
+    }
+    return encoder or state
+
+
+def load_encoder_checkpoint(encoder: Any, path: Path, require_budget: bool = False):
+    """Load every encoder parameter strictly before any scene inference."""
+    import torch
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Unsupported checkpoint format: {path}")
+    state = encoder_weights(checkpoint)
+    if require_budget and not all(
+        f"gaussian_decoder.budget_head.{name}" in state for name in ("weight", "bias")
+    ):
+        raise ValueError(
+            "Ours checkpoint has no learned budget head. Supply the original "
+            "budget-trained Final++ checkpoint for this analysis."
+        )
+    encoder.load_state_dict(state, strict=True)
+    return int(checkpoint.get("global_step", 0)), len(state)
+
+
+def checkpoint_paths(args: Any, config: dict) -> dict[str, Path]:
+    return {
+        "baseline": Path(args.baseline_ckpt or config["baseline_checkpoint"]),
+        "ours": Path(args.ours_ckpt or config["ours_checkpoint"]),
+    }
+
+
+def require_server_files(paths) -> None:
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Server input not found: {path}. Run in the server environment "
+                "with the checkpoints and RE10K data mounted. No plots were generated."
+            )
 
 
 def selection_plan(
@@ -394,24 +447,37 @@ def plot_comparison(sample: dict, results: dict, evidence: dict, directory: Path
     plt.close(fig)
 
 
-def model_config(experiment: str, data_root: Path, index_path: Path, size: list[int]):
+def model_config(
+    experiment: str, data_root: Path, index_path: Path, size: list[int],
+    saved_config: Path | None = None, budget_max: float | None = None,
+):
     from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
     from src.config import load_typed_root_config
     from src.global_cfg import set_cfg
 
-    with initialize_config_dir(config_dir=str(ROOT / "config"), version_base=None):
-        config = compose(config_name="main", overrides=[
-            f"+experiment={experiment}", "mode=test", "wandb.mode=disabled",
-            "dataset/view_sampler@dataset.re10k.view_sampler=evaluation",
-        ])
+    if saved_config is not None:
+        config = OmegaConf.load(saved_config)
+    else:
+        with initialize_config_dir(config_dir=str(ROOT / "config"), version_base=None):
+            config = compose(config_name="main", overrides=[
+                f"+experiment={experiment}",
+                "dataset/view_sampler@dataset.re10k.view_sampler=evaluation",
+            ])
+    config.mode, config.wandb.mode = "test", "disabled"
     config.dataset.re10k.roots = [str(data_root)]
-    config.dataset.re10k.view_sampler.index_path = str(index_path)
+    config.dataset.re10k.view_sampler = dict(
+        name="evaluation", index_path=str(index_path), num_context_views=2,
+    )
     config.dataset.re10k.input_image_shape = [size[1], size[0]]
     config.data_loader.test.num_workers = 0
+    config.data_loader.test.batch_size = 1
     config.model.encoder.pretrained_weights = ""
-    if experiment == "re10k_moment":
+    if config.model.encoder.gs_params_head_type == "moment":
         # Expose hooks and avoid compilation warmup; this changes no parameters.
         config.model.encoder.moment_decoder.compile_kernels = False
+        if budget_max is not None:
+            config.model.encoder.moment_decoder.budget_max = budget_max
     set_cfg(config)
     return load_typed_root_config(config), config
 
@@ -461,6 +527,9 @@ def render_result(decoder: Any, gaussians: Any, sample: dict, display: dict,
     composite = color + (1 - alpha[..., None]) * gray
     return {
         "attributes": describe_gaussian(gaussians, slot),
+        "selected_gaussian": {
+            name: getattr(selected, name).detach().cpu() for name in FIELDS
+        },
         "centers": centers,
         "context_rgb": rgb,
         "isolated_composite": np.clip(composite, 0, 1),
@@ -471,25 +540,7 @@ def render_result(decoder: Any, gaussians: Any, sample: dict, display: dict,
 
 
 def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
-    import numpy as np
-    import torch
-    from omegaconf import OmegaConf
-    from PIL import Image
-
-    # Make repository packages visible when invoked as python scripts/....py.
-    from src.dataset.data_module import DataModule
-    from src.loss import get_losses
-    from src.misc.step_tracker import StepTracker
-    from src.model.decoder import get_decoder
-    from src.model.encoder import get_encoder
-    from src.scripts.analysis_scale_opacity import (
-        _align_target_extrinsics, _freeze, _load_encoder_checkpoint, _to_device,
-    )
-
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "Full visualization requires the CUDA evaluation environment"
-        )
+    # Validate real files before importing CUDA libraries or creating output.
     data_path = Path(args.data_root or manifest["data_path"])
     if data_path.suffix == ".torch":
         data_path = data_path.parent
@@ -504,13 +555,26 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
         if not path.is_file():
             raise FileNotFoundError(path)
         chunks.append(path)
-    checkpoints = {
-        "baseline": Path(args.baseline_ckpt or config["baseline_checkpoint"]),
-        "ours": Path(args.ours_ckpt or config["ours_checkpoint"]),
-    }
-    for path in [*checkpoints.values(), *[Path(s["image_path"]) for s in plan]]:
-        if not path.is_file():
-            raise FileNotFoundError(path)
+    checkpoints = checkpoint_paths(args, config)
+    require_server_files([
+        *checkpoints.values(), *[Path(s["image_path"]) for s in plan],
+    ])
+
+    import numpy as np
+    import torch
+    from omegaconf import OmegaConf
+    from PIL import Image
+    from src.dataset.data_module import DataModule
+    from src.loss import get_losses
+    from src.misc.step_tracker import StepTracker
+    from src.model.decoder import get_decoder
+    from src.model.encoder import get_encoder
+    from src.scripts.analysis_scale_opacity import (
+        _align_target_extrinsics, _freeze, _to_device,
+    )
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Actual inference requires CUDA Gaussian rasterization")
     output = args.output_dir.resolve()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError(f"Choose an empty output directory: {output}")
@@ -522,10 +586,12 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
     write_json(index_path, selected_index)
     write_json(output / "selection_plan.json", {"samples": plan})
     run_metadata = {
+        "source": "real_checkpoint_inference",
         "checkpoints": {name: str(path) for name, path in checkpoints.items()},
         "data_root": str(data_root),
         "pose_align_steps": args.pose_align_steps,
         "global_steps": {},
+        "models": {},
         "complete": False,
     }
     write_json(output / "run_metadata.json", run_metadata)
@@ -538,10 +604,14 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
         dataset.chunks = sorted(set(chunks))
         return dataset
 
-    for model, experiment in (("baseline", "re10k"), ("ours", "re10k_moment")):
+    for model, experiment in (
+        ("baseline", "re10k"), ("ours", "re10k_budget_analysis"),
+    ):
         checkpoint = checkpoints[model]
         cfg, raw_cfg = model_config(
-            experiment, data_root, index_path, plan[0]["image_size_wh"]
+            experiment, data_root, index_path, plan[0]["image_size_wh"],
+            saved_config=args.ours_config if model == "ours" else args.baseline_config,
+            budget_max=args.budget_max if model == "ours" else None,
         )
         if cfg.model.encoder.num_surfaces != 1:
             raise ValueError("Analysis requires one Gaussian slot per source pixel")
@@ -550,8 +620,22 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
         OmegaConf.save(raw_cfg, output / f"{model}_config.yaml")
         torch.manual_seed(0)
         encoder, _ = get_encoder(cfg.model.encoder)
-        step, _, _ = _load_encoder_checkpoint(encoder, checkpoint, False)
+        print(f"[Checkpoint] Strictly loading {model}: {checkpoint}", flush=True)
+        step, tensor_count = load_encoder_checkpoint(
+            encoder, checkpoint, require_budget=model == "ours",
+        )
         run_metadata["global_steps"][model] = step
+        run_metadata["models"][model] = {
+            "strict_load": True, "encoder_tensors": tensor_count,
+            "budget_max": cfg.model.encoder.moment_decoder.budget_max
+            if model == "ours" else None,
+            "budget_setting_source": (
+                "command line" if args.budget_max is not None else
+                "saved training config" if args.ours_config else
+                "original Final++ inference config"
+            ) if model == "ours" else None,
+            "inferred_scenes": [],
+        }
         write_json(output / "run_metadata.json", run_metadata)
         encoder = _freeze(encoder.to(device))
         decoder = _freeze(get_decoder(cfg.model.decoder).to(device))
@@ -571,7 +655,7 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
             if scene not in by_scene or scene in done:
                 continue
             sample = by_scene[scene]
-            print(f"{model}: {sample['id']} {scene}", flush=True)
+            print(f"[Inference] {model}: {sample['id']} {scene}", flush=True)
             batch = _to_device(batch, device)
             context_rgb = batch["context"]["image"]
             if list(context_rgb.shape[-2:]) != sample["image_size_wh"][::-1]:
@@ -582,7 +666,10 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
             with Image.open(sample["image_path"]) as image:
                 chosen = np.asarray(image.convert("RGB"), dtype=np.float32) / 255
             actual = context_rgb[0, sample["context_view"]].permute(1, 2, 0)
-            if not np.allclose(chosen, actual.cpu().numpy(), atol=1 / 255 + 1e-7):
+            if (
+                chosen.shape != tuple(actual.shape)
+                or not np.allclose(chosen, actual.cpu().numpy(), atol=1 / 255 + 1e-7)
+            ):
                 raise ValueError(
                     f"Exported PNG differs from the loaded frame: {scene}"
                 )
@@ -615,10 +702,13 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
             variants = {"baseline": original} if model == "baseline" else {
                 "learned": original, "constant": constant,
             }
+            print(f"[Render] {model}: {sample['id']}", flush=True)
             for name, gaussians in variants.items():
                 results[sample["id"]][name] = render_result(
                     decoder, gaussians, sample, display, cameras, context_rgb
                 )
+            run_metadata["models"][model]["inferred_scenes"].append(scene)
+            write_json(output / "run_metadata.json", run_metadata)
             if model == "ours":
                 directory = output / sample["id"]
                 directory.mkdir()
@@ -626,6 +716,7 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
                 save_evidence(directory, evidence, tuple(context_rgb.shape[-2:]))
                 total = float(learned_trace["mass"].sum())
                 attributes = {
+                    "source": "real_checkpoint_inference",
                     "sample": sample,
                     "conditions": {
                         name: result["attributes"]
@@ -642,6 +733,10 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
                     ),
                 }
                 write_json(directory / "attributes.json", attributes)
+                torch.save({
+                    name: result["selected_gaussian"]
+                    for name, result in results[sample["id"]].items()
+                }, directory / "selected_gaussians.pt")
                 plot_comparison(sample, results[sample["id"]], evidence, directory)
                 # Save unmarked images for inspection, not only a composed figure.
                 for name, result in results[sample["id"]].items():
@@ -660,6 +755,7 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
                 Image.fromarray((np.clip(gt, 0, 1) * 255).astype(np.uint8)).save(
                     directory / "novel_ground_truth.png"
                 )
+                print(f"[Saved] {directory / 'comparison.png'}", flush=True)
                 del learned_trace, constant_trace, constant
             done.add(scene)
             del original, gaussians, variants, batch, context_rgb, display, cameras
@@ -673,10 +769,10 @@ def execute(args: Any, config: dict, plan: list[dict], manifest: dict) -> None:
         torch.cuda.empty_cache()
     run_metadata["complete"] = True
     write_json(output / "run_metadata.json", run_metadata)
-    print(f"Saved comparisons to {output}", flush=True)
+    print(f"Real inference completed: {output}", flush=True)
 
 
-def main() -> None:
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -686,17 +782,32 @@ def main() -> None:
     parser.add_argument("--index", type=Path,
                         default=ROOT / "assets/evaluation_index_re10k.json")
     parser.add_argument("--data-root", type=Path)
-    parser.add_argument("--baseline-ckpt", type=Path)
-    parser.add_argument("--ours-ckpt", type=Path)
+    parser.add_argument("--baseline-checkpoint", "--baseline-ckpt",
+                        dest="baseline_ckpt", type=Path)
+    parser.add_argument("--ours-checkpoint", "--ours-ckpt", dest="ours_ckpt", type=Path)
+    parser.add_argument("--ours-config", type=Path, help="Saved full training YAML")
+    parser.add_argument("--baseline-config", type=Path)
+    parser.add_argument("--budget-max", type=float)
     parser.add_argument("--output-dir", type=Path,
                         default=Path("outputs/budget_assignment_analysis"))
     parser.add_argument("--pose-align-steps", type=int, default=100)
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.pose_align_steps < 0:
         parser.error("--pose-align-steps must be nonnegative")
+    if args.budget_max is not None and (
+        not math.isfinite(args.budget_max) or args.budget_max <= 0
+    ):
+        parser.error("--budget-max must be positive and finite")
     config = read_json(args.samples)
     manifest_path = args.manifest or Path(config["manifest"])
+    if not args.dry_run:
+        try:
+            require_server_files([
+                *checkpoint_paths(args, config).values(), manifest_path,
+            ])
+        except FileNotFoundError as error:
+            parser.exit(2, f"Error: {error}\n")
     manifest = read_json(manifest_path) if manifest_path.is_file() else None
     plan = selection_plan(config, read_json(args.index), manifest)
     for sample in plan:
@@ -713,7 +824,10 @@ def main() -> None:
     if manifest is None:
         parser.error(f"Export manifest not found: {manifest_path}; supply --manifest")
     sys.path.insert(0, str(ROOT))
-    execute(args, config, plan, manifest)
+    try:
+        execute(args, config, plan, manifest)
+    except (FileNotFoundError, ValueError) as error:
+        parser.exit(2, f"Error: {error}\n")
 
 
 if __name__ == "__main__":
