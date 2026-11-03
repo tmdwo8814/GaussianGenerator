@@ -7,8 +7,8 @@ defaults:
 # Inherit ACID roots, optimizer, batch size, and checkpoint retention from acid.
 # Train to 80000 steps, then evaluate checkpoints at 20000/40000/60000/80000.
 wandb:
-  name: final_plus_acid
-  tags: [acid, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus]
+  name: final_plus_nobudget_acid
+  tags: [acid, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus, no_budget]
 
 # Keep the model parameters identical to re10k_moment.yaml.
 model:
@@ -38,8 +38,6 @@ model:
       knn_backend: auto
       knn_query_backend: specialized
       knn_workers: 1
-      budget_max: 2.0
-      budget_init: 0.6931471805599453
       scale_min: 1.0
       scale_max: 3.0
       scale_init: 1.75

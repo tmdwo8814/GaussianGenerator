@@ -24,8 +24,9 @@ class FinalPlusTests(unittest.TestCase):
         head = dpt.DPTOutputAdapter(num_channels=83, feature_dim=256, head_type='gs_params').head
         self.assertEqual(2 * sum(p.numel() for p in head.parameters()), 1222310)
         for name, width, depth, spread, expected in (
-            ('Final', 128, 1, False, 154649), ('A', 256, 2, False, 271129),
-            ('B', 256, 1, True, 270873), ('A+B', 256, 2, True, 336665),
+            # No-budget branch: remove Linear(256, 1), i.e. 257 parameters.
+            ('Final', 128, 1, False, 154392), ('A', 256, 2, False, 270872),
+            ('B', 256, 1, True, 270616), ('A+B', 256, 2, True, 336408),
         ):
             with self.subTest(variant=name):
                 model = Decoder(cfg(feature_dim=256, hidden_dim=64, appearance_heads=2,

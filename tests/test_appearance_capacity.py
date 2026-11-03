@@ -42,7 +42,7 @@ class AppearanceCapacityTests(unittest.TestCase):
     def test_parameter_count_matches_agreed_design_and_zero_outputs(self):
         model = Decoder(cfg(feature_dim=256, hidden_dim=64, appearance_dim=32,
                             appearance_mlp_dim=256))
-        self.assertEqual(sum(p.numel() for p in model.parameters()), 272601)
+        self.assertEqual(sum(p.numel() for p in model.parameters()), 272344)
         self.assertEqual(sum(p.numel() for p in model.appearance_reader.parameters()), 101760)
         self.assertEqual(sum(p.numel() for p in model.appearance_sh_head.parameters()), 117835)
         self.assertEqual(model.appearance_head.weight.count_nonzero().item(), 0)
@@ -194,7 +194,7 @@ class AppearanceCapacityTests(unittest.TestCase):
         self.assertEqual(options.appearance_mlp_depth, 2)
         self.assertTrue(options.appearance_moments)
         self.assertTrue(options.checkpoint_appearance)
-        self.assertEqual(sum(p.numel() for p in Decoder(options).parameters()), 336665)
+        self.assertEqual(sum(p.numel() for p in Decoder(options).parameters()), 336408)
         model = torch.nn.Module()
         model.encoder = torch.nn.Module()
         model.encoder.gaussian_decoder = Decoder(cfg())

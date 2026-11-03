@@ -129,7 +129,7 @@ class CapacitySpeedTests(unittest.TestCase):
     def test_actual_widths_preserve_parameters_and_forward_retention(self):
         old, new = models(feature_dim=256, hidden_dim=64, appearance_dim=32,
                           appearance_mlp_dim=128, num_neighbors=16, chunk_size=64)
-        self.assertEqual(sum(p.numel() for p in new.parameters()), 154649)
+        self.assertEqual(sum(p.numel() for p in new.parameters()), 154392)
         inputs = [torch.randn(2, 512, d, requires_grad=True) for d in (3, 256, 3)]
         sizes = []
         for model in (old, new):

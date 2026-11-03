@@ -37,16 +37,22 @@ context RGB → 기존 backbone
 
 - `build_knn`: `neighbors[j,k] = i`. 지지점 `j`가 질량을 보낼 후보 슬롯 `i`.
   self를 첫 열에 두고 최대 16개를 선택한다. 후보는 모든 입력 view에 걸쳐 검색한다.
-- `predict_allocation`: `b_j = budget_max × sigmoid(budget_head(f_j))`.
+- `predict_allocation` (`exp/Final++_nobudget`): 별도의 budget head 없이 배분한다.
   `allocation_head([f_i, f_j, (x_j-x_i)/L, ||(x_j-x_i)/L||²])`의 logit을
-  **각 지지점의 후보 방향**으로 softmax하여 `A_ij`를 얻고, `q_ij = A_ij b_j`로 배분한다.
-- `aggregate_moments`: **목적지 슬롯 방향으로** 모아 `m_i = Σ_j q_ij`를 계산한다.
-  `w_ij = (q_ij + ε·1[i=j]) / (m_i + ε)`로 moment만 안정화한다.
-  `μ_i = Σ_j w_ij x_j`, `C_i = Σ_j w_ij (x_j-μ_i)(x_j-μ_i)ᵀ`,
-  `h_i = Σ_j w_ij f_j`를 계산한다.
+  **각 지지점의 후보 방향**으로 softmax하여 `a_ji`를 얻고 그대로 질량으로 사용한다.
+  따라서 `Σ_i a_ji = 1`이며, 별도 상수나 학습 가능한 스칼라를 곱하지 않는다.
+- `aggregate_moments`: **목적지 슬롯 방향으로** 모아 `m_i = Σ_j a_ji`를 계산한다.
+  `w_ji = (a_ji + ε·1[i=j]) / (m_i + ε)`로 moment만 안정화한다.
+  `μ_i = Σ_j w_ji x_j`, `C_i = Σ_j w_ji (x_j-μ_i)(x_j-μ_i)ᵀ`,
+  `h_i = Σ_j w_ji f_j`를 계산한다.
 - `build_gaussians`: `s_i`는 `h_i`에서 예측하며 범위는 `[1,3]`, 초기값은 `1.75`이다.
   `Σ_i = s_i² C_i + (covariance_floor × L)² I`,
   `o_i = 1-exp(-m_i)`, `SH_i = SH_head(h_i) × 기존 SH mask`로 생성한다.
+
+이 ablation에서는 장면의 총 질량이 지지점 수 `M`과 같다. 슬롯별 질량은
+고정되지 않으며, `m_i=1`인 슬롯의 opacity는 약 `0.6321`이다. 기존 초기
+budget `log(2)`에 맞추는 보정은 하지 않는다. RE10K W&B 이름은
+`final_plus_nobudget`이며, 학습·평가 주기는 기존 설정을 따른다.
 
 FP32에서 작은 covariance floor가 반올림으로 사라지지 않도록, 코드에는
 covariance trace에 비례하는 작은 detached 수치 보정도 포함되어 있다.

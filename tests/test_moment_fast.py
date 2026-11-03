@@ -24,7 +24,7 @@ def original_allocation(model, points, features, neighbors):
     delta = points[:, None] - points[neighbors]
     pair = torch.cat((destination, source, delta, delta.square().sum(-1, keepdim=True)), -1)
     logits = model.allocation_head(pair).squeeze(-1)
-    return logits.softmax(-1) * (model.cfg.budget_max * model.budget_head(features).sigmoid())
+    return logits.softmax(-1)
 
 
 class OriginalDecoder(Decoder):

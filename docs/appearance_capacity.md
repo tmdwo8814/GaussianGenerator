@@ -1,14 +1,15 @@
 # Appearance capacity and Final++
 
-Current branch: `exp/Final++`. W&B run name: `final_plus`.
-This adds the expanded SH MLP (A) and appearance feature standard deviation
-(B) to Final. Geometry allocation, budget, opacity, candidate sets, DPT256,
-losses and the user-configured training length are unchanged.
+Current branch: `exp/Final++_nobudget`. W&B run name: `final_plus_nobudget`.
+This retains Final++'s expanded SH MLP (A) and appearance feature standard
+deviation (B), but removes the learned support budget. Softmax allocation is
+used directly as mass, so every support distributes a total of 1. Moment and
+opacity formulas, candidate sets, DPT256, losses and training length are unchanged.
 
 ## Flow
 
-1. Keep the DPT256 features, exact 3D kNN (K=16, including self), support
-   budgets, geometry allocation, moment centers/covariances and opacity mapping.
+1. Keep the DPT256 features and exact 3D kNN (K=16, including self). Use
+   softmax allocation as unit outgoing mass, then the same moment and opacity formulas.
 2. Reuse the allocation MLP's hidden features to predict one additional score
    `a[j,i]` on each existing geometry edge. The new output weight starts at zero.
 3. Compute `wA[j,i] = incoming_softmax(log(wG[j,i]) + a[j,i])`, and
@@ -33,9 +34,9 @@ They can influence SH even when they are absent from the geometry graph.
 Only context RGB and its view-major raster layout enter the decoder; target
 images/poses are used by the unchanged renderer and MSE/LPIPS losses.
 
-Final++ has **336,665 trainable parameters**, excluding DPT and point heads:
-moment 52,942 + separate score 64 + two readers 50,880 + MLP 232,779.
-Final has 154,649; the baseline has 1,222,310 across its TWO DPT output heads
+Final++ without budget has **336,408 trainable parameters**, excluding DPT and point heads:
+moment 52,685 + separate score 64 + two readers 50,880 + MLP 232,779.
+Final without budget has 154,392; the baseline has 1,222,310 across its TWO DPT output heads
 (each `3x3 Conv 256->256` without bias, then `1x1 Conv 256->83` with bias).
 Heads are independent but the complete decoder is shared across input views.
 
@@ -171,7 +172,7 @@ Each head keeps its own parameters and its own incoming softmax. With two
 heads this replaces four support/query GEMM calls with two per scene evaluation
 (including recomputation), with the same mathematical projections. It does not
 combine scores or normalize across heads. The original Final's learned
-function and 154,649 parameters are unchanged by these speed flags alone.
+function and parameter count are unchanged by these speed flags alone.
 
 Only support/slot projections are batched. Edge features are still processed
 one head and one chunk at a time; there is no [M,K,heads,D] expansion. Both
@@ -221,12 +222,12 @@ All three switches live under `model.encoder.moment_decoder`:
 
 | Variant | appearance_moments | appearance_mlp_dim | appearance_mlp_depth | Post-DPT parameters |
 | --- | --- | --- | --- | ---: |
-| Final | false | 128 | 1 | 154,649 |
-| A | false | 256 | 2 | 271,129 |
-| B | true | 256 | 1 | 270,873 |
-| A+B (default) | true | 256 | 2 | 336,665 |
+| Final, no budget | false | 128 | 1 | 154,392 |
+| A, no budget | false | 256 | 2 | 270,872 |
+| B, no budget | true | 256 | 1 | 270,616 |
+| A+B, no budget (default) | true | 256 | 2 | 336,408 |
 
-For example, restore the exact Final architecture (including checkpoint keys):
+For example, use Final's appearance architecture without a budget head:
 
 ```bash
 sbatch scripts/train_re10k.sh \

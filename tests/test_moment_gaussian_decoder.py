@@ -72,15 +72,35 @@ class MomentDecoderTests(unittest.TestCase):
                 self.assertEqual(row.unique().numel(), row.numel())
         self.assertEqual(build_knn(torch.ones(1, 3), 16).tolist(), [[0]])
 
-    def test_allocation_conserves_each_support_budget(self):
-        model = Decoder(Cfg(feature_dim=5, hidden_dim=8, chunk_size=3))
-        points, features = torch.randn(9, 3), torch.randn(9, 5)
-        indices = build_knn(points, 4)
-        q = model.predict_allocation(points, features, indices)
-        budget = model.cfg.budget_max * model.budget_head(features).sigmoid().squeeze(-1)
-        torch.testing.assert_close(q.sum(-1), budget)
-        mass, *_ = model.aggregate_moments(points, features, indices, q)
-        torch.testing.assert_close(mass.sum(), budget.sum())
+    def test_allocation_conserves_unit_mass_without_budget_parameters(self):
+        for separate in (False, True):
+            with self.subTest(separate_appearance=separate):
+                model = Decoder(Cfg(feature_dim=5, hidden_dim=8, chunk_size=3,
+                                    separate_appearance=separate))
+                # Verify learned, nonuniform allocations, not just initialization.
+                for parameter in model.allocation_head.parameters():
+                    nn.init.normal_(parameter, std=.3)
+                points, features = torch.randn(9, 3), torch.randn(9, 5)
+                indices = build_knn(points, 4)
+                result = model.predict_allocation(points, features, indices,
+                                                  return_appearance=separate)
+                allocation = result[0] if separate else result
+                torch.testing.assert_close(allocation.sum(-1), torch.ones(9))
+                self.assertTrue((allocation >= 0).all())
+                mass, *_ = model.aggregate_moments(points, features, indices, allocation)
+                torch.testing.assert_close(mass.sum(), torch.tensor(9.))
+                self.assertFalse(hasattr(model, 'budget_head'))
+                self.assertFalse(any('budget' in key for key in model.state_dict()))
+                self.assertFalse(any('budget' in key for key in vars(model.cfg)))
+
+    def test_self_only_uses_unit_mass_in_unchanged_opacity_mapping(self):
+        model = Decoder(Cfg(feature_dim=5, hidden_dim=8, num_neighbors=1)).eval()
+        points, features = torch.randn(1, 7, 3), torch.randn(1, 7, 5)
+        with torch.no_grad():
+            gaussians = model(points, features)
+        torch.testing.assert_close(gaussians.means, points)
+        expected = -torch.expm1(torch.tensor(-1.))
+        torch.testing.assert_close(gaussians.opacities, expected.expand(1, 7))
 
     def test_incoming_moments_match_independent_dense_reference(self):
         model = Decoder(Cfg(feature_dim=5, hidden_dim=8, chunk_size=2))
@@ -137,7 +157,7 @@ class MomentDecoderTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(actual.grad).all())
             torch.testing.assert_close(actual.grad, target.grad, rtol=1e-4, atol=2e-6)
         for tensor in (points, features, model.allocation_head[0].weight,
-                       model.budget_head.weight, model.scale_head.weight,
+                       model.allocation_head[2].weight, model.scale_head.weight,
                        model.sh_head.weight):
             self.assertGreater(tensor.grad.abs().sum().item(), 0)
 
@@ -185,6 +205,9 @@ class MomentDecoderTests(unittest.TestCase):
             baseline = compose(config_name="main", overrides=["+experiment=re10k"])
             cfg = compose(config_name="main", overrides=["+experiment=re10k_moment"])
         self.assertEqual(cfg.model.encoder.gs_params_head_type, "moment")
+        self.assertEqual(cfg.wandb.name, 'final_plus_nobudget')
+        self.assertNotIn('budget_max', cfg.model.encoder.moment_decoder)
+        self.assertNotIn('budget_init', cfg.model.encoder.moment_decoder)
         decoder_cfg = from_dict(Cfg, OmegaConf.to_container(cfg.model.encoder.moment_decoder))
         self.assertEqual(decoder_cfg.feature_dim, 256)
         self.assertEqual(decoder_cfg.num_neighbors, 16)

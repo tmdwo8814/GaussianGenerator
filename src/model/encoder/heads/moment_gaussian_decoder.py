@@ -3,6 +3,7 @@
 Notation in this file: j is a source SUPPORT and i is a destination SLOT.
 neighbors[j, k] = i, so softmax runs over outgoing candidates (k). Moments
 use index_add over destination i, whose incoming degree is NOT limited to k.
+No-budget ablation: softmax allocation itself is the mass; each support sends 1.
 The optional appearance path also reads context RGB and its raster layout,
 never cameras or target images.
 """
@@ -39,8 +40,6 @@ class MomentDecoderCfg:
     knn_backend: str = 'auto'
     knn_query_backend: str = 'specialized'
     knn_workers: int = 1
-    budget_max: float = 2.0
-    budget_init: float = log(2.0)
     scale_min: float = 1.0
     scale_max: float = 3.0
     scale_init: float = 1.75
@@ -74,8 +73,6 @@ class MomentGaussianDecoder(nn.Module):
         if min(cfg.feature_dim, cfg.hidden_dim, cfg.num_neighbors,
                cfg.chunk_size, cfg.knn_workers) < 1:
             raise ValueError("Feature sizes, neighbor count, chunk size and workers must be positive")
-        if not 0 < cfg.budget_init < cfg.budget_max:
-            raise ValueError("Require 0 < budget_init < budget_max")
         if not 0 < cfg.scale_min < cfg.scale_init < cfg.scale_max:
             raise ValueError("Require 0 < scale_min < scale_init < scale_max")
         if min(cfg.covariance_floor, cfg.mass_epsilon, cfg.scene_epsilon) <= 0:
@@ -103,18 +100,14 @@ class MomentGaussianDecoder(nn.Module):
             nn.SiLU(),
             nn.Linear(cfg.hidden_dim, 1),
         )
-        self.budget_head = nn.Linear(cfg.feature_dim, 1)
         self.scale_head = nn.Linear(cfg.feature_dim, 1)
         self.d_sh = (sh_degree + 1) ** 2
         self.sh_head = nn.Linear(cfg.feature_dim, 3 * self.d_sh)
 
-        # Nearly uniform initial allocation; bounded budget gives opacity ~0.5
-        # when incoming mass equals outgoing mass. No per-slot mass guarantee.
+        # Nearly uniform initial allocation; each support sends unit total mass.
+        # Incoming slot mass is not fixed; m_i=1 gives opacity 1-exp(-1) ~0.632.
         nn.init.normal_(self.allocation_head[-1].weight, std=1e-3)
         nn.init.zeros_(self.allocation_head[-1].bias)
-        nn.init.zeros_(self.budget_head.weight)
-        nn.init.constant_(self.budget_head.bias,
-                          log(cfg.budget_init / (cfg.budget_max - cfg.budget_init)))
         nn.init.zeros_(self.scale_head.weight)
         nn.init.constant_(self.scale_head.bias,
                           log((cfg.scale_init - cfg.scale_min) /
@@ -182,7 +175,7 @@ class MomentGaussianDecoder(nn.Module):
                               preserve_rng_state=False)
         return function(*args)
 
-    def _allocation_chunk(self, source_points, source_projection, budget,
+    def _allocation_chunk(self, source_points, source_projection,
                           points, destination_projection, neighbors, return_appearance=False):
         delta = source_points[:, None] - points[neighbors]
         geometry = torch.cat((delta, delta.square().sum(-1, keepdim=True)), dim=-1)
@@ -194,14 +187,13 @@ class MomentGaussianDecoder(nn.Module):
         hidden = self.allocation_head[1](hidden)
         logits = self.allocation_head[2](hidden).squeeze(-1)
         allocation = logits.softmax(dim=-1)  # sum_k A[j, k] = 1
-        mass = allocation * budget  # q[j, k] = A_ij * b_j
         if return_appearance:
-            return mass, self.appearance_head(hidden).squeeze(-1)
-        return mass
+            return allocation, self.appearance_head(hidden).squeeze(-1)
+        return allocation
 
     def predict_allocation(self, points: Tensor, features: Tensor,
                            neighbors: Tensor, return_appearance: bool = False):
-        """Normalized coordinates in; sparse outgoing mass q [M, K] out."""
+        """Normalized coordinates in; outgoing allocation a [M, K], sum_k a=1."""
         # Project each support once instead of repeating a 128->64 projection
         # for every edge. These projections remain in the autograd graph.
         if return_appearance and self.appearance_head is None:
@@ -214,13 +206,12 @@ class MomentGaussianDecoder(nn.Module):
         destination_projection, source_projection = F.linear(features, projection_weight).split(
             self.cfg.hidden_dim, dim=-1
         )
-        budget = self.cfg.budget_max * self.budget_head(features).sigmoid()
         chunks = []
         for start in range(0, len(points), self.cfg.chunk_size):
             stop = start + self.cfg.chunk_size
             chunks.append(self._run_chunk(
                 self._allocation_chunk, points[start:stop], source_projection[start:stop],
-                budget[start:stop], points, destination_projection, neighbors[start:stop], return_appearance,
+                points, destination_projection, neighbors[start:stop], return_appearance,
             ))
         if return_appearance:
             return tuple(torch.cat(values, dim=0) for values in zip(*chunks))
@@ -457,13 +448,14 @@ class MomentGaussianDecoder(nn.Module):
                 normalized = scene_points / scene_scale
                 scene_stats = {}
                 if self.appearance_head is None:
-                    q = self.predict_allocation(normalized, scene_features, neighbors)
-                    scene_moments = self.aggregate_moments(normalized, scene_features, neighbors, q)
+                    allocation = self.predict_allocation(normalized, scene_features, neighbors)
+                    scene_moments = self.aggregate_moments(normalized, scene_features, neighbors, allocation)
                 else:
-                    q, scores = self.predict_allocation(normalized, scene_features, neighbors,
-                                                        return_appearance=True)
+                    allocation, scores = self.predict_allocation(
+                        normalized, scene_features, neighbors, return_appearance=True,
+                    )
                     *scene_moments, geometry = self.aggregate_moments(
-                        normalized, scene_features, neighbors, q, return_weights=True,
+                        normalized, scene_features, neighbors, allocation, return_weights=True,
                     )
                     if self.cfg.appearance_capacity:
                         args = (normalized, scene_features, rgb[scene_index].float(),
