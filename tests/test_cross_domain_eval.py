@@ -69,6 +69,10 @@ class CrossDomainTests(unittest.TestCase):
                 "phase": "evaluating", "completed": 1, "total": 4,
                 "elapsed_seconds": 5, "eta_seconds": 15,
             })
+        (self.output / "baseline/console.log").write_text(
+            "Traceback (most recent call last):\nModuleNotFoundError: missing_dependency\n",
+            encoding="utf-8",
+        )
         with patch.object(evaluation, "sleep") as sleep, \
              contextlib.redirect_stdout(io.StringIO()) as output:
             failures = evaluation.monitor_jobs(
@@ -80,7 +84,20 @@ class CrossDomainTests(unittest.TestCase):
         self.assertIn("[Progress][baseline]", output.getvalue())
         self.assertIn("ETA=00:00:15", output.getvalue())
         self.assertIn("baseline FAILED", output.getvalue())
+        self.assertIn("ModuleNotFoundError: missing_dependency", output.getvalue())
         self.assertIn("ours finished", output.getvalue())
+
+    def test_failure_log_tail_is_bounded_and_handles_invalid_encoding(self):
+        path = self.root / "console.log"
+        path.write_bytes(b"old noise\n" * 10000 + b"bad byte: \xff\nRuntimeError: actual cause\n")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            evaluation.print_failure_log("acid2re10k/ours", path, max_lines=2)
+        self.assertIn("RuntimeError: actual cause", output.getvalue())
+        self.assertIn("acid2re10k/ours", output.getvalue())
+        self.assertNotIn("old noise", output.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as missing_output:
+            evaluation.print_failure_log("missing", self.root / "absent.log")
+        self.assertIn("Could not read worker log", missing_output.getvalue())
 
     def test_protocol_uses_two_inputs_and_distinct_novel_targets(self):
         self.assertEqual(evaluation.fixed_views(100, 22, 3),

@@ -84,6 +84,24 @@ class EvaluationProgress:
         self.last_report = now
 
 
+def print_failure_log(label: str, path: Path, max_lines: int = 60) -> None:
+    """Show the actual worker exception without loading a potentially huge log."""
+    print(f"\n[CrossDomain] {label}: last {max_lines} log lines ({path})", flush=True)
+    try:
+        with path.open("rb") as file:
+            file.seek(0, os.SEEK_END)
+            offset = max(0, file.tell() - 32768)
+            file.seek(offset)
+            lines = file.read().decode("utf-8", errors="replace").splitlines()
+        if offset:
+            lines = lines[1:]  # The byte window may begin partway through a line.
+        excerpt = "\n".join(lines[-max_lines:])
+        print(excerpt or "(worker log is empty)", flush=True)
+    except OSError as error:
+        print(f"Could not read worker log: {error}", flush=True)
+    print(f"[CrossDomain] End of {label} error log\n", flush=True)
+
+
 def monitor_jobs(jobs, output_dir: Path):
     """Mirror worker progress to the launcher while preserving separate logs."""
     pending = list(jobs)
@@ -105,6 +123,8 @@ def monitor_jobs(jobs, output_dir: Path):
                 status = "finished" if code == 0 else f"FAILED (exit={code})"
                 print(f"[CrossDomain] {label} {status}; log={path.parent / 'console.log'}",
                       flush=True)
+                if code != 0:
+                    print_failure_log(label, path.parent / "console.log")
                 pending.remove((label, process))
         if pending:
             sleep(1)
@@ -318,10 +338,12 @@ def evaluate_worker(config_path: Path) -> None:
     )
     from lightning.pytorch import Callback
 
+    progress.report(0, phase="validating config", force=True)
     set_cfg(config)
     cfg = load_typed_root_config(config)
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("Each evaluation worker requires exactly one visible CUDA GPU")
+    progress.report(0, phase="initializing model", force=True)
     torch.manual_seed(cfg.seed)
     evaluated = {}
 
@@ -354,6 +376,7 @@ def evaluate_worker(config_path: Path) -> None:
     if any(entry.get("overlap") is None for entry in expected.values()):
         model._test_overlap_tags = ()
     data_module = DataModule(cfg.dataset, cfg.data_loader, step_tracker=None)
+    progress.report(0, phase="loading checkpoint and data", force=True)
     trainer.test(model, datamodule=data_module, ckpt_path=cfg.checkpointing.load)
     progress.report(len(evaluated), phase="checking coverage", force=True)
     output_dir = config_path.parent
