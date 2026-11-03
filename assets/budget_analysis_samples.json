@@ -1,0 +1,47 @@
+{
+  "manifest": "/workspace/research/GaussianGenerator/outputs/re10k_samples/manifest.json",
+  "ours_checkpoint": "/workspace/research/GaussianGenerator/pretrained_weights/Final++_re10k.ckpt",
+  "baseline_checkpoint": "/workspace/research/GaussianGenerator/pretrained_weights/re10k.ckpt",
+  "samples": [
+    {
+      "id": "sample1",
+      "image_path": "/workspace/research/GaussianGenerator/outputs/re10k_samples/scenes/001_f76e22ad948f8218/context_0_frame_000088.png",
+      "pixel_xy": [134, 134],
+      "target_surface": "수도꼭지",
+      "other_surface": "뒤쪽 sink",
+      "label": "Faucet / sink"
+    },
+    {
+      "id": "sample2",
+      "image_path": "/workspace/research/GaussianGenerator/outputs/re10k_samples/scenes/022_8cebe36289a4d5a0/context_0_frame_000025.png",
+      "pixel_xy": [210, 166],
+      "target_surface": "접시",
+      "other_surface": "식탁",
+      "label": "Plate / dining table"
+    },
+    {
+      "id": "sample3",
+      "image_path": "/workspace/research/GaussianGenerator/outputs/re10k_samples/scenes/051_3c84329b60bfa7cb/context_1_frame_000063.png",
+      "pixel_xy": [156, 239],
+      "target_surface": "손잡이",
+      "other_surface": "침대",
+      "label": "Handle / bed"
+    },
+    {
+      "id": "sample4",
+      "image_path": "/workspace/research/GaussianGenerator/outputs/re10k_samples/scenes/085_5f9582362fb46957/context_0_frame_000002.png",
+      "pixel_xy": [146, 168],
+      "target_surface": "table",
+      "other_surface": "바닥",
+      "label": "Table / floor"
+    },
+    {
+      "id": "sample5",
+      "image_path": "/workspace/research/GaussianGenerator/outputs/re10k_samples/scenes/059_7591c0ad03afa12b/context_1_frame_000127.png",
+      "pixel_xy": [74, 145],
+      "target_surface": "손잡이",
+      "other_surface": "배경",
+      "label": "Handle / background"
+    }
+  ]
+}

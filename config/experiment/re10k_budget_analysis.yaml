@@ -1,0 +1,49 @@
+# @package _global_
+
+# Inference snapshot of the original Final++ architecture, independently of
+# experiments that remove/change budget in re10k_moment.yaml.
+defaults:
+  - re10k
+  - _self_
+
+wandb:
+  name: final_plus_budget_analysis
+  mode: disabled
+
+model:
+  encoder:
+    gs_params_head_type: moment
+    moment_decoder:
+      feature_dim: 256
+      hidden_dim: 64
+      appearance_2d: true
+      separate_appearance: true
+      appearance_capacity: true
+      appearance_heads: 2
+      appearance_dim: 32
+      appearance_mlp_dim: 256
+      appearance_mlp_depth: 2
+      appearance_moments: true
+      appearance_variance_epsilon: 0.000001
+      checkpoint_appearance: false
+      appearance_2d_radii: [1, 4]
+      log_every_n_steps: 0
+      num_neighbors: 16
+      chunk_size: 32768
+      checkpoint_chunks: false
+      compile_kernels: false
+      cache_image_neighbors: true
+      batch_appearance_projections: true
+      knn_backend: auto
+      knn_query_backend: specialized
+      knn_workers: 1
+      # Non-tensor training setting; override with --budget-max or --ours-config
+      # if this checkpoint was trained with a different value.
+      budget_max: 2.0
+      budget_init: 0.6931471805599453
+      scale_min: 1.0
+      scale_max: 3.0
+      scale_init: 1.75
+      covariance_floor: 0.0001
+      mass_epsilon: 0.000001
+      scene_epsilon: 0.000001
