@@ -79,16 +79,31 @@ if [[ ! -d "$CHECKPOINT_DIR" ]]; then
   echo "Checkpoint directory not found: $CHECKPOINT_DIR" >&2
   exit 1
 fi
+
+# A saved Hydra config preserves the training model/evaluation settings even
+# when the working branch has changed. Other callers retain the old defaults.
+config_args=("+experiment=${EXPERIMENT:-re10k_moment}")
+if [[ -n "${EVAL_CONFIG_PATH:-}" ]]; then
+  if [[ ! -f "$EVAL_CONFIG_PATH" ]]; then
+    echo "Saved evaluation config not found: $EVAL_CONFIG_PATH" >&2
+    exit 1
+  fi
+  config_dir="$(cd "$(dirname "$EVAL_CONFIG_PATH")" && pwd)"
+  config_name="$(basename "$EVAL_CONFIG_PATH")"
+  config_name="${config_name%.yaml}"
+  config_args=("--config-path=$config_dir" "--config-name=$config_name")
+  echo "Saved training config: $config_dir/$config_name.yaml"
+fi
 python --version
 if ! $dry_run; then
   nvidia-smi
 fi
 
 python -u -m src.eval_checkpoints \
-  "+experiment=${EXPERIMENT:-re10k_moment}" \
+  "${config_args[@]}" \
   "wandb.entity=$WANDB_ENTITY" \
   "wandb.project=$WANDB_PROJECT" \
-  "+wandb.id=$WANDB_RUN_ID" \
+  "++wandb.id=$WANDB_RUN_ID" \
   "wandb.mode=online" \
   "+resume_eval.checkpoint_dir=$CHECKPOINT_DIR" \
   "+resume_eval.steps=$EVAL_STEPS" \

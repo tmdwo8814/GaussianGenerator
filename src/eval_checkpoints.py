@@ -150,6 +150,31 @@ def create_resume_logger(wandb_cfg: DictConfig, output_dir: Path):
     )
 
 
+def validate_expected_decoder(cfg_dict: DictConfig) -> None:
+    """Check requested ablation settings before opening the existing W&B run.
+
+    Older Final++ snapshots predate allocation_mode/budget_mode; their behavior
+    was learned allocation with support-wise budgets. These flags do not change
+    checkpoint tensor shapes, so strict weight loading alone cannot check them.
+    """
+    expected = cfg_dict.resume_eval.get("expected_decoder")
+    if not expected:
+        return
+    encoder = cfg_dict.model.encoder
+    if encoder.get("gs_params_head_type") != "moment":
+        raise ValueError("Expected a moment Gaussian decoder for this evaluation")
+    decoder = encoder.get("moment_decoder", {})
+    legacy_defaults = {"allocation_mode": "learned", "budget_mode": "support"}
+    for name, value in expected.items():
+        actual = decoder.get(name, legacy_defaults.get(name))
+        if actual != value:
+            raise ValueError(
+                f"Evaluation decoder mismatch: {name}={actual!r}; expected {value!r}. "
+                "Use the original training config for the selected checkpoints."
+            )
+    print(f"[ResumeEval] Decoder settings verified: {dict(expected)}", flush=True)
+
+
 @hydra.main(version_base=None, config_path="../config", config_name="main")
 def evaluate(cfg_dict: DictConfig) -> None:
     options = cfg_dict.get("resume_eval")
@@ -160,6 +185,7 @@ def evaluate(cfg_dict: DictConfig) -> None:
     checkpoints = select_checkpoints(
         Path(options.checkpoint_dir).expanduser().resolve(), list(options.steps)
     )
+    validate_expected_decoder(cfg_dict)
     prepare_eval_config(cfg_dict)
     cfg = load_typed_root_config(cfg_dict)
     set_cfg(cfg_dict)
