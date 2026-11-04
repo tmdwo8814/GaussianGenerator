@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #SBATCH -J GaussianGenerator
-#SBATCH --gres=gpu:high_perf:3
+#SBATCH --gres=gpu:high_perf:4
 #SBATCH --cpus-per-task=12
-#SBATCH --mem=85G
+#SBATCH --mem=120G
 #SBATCH -p batch_grad
 #SBATCH -w ariel-n1
 #SBATCH -t 6-00:00:00
