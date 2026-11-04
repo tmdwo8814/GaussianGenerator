@@ -140,7 +140,7 @@ class UniformAllocationTests(unittest.TestCase):
         for a, b in zip(attributes(actual), attributes(inference)):
             torch.testing.assert_close(a, b, rtol=5e-4, atol=5e-5)
 
-    def test_experiment_configs_enable_uniform_and_preserve_training(self):
+    def test_uniform_overrides_preserve_training(self):
         from dacite import from_dict
         from hydra import compose, initialize_config_dir
         from omegaconf import OmegaConf
@@ -148,7 +148,9 @@ class UniformAllocationTests(unittest.TestCase):
         for dataset in ('re10k', 'acid'):
             with initialize_config_dir(config_dir=str(ROOT / 'config'), version_base=None):
                 baseline = compose(config_name='main', overrides=[f'+experiment={dataset}'])
-                experiment = compose(config_name='main', overrides=[f'+experiment={dataset}_moment'])
+                experiment = compose(config_name='main', overrides=[f'+experiment={dataset}_moment',
+                                     'model.encoder.moment_decoder.allocation_mode=uniform',
+                                     'model.encoder.moment_decoder.budget_mode=support'])
                 learned = compose(config_name='main', overrides=[f'+experiment={dataset}_moment',
                                   'model.encoder.moment_decoder.allocation_mode=learned'])
             options = from_dict(Cfg, OmegaConf.to_container(experiment.model.encoder.moment_decoder))
@@ -158,7 +160,7 @@ class UniformAllocationTests(unittest.TestCase):
             self.assertTrue(options.appearance_moments)
             self.assertGreater(options.budget_max, options.budget_init)
             self.assertAlmostEqual(options.budget_init, .6931471805599453)
-            self.assertIn('uniform', experiment.wandb.name)
+            self.assertEqual(options.budget_mode, 'support')
             self.assertEqual(learned.model.encoder.moment_decoder.allocation_mode, 'learned')
             for key in ('dataset', 'data_loader', 'optimizer', 'loss', 'train', 'checkpointing'):
                 self.assertEqual(OmegaConf.to_container(experiment[key]),

@@ -4,6 +4,8 @@ Notation in this file: j is a source SUPPORT and i is a destination SLOT.
 neighbors[j, k] = i, so softmax runs over outgoing candidates (k). The uniform
 ablation instead sends b_j / K to every candidate, keeping b_j learnable. Moments
 use index_add over destination i, whose incoming degree is NOT limited to k.
+Scene-shared budgeting averages the learned budgets over all supports of one
+scene before allocation; the mean stays differentiable.
 The optional appearance path also reads context RGB and its raster layout,
 never cameras or target images.
 """
@@ -41,6 +43,7 @@ class MomentDecoderCfg:
     knn_backend: str = 'auto'
     knn_query_backend: str = 'specialized'
     knn_workers: int = 1
+    budget_mode: str = 'support'  # 'scene_shared': use mean_j b_j for every support.
     budget_max: float = 2.0
     budget_init: float = log(2.0)
     scale_min: float = 1.0
@@ -71,6 +74,8 @@ class MomentGaussianDecoder(nn.Module):
         self._image_cache = None
         if cfg.allocation_mode not in ('learned', 'uniform'):
             raise ValueError("allocation_mode must be learned or uniform")
+        if cfg.budget_mode not in ('support', 'scene_shared'):
+            raise ValueError("budget_mode must be support or scene_shared")
         if cfg.knn_backend not in ('auto', 'cupy', 'scipy'):
             raise ValueError('knn_backend must be auto, cupy or scipy')
         if cfg.knn_query_backend not in ('specialized', 'cupy'):
@@ -217,7 +222,7 @@ class MomentGaussianDecoder(nn.Module):
 
     def predict_allocation(self, points: Tensor, features: Tensor,
                            neighbors: Tensor, return_appearance: bool = False):
-        """Normalized coordinates in; sparse outgoing mass q [M, K] out."""
+        """One scene's normalized coordinates in; outgoing mass q [M, K] out."""
         # Project each support once instead of repeating a 128->64 projection
         # for every edge. These projections remain in the autograd graph.
         if return_appearance and self.appearance_head is None:
@@ -231,6 +236,10 @@ class MomentGaussianDecoder(nn.Module):
             self.cfg.hidden_dim, dim=-1
         )
         budget = self.cfg.budget_max * self.budget_head(features).sigmoid()
+        if self.cfg.budget_mode == 'scene_shared':
+            # Average AFTER sigmoid over all views/supports of this scene,
+            # BEFORE chunking. No detach: every support trains the budget head.
+            budget = budget.mean(dim=0, keepdim=True).expand_as(budget)
         chunks = []
         for start in range(0, len(points), self.cfg.chunk_size):
             stop = start + self.cfg.chunk_size

@@ -5,11 +5,11 @@ defaults:
   - _self_
 
 wandb:
-  name: final_plus_uniform
-  tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus, uniform_allocation]
+  name: final_plus_scene-shared
+  tags: [re10k, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus, scene_shared_budget]
 
 # Final++: Final + wider/deeper SH MLP (A) + appearance feature std (B).
-# Uniform ablation: q_ji = b_j / K; budget and appearance remain learned.
+# Scene-shared ablation: q_ji = mean_j(b_j) * a_ji; softmax remains learned.
 # Training length is inherited from re10k.yaml (trainer.max_steps); set it manually.
 model:
   encoder:
@@ -17,7 +17,8 @@ model:
     moment_decoder:
       feature_dim: 256
       hidden_dim: 64
-      allocation_mode: uniform
+      allocation_mode: learned
+      budget_mode: scene_shared
       appearance_2d: true
       separate_appearance: true  # Independent weights on the original 3D graph.
       appearance_capacity: true
