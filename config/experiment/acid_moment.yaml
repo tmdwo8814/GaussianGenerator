@@ -7,16 +7,18 @@ defaults:
 # Inherit ACID roots, optimizer, batch size, and checkpoint retention from acid.
 # Train to 80000 steps, then evaluate checkpoints at 20000/40000/60000/80000.
 wandb:
-  name: final_plus_acid
-  tags: [acid, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus]
+  name: final_plus_uniform_acid
+  tags: [acid, 256x256, moment_decoder, dpt256, appearance_2d, separate_weight, appearance_capacity, appearance_moments, final_plus, uniform_allocation]
 
-# Keep the model parameters identical to re10k_moment.yaml.
+# Keep the Final++ decoder architecture aligned with re10k_moment.yaml.
+# Uniform ablation: q_ji = b_j / K; budget and appearance remain learned.
 model:
   encoder:
     gs_params_head_type: moment
     moment_decoder:
       feature_dim: 256
       hidden_dim: 64
+      allocation_mode: uniform
       appearance_2d: true
       separate_appearance: true
       appearance_capacity: true

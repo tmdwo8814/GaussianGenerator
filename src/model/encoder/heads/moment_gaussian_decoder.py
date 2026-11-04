@@ -1,7 +1,8 @@
 """Support allocation -> moments -> renderable Gaussians.
 
 Notation in this file: j is a source SUPPORT and i is a destination SLOT.
-neighbors[j, k] = i, so softmax runs over outgoing candidates (k). Moments
+neighbors[j, k] = i, so softmax runs over outgoing candidates (k). The uniform
+ablation instead sends b_j / K to every candidate, keeping b_j learnable. Moments
 use index_add over destination i, whose incoming degree is NOT limited to k.
 The optional appearance path also reads context RGB and its raster layout,
 never cameras or target images.
@@ -31,6 +32,7 @@ class MomentDecoderCfg:
     feature_dim: int = 64
     hidden_dim: int = 64
     num_neighbors: int = 16
+    allocation_mode: str = 'learned'  # 'uniform': q[j,k] = b_j / actual K.
     chunk_size: int = 32768
     checkpoint_chunks: bool = True
     compile_kernels: bool = False  # Bounded CUDA tensor kernels, without CUDA graphs.
@@ -67,6 +69,8 @@ class MomentGaussianDecoder(nn.Module):
         self.cfg = cfg
         self._image_cache_key = None
         self._image_cache = None
+        if cfg.allocation_mode not in ('learned', 'uniform'):
+            raise ValueError("allocation_mode must be learned or uniform")
         if cfg.knn_backend not in ('auto', 'cupy', 'scipy'):
             raise ValueError('knn_backend must be auto, cupy or scipy')
         if cfg.knn_query_backend not in ('specialized', 'cupy'):
@@ -112,6 +116,13 @@ class MomentGaussianDecoder(nn.Module):
         # when incoming mass equals outgoing mass. No per-slot mass guarantee.
         nn.init.normal_(self.allocation_head[-1].weight, std=1e-3)
         nn.init.zeros_(self.allocation_head[-1].bias)
+        if cfg.allocation_mode == 'uniform':
+            # Keep checkpoint keys and RNG initialization identical to Final++.
+            # Only the scalar allocation scorer is unused; appearance still
+            # learns the shared relation features in allocation_head[0:2].
+            self.allocation_head[-1].requires_grad_(False)
+            if not cfg.separate_appearance:
+                self.allocation_head[0].requires_grad_(False)
         nn.init.zeros_(self.budget_head.weight)
         nn.init.constant_(self.budget_head.bias,
                           log(cfg.budget_init / (cfg.budget_max - cfg.budget_init)))
@@ -192,9 +203,14 @@ class MomentGaussianDecoder(nn.Module):
         hidden = (destination_projection[neighbors] + source_projection[:, None]
                   + F.linear(geometry, first.weight[:, 2 * self.cfg.feature_dim:], first.bias))
         hidden = self.allocation_head[1](hidden)
-        logits = self.allocation_head[2](hidden).squeeze(-1)
-        allocation = logits.softmax(dim=-1)  # sum_k A[j, k] = 1
-        mass = allocation * budget  # q[j, k] = A_ij * b_j
+        if self.cfg.allocation_mode == 'uniform':
+            # Use the actual candidate count (kNN may return fewer than cfg.K).
+            # Do not detach budget or the relation features used by appearance.
+            mass = budget.expand(-1, neighbors.shape[-1]) / neighbors.shape[-1]
+        else:
+            logits = self.allocation_head[2](hidden).squeeze(-1)
+            allocation = logits.softmax(dim=-1)  # sum_k A[j, k] = 1
+            mass = allocation * budget  # q[j, k] = A_ij * b_j
         if return_appearance:
             return mass, self.appearance_head(hidden).squeeze(-1)
         return mass
