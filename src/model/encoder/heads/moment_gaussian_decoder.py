@@ -39,6 +39,7 @@ class MomentDecoderCfg:
     knn_backend: str = 'auto'
     knn_query_backend: str = 'specialized'
     knn_workers: int = 1
+    budget_mode: str = 'support'  # 'fixed' uses budget_init for every support throughout training.
     budget_max: float = 2.0
     budget_init: float = log(2.0)
     scale_min: float = 1.0
@@ -71,6 +72,8 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError('knn_backend must be auto, cupy or scipy')
         if cfg.knn_query_backend not in ('specialized', 'cupy'):
             raise ValueError('knn_query_backend must be specialized or cupy')
+        if cfg.budget_mode not in ('support', 'fixed'):
+            raise ValueError('budget_mode must be support or fixed')
         if min(cfg.feature_dim, cfg.hidden_dim, cfg.num_neighbors,
                cfg.chunk_size, cfg.knn_workers) < 1:
             raise ValueError("Feature sizes, neighbor count, chunk size and workers must be positive")
@@ -115,6 +118,10 @@ class MomentGaussianDecoder(nn.Module):
         nn.init.zeros_(self.budget_head.weight)
         nn.init.constant_(self.budget_head.bias,
                           log(cfg.budget_init / (cfg.budget_max - cfg.budget_init)))
+        if cfg.budget_mode == 'fixed':
+            # Keep state_dict keys and RNG initialization identical to Final++.
+            # The unused head is frozen so it is excluded from the optimizer/DDP.
+            self.budget_head.requires_grad_(False)
         nn.init.zeros_(self.scale_head.weight)
         nn.init.constant_(self.scale_head.bias,
                           log((cfg.scale_init - cfg.scale_min) /
@@ -214,7 +221,11 @@ class MomentGaussianDecoder(nn.Module):
         destination_projection, source_projection = F.linear(features, projection_weight).split(
             self.cfg.hidden_dim, dim=-1
         )
-        budget = self.cfg.budget_max * self.budget_head(features).sigmoid()
+        if self.cfg.budget_mode == 'fixed':
+            # q[j,k] = budget_init * softmax(logits[j])[k]; allocation still learns.
+            budget = features.new_full((len(features), 1), self.cfg.budget_init)
+        else:
+            budget = self.cfg.budget_max * self.budget_head(features).sigmoid()
         chunks = []
         for start in range(0, len(points), self.cfg.chunk_size):
             stop = start + self.cfg.chunk_size
