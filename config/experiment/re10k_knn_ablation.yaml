@@ -13,7 +13,7 @@ model:
     pretrained_weights: /workspace/research/GaussianGenerator/pretrained_weights/Final++_re10k.ckpt
     freeze_scene_encoder: true
     moment_decoder:
-      num_neighbors: 4  # Includes self. Subsequent runs override this one value.
+      num_neighbors: 8  # Includes self. Subsequent runs override this one value.
       knn_backend: cupy
       knn_query_backend: cupy  # Same exact query for ALL K, including 16.
 

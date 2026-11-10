@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH -J GaussianGenerator-K4
+#SBATCH -J GaussianGenerator-K8
 #SBATCH --gres=gpu:high_perf:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -25,7 +25,7 @@ export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}"
 export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$PWD/.cache/wandb}"
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR"
 
-K="${K:-4}"
+K="${K:-8}"
 case "$K" in
     4|8|16|32) ;;
     *) echo "K must be one of 4, 8, 16, 32" >&2; exit 2 ;;
