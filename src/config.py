@@ -33,9 +33,12 @@ class TrainerCfg:
     val_check_interval: int | float | None
     gradient_clip_val: int | float | None
     num_nodes: int = 1
+    devices: int | str = "auto"
+    accumulate_grad_batches: int = 1
 
     # auto evaluation during training
     auto_eval: bool = False
+    auto_eval_during_training: bool = False
     eval_every_n_steps: int | None = None
     auto_eval_index_path: Optional[Path] = None
     auto_eval_save_image: bool = False

@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable, Any
@@ -22,6 +23,7 @@ from ..loss import Loss
 from ..loss.loss_point import Regr3D
 from ..loss.loss_ssim import ssim
 from ..misc.benchmarker import Benchmarker
+from ..misc.inference_timing import summarize_inference
 from ..misc.cam_utils import update_pose, get_pnp_pose
 from ..misc.image_io import prep_image, save_image, save_video
 from ..misc.LocalLogger import LOG_PATH, LocalLogger
@@ -64,6 +66,8 @@ class TestCfg:
     save_image: bool
     save_video: bool
     save_compare: bool
+    measure_fps: bool = False
+    fps_warmup_steps: int = 5
 
 
 @dataclass
@@ -241,6 +245,9 @@ class ModelWrapper(LightningModule):
     def on_test_start(self) -> None:
         # Each checkpoint must start with fresh metrics and timings.
         self.benchmarker = Benchmarker()
+        self._inference_records = []
+        if getattr(self.test_cfg, "measure_fps", False):
+            self.benchmarker = Benchmarker(synchronize_device=self.device)
         self._test_metric_sums = {
             k: torch.zeros((), device=self.device) for k in self._test_metric_names
         }
@@ -280,7 +287,7 @@ class ModelWrapper(LightningModule):
             for k in self._test_metric_names:
                 dist.all_reduce(self._test_overlap_sums[tag][k], op=dist.ReduceOp.SUM)
 
-    def _print_final_test_metrics(self, log_prefix="test", log_step=None) -> None:
+    def _print_final_test_metrics(self, log_prefix="test", log_step=None) -> dict | None:
         if self.global_rank != 0 or not self.test_cfg.compute_scores:
             return
         if self._test_metric_count.item() == 0:
@@ -311,13 +318,22 @@ class ModelWrapper(LightningModule):
         print(f"\n[{log_prefix} | Final Evaluation | global | all ranks]")
         print(tabulate(rows, headers=["Group", "PSNR", "SSIM", "LPIPS", "Num Samples"]))
 
+        if getattr(self.test_cfg, "measure_fps", False):
+            timing = self._test_inference_summary
+            log_payload[f"{log_prefix}/overall/fps"] = timing["fps"]
+            log_payload[f"{log_prefix}/overall/render_fps"] = timing["render_fps"]
+            log_payload[f"{log_prefix}/overall/num_timed_frames"] = timing["num_timed_frames"]
+            print(f"[{log_prefix}] FPS={timing['fps']:.3f}, render FPS={timing['render_fps']:.3f}")
+
+        log_payload[f"{log_prefix}/ckpt_step"] = (
+            self.global_step if log_step is None else log_step
+        )
+
         if wandb.run is not None:
-            log_payload[f"{log_prefix}/ckpt_step"] = (
-                self.global_step if log_step is None else log_step
-            )
             wandb.log(log_payload)
             for k, value in log_payload.items():
                 wandb.run.summary[k] = value
+        return log_payload
 
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
@@ -345,6 +361,14 @@ class ModelWrapper(LightningModule):
                     batch["target"]["far"],
                     (h, w),
                 )
+
+        if self.test_cfg.measure_fps:
+            self._inference_records.append({
+                "scene": batch["scene"][0],
+                "num_frames": v,
+                "encoder_seconds": self.benchmarker.execution_times["encoder"][-1],
+                "render_seconds": sum(self.benchmarker.execution_times["decoder"][-v:]),
+            })
 
         # compute scores
         if self.test_cfg.compute_scores:
@@ -441,14 +465,15 @@ class ModelWrapper(LightningModule):
                         extrinsics = rearrange(new_extrinsic, "(b v) i j -> b v i j", b=b, v=v)
 
         # Render Gaussians.
-        output = self.decoder.forward(
-            gaussians,
-            extrinsics,
-            batch["target"]["intrinsics"],
-            batch["target"]["near"],
-            batch["target"]["far"],
-            (h, w),
-        )
+        with self.benchmarker.time("decoder", num_calls=v):
+            output = self.decoder.forward(
+                gaussians,
+                extrinsics,
+                batch["target"]["intrinsics"],
+                batch["target"]["near"],
+                batch["target"]["far"],
+                (h, w),
+            )
 
         return output
 
@@ -456,10 +481,34 @@ class ModelWrapper(LightningModule):
         name = get_cfg()["wandb"]["name"]
         out_dir = self.test_cfg.output_path / name
         self._reduce_test_metric_buffers()
-        self._print_final_test_metrics(
+        if self.test_cfg.measure_fps:
+            if self.trainer.world_size != 1:
+                raise ValueError("Synchronized ablation FPS requires a single GPU")
+            self._test_inference_summary = summarize_inference(
+                self._inference_records, self.test_cfg.fps_warmup_steps
+            )
+        payload = self._print_final_test_metrics(
             log_prefix=getattr(self, "_auto_eval_log_prefix", "test"),
             log_step=getattr(self, "_auto_eval_step", None),
         )
+        if self.test_cfg.measure_fps and self.global_rank == 0:
+            if payload is None:
+                raise RuntimeError("FPS evaluation requires nonempty quality metrics")
+            self._test_result_payload = payload
+            out_dir.mkdir(parents=True, exist_ok=True)
+            result = {
+                "step": self._eval_step(),
+                "k": self.encoder.cfg.moment_decoder.num_neighbors,
+                "align_pose": self.test_cfg.align_pose,
+                "pose_align_steps": self.test_cfg.pose_align_steps,
+                "metrics": payload,
+                "timing": self._test_inference_summary,
+                "per_scene_timing": self._inference_records,
+            }
+            path = out_dir / "metrics.json"
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
+            temporary.replace(path)
         if self.trainer.world_size > 1:
             self.benchmarker.dump(out_dir / f"benchmark_rank{self.global_rank}.json")
             self.benchmarker.dump_memory(out_dir / f"peak_memory_rank{self.global_rank}.json")

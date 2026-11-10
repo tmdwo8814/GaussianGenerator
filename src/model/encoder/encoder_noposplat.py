@@ -52,6 +52,7 @@ class EncoderNoPoSplatCfg:
     pretrained_weights: str = ""
     pose_free: bool = True
     moment_decoder: MomentDecoderCfg = field(default_factory=MomentDecoderCfg)
+    freeze_scene_encoder: bool = False
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -85,6 +86,23 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         self.set_center_head(output_mode='pts3d', head_type='dpt', landscape_only=True,
                            depth_mode=('exp', -inf, inf), conf_mode=None,)
         self.set_gs_params_head(cfg, cfg.gs_params_head_type)
+
+        if cfg.freeze_scene_encoder:
+            if self.gs_params_head_type != 'moment':
+                raise ValueError("Freezing the scene encoder requires the moment decoder")
+            self.requires_grad_(False)
+            self.gaussian_decoder.requires_grad_(True)
+            self.train(self.training)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.cfg.freeze_scene_encoder:
+            # Lightning calls train() again after evaluation. Keep point/feature
+            # providers in eval mode as well as excluding them from autograd.
+            for name, module in self.named_children():
+                if name != 'gaussian_decoder':
+                    module.eval()
+        return self
 
     def set_center_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode

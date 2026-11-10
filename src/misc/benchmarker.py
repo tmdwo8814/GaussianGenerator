@@ -2,23 +2,28 @@ import json
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from time import time
+from time import perf_counter
 
 import numpy as np
 import torch
 
 
 class Benchmarker:
-    def __init__(self):
+    def __init__(self, synchronize_device=None):
         self.execution_times = defaultdict(list)
+        self.synchronize_device = synchronize_device
 
     @contextmanager
     def time(self, tag: str, num_calls: int = 1):
+        if self.synchronize_device is not None:
+            torch.cuda.synchronize(self.synchronize_device)
+        start_time = perf_counter()
         try:
-            start_time = time()
             yield
         finally:
-            end_time = time()
+            if self.synchronize_device is not None:
+                torch.cuda.synchronize(self.synchronize_device)
+            end_time = perf_counter()
             for _ in range(num_calls):
                 self.execution_times[tag].append((end_time - start_time) / num_calls)
 

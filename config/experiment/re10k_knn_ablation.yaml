@@ -1,0 +1,64 @@
+# @package _global_
+
+defaults:
+  - re10k_moment
+  - _self_
+
+wandb:
+  name: abl_K${model.encoder.moment_decoder.num_neighbors}
+  tags: [re10k, knn_ablation, frozen_scene_encoder, decoder_from_scratch]
+
+model:
+  encoder:
+    pretrained_weights: /workspace/research/GaussianGenerator/pretrained_weights/Final++_re10k.ckpt
+    freeze_scene_encoder: true
+    moment_decoder:
+      num_neighbors: 4  # Includes self. Subsequent runs override this one value.
+      knn_backend: cupy
+      knn_query_backend: cupy  # Same exact query for ALL K, including 16.
+
+data_loader:
+  train:
+    batch_size: 1
+    num_workers: 4
+  test:
+    batch_size: 1
+    num_workers: 4
+
+dataset:
+  re10k:
+    view_sampler:
+      warm_up_steps: 0  # Train on the final context distance range from step 0.
+
+optimizer:
+  lr: 0.0001
+  warm_up_steps: 500
+
+checkpointing:
+  load: null  # Initialization above is NOT a resume of the 140k-step training.
+  every_n_train_steps: 2000
+  save_top_k: -1
+  save_weights_only: false
+
+trainer:
+  devices: 1
+  num_nodes: 1
+  accumulate_grad_batches: 1
+  max_steps: 10000
+  val_check_interval: null
+  auto_eval: true
+  auto_eval_during_training: true
+  eval_every_n_steps: 2000
+
+train:
+  distiller: ''
+
+test:
+  compute_scores: true
+  align_pose: true  # Preserve the existing RE10K scoring protocol.
+  measure_fps: true
+  fps_warmup_steps: 5  # Excluded from FPS, still included in image quality scores.
+
+hydra:
+  run:
+    dir: outputs/abl/K${model.encoder.moment_decoder.num_neighbors}/${now:%Y-%m-%d_%H-%M-%S}

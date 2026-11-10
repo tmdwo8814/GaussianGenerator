@@ -7,7 +7,7 @@ import wandb
 import signal
 from colorama import Fore
 from jaxtyping import install_import_hook
-from lightning.pytorch import Trainer
+from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
@@ -30,6 +30,7 @@ with install_import_hook(
     from src.loss import get_losses
     from src.misc.LocalLogger import LocalLogger
     from src.misc.step_tracker import StepTracker
+    from src.misc.frozen_scene import load_scene_encoder
     from src.misc.wandb_tools import update_checkpoint_path
     from src.model.decoder import get_decoder
     from src.model.encoder import get_encoder
@@ -62,6 +63,9 @@ def get_eval_checkpoints(checkpoint_dir: Path, eval_every_n_steps: int) -> list[
 def train(cfg_dict: DictConfig):
     cfg = load_typed_root_config(cfg_dict)
     set_cfg(cfg_dict)
+    if (cfg.mode == "train" and cfg.model.encoder.freeze_scene_encoder
+            and not cfg.model.encoder.pretrained_weights):
+        raise ValueError("Frozen scene encoders require pretrained_weights")
 
     # Set up the output directory.
     output_dir = Path(
@@ -99,17 +103,23 @@ def train(cfg_dict: DictConfig):
         logger = LocalLogger()
 
     # Set up checkpointing.
-    callbacks.append(
-        ModelCheckpoint(
-            output_dir / "checkpoints",
-            every_n_train_steps=cfg.checkpointing.every_n_train_steps,
-            save_top_k=cfg.checkpointing.save_top_k,
-            save_weights_only=cfg.checkpointing.save_weights_only,
-            monitor="info/global_step",
-            mode="max",
+    if not cfg.trainer.auto_eval_during_training:
+        callbacks.append(
+            ModelCheckpoint(
+                output_dir / "checkpoints",
+                every_n_train_steps=cfg.checkpointing.every_n_train_steps,
+                save_top_k=cfg.checkpointing.save_top_k,
+                save_weights_only=cfg.checkpointing.save_weights_only,
+                monitor="info/global_step",
+                mode="max",
+            )
         )
-    )
-    callbacks[-1].CHECKPOINT_EQUALS_CHAR = '_'
+        callbacks[-1].CHECKPOINT_EQUALS_CHAR = '_'
+
+    if cfg.trainer.auto_eval_during_training:
+        from src.misc.knn_ablation import DecoderAblationEvalCallback
+
+        callbacks.append(DecoderAblationEvalCallback(cfg_dict, output_dir))
 
     # Prepare the checkpoint for loading.
     checkpoint_path = update_checkpoint_path(cfg.checkpointing.load, cfg.wandb)
@@ -122,22 +132,26 @@ def train(cfg_dict: DictConfig):
         num_nodes=cfg.trainer.num_nodes,
         accelerator="gpu",
         logger=logger,
-        devices="auto",
+        devices=cfg.trainer.devices,
         strategy=(
             "ddp_find_unused_parameters_true"
-            if torch.cuda.device_count() > 1
+            if cfg.trainer.devices != 1 and torch.cuda.device_count() > 1
             else "auto"
         ),
         callbacks=callbacks,
+        enable_checkpointing=not cfg.trainer.auto_eval_during_training,
         val_check_interval=cfg.trainer.val_check_interval,
         check_val_every_n_epoch=None,
         limit_val_batches=0 if cfg.trainer.val_check_interval is None else 1.0,
         enable_progress_bar=False,
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         max_steps=cfg.trainer.max_steps,
+        accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,
         inference_mode=False if cfg.test.align_pose else True,
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
+    if cfg.model.encoder.freeze_scene_encoder:
+        seed_everything(cfg_dict.seed + trainer.global_rank, workers=True)
 
     encoder, encoder_visualizer = get_encoder(cfg.model.encoder)
 
@@ -149,17 +163,20 @@ def train(cfg_dict: DictConfig):
     # Load the encoder weights.
     if cfg.model.encoder.pretrained_weights and cfg.mode == "train":
         weight_path = cfg.model.encoder.pretrained_weights
-        ckpt_weights = torch.load(weight_path, map_location='cpu', weights_only=False)
-        if 'model' in ckpt_weights:
-            ckpt_weights = ckpt_weights['model']
-            ckpt_weights = checkpoint_filter_fn(ckpt_weights, encoder)
-            missing_keys, unexpected_keys = encoder.load_state_dict(ckpt_weights, strict=False)
-        elif 'state_dict' in ckpt_weights:
-            ckpt_weights = ckpt_weights['state_dict']
-            ckpt_weights = {k[8:]: v for k, v in ckpt_weights.items() if k.startswith('encoder.')}
-            missing_keys, unexpected_keys = encoder.load_state_dict(ckpt_weights, strict=False)
+        if cfg.model.encoder.freeze_scene_encoder:
+            load_scene_encoder(encoder, weight_path)
         else:
-            raise ValueError(f"Invalid checkpoint format: {weight_path}")
+            ckpt_weights = torch.load(weight_path, map_location='cpu', weights_only=False)
+            if 'model' in ckpt_weights:
+                ckpt_weights = ckpt_weights['model']
+                ckpt_weights = checkpoint_filter_fn(ckpt_weights, encoder)
+                missing_keys, unexpected_keys = encoder.load_state_dict(ckpt_weights, strict=False)
+            elif 'state_dict' in ckpt_weights:
+                ckpt_weights = ckpt_weights['state_dict']
+                ckpt_weights = {k[8:]: v for k, v in ckpt_weights.items() if k.startswith('encoder.')}
+                missing_keys, unexpected_keys = encoder.load_state_dict(ckpt_weights, strict=False)
+            else:
+                raise ValueError(f"Invalid checkpoint format: {weight_path}")
 
     model_wrapper = ModelWrapper(
         cfg.optimizer,
@@ -182,7 +199,7 @@ def train(cfg_dict: DictConfig):
     if cfg.mode == "train":
         trainer.fit(model_wrapper, datamodule=data_module, ckpt_path=checkpoint_path)
 
-        if cfg.trainer.auto_eval:
+        if cfg.trainer.auto_eval and not cfg.trainer.auto_eval_during_training:
             eval_every_n_steps = (
                 cfg.trainer.eval_every_n_steps
                 if cfg.trainer.eval_every_n_steps is not None
