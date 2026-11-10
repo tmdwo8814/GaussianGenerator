@@ -1,7 +1,7 @@
-# RE10K KNN ablation (abl/K16)
+# RE10K KNN ablation (abl/K32)
 
 `re10k_knn_ablation` inherits the Final++ architecture from `re10k_moment`.
-The default is **K=16, including self**, one GPU, train batch size 1, 10,000
+The default is **K=32, including self**, one GPU, train batch size 1, 10,000
 optimizer steps, and a complete fixed-index evaluation after steps
 2,000 / 4,000 / 6,000 / 8,000 / 10,000. Evaluation blocks training and reuses
 the model on the same GPU, without allocating another backbone.
@@ -46,11 +46,11 @@ Slurm reserves one GPU. To run directly on physical GPU 2 of a four-GPU server:
 GPU_ID=2 bash scripts/train_re10k_knn_ablation.sh
 ```
 
-The script defaults to K=16. Later branches can use the same protocol by changing
+The script defaults to K=32. Other ablation values use the same protocol by changing
 only K (the output path and W&B name follow K automatically):
 
 ```bash
-K=32 sbatch --job-name=GaussianGenerator-K32 scripts/train_re10k_knn_ablation.sh
+K=16 sbatch --job-name=GaussianGenerator-K16 scripts/train_re10k_knn_ablation.sh
 ```
 
 Overrides are forwarded to Hydra. For example, a checkpoint path override:
@@ -79,15 +79,15 @@ the index must reference scenes present in the test dataset.
 
 ## Outputs and the paper table
 
-Each run writes under `outputs/abl/K16/<timestamp>/`:
+Each run writes under `outputs/abl/K32/<timestamp>/`:
 
 ```text
 ablation.json                              # Source checkpoint, seed, GPU, config, index.
 metrics.csv                                # One row per evaluated optimizer step.
 checkpoints/step_00002000.ckpt               # Model + optimizer/scheduler state.
-evaluation/step_00002000/abl_K16/metrics.json  # Quality metrics + FPS + per-scene timings.
-evaluation/step_00002000/abl_K16/benchmark.json
-evaluation/step_00002000/abl_K16/peak_memory.json
+evaluation/step_00002000/abl_K32/metrics.json  # Quality metrics + FPS + per-scene timings.
+evaluation/step_00002000/abl_K32/benchmark.json
+evaluation/step_00002000/abl_K32/peak_memory.json
 ...                                        # Through step_00010000.
 ```
 
