@@ -60,8 +60,8 @@ CUDA_VISIBLE_DEVICES=0,1,2 OMP_NUM_THREADS=1 python -u -m src.main \
 
 ## Training and evaluation
 
-- 10,000 optimizer steps; checkpoints at 5,000 and 10,000.
-- 현재 `src.main` 흐름을 유지한다. 학습 종료 후 두 checkpoint를 순서대로 평가한다.
+- 30,000 optimizer steps; checkpoints at 6,000, 12,000, 18,000, 24,000 and 30,000.
+- 현재 `src.main` 흐름을 유지한다. 학습 종료 후 다섯 checkpoint를 순서대로 평가한다.
 - 기존 `re10k_moment`의 dataset roots, train/test splits, augmentation,
   batch size, GPU 설정, dataloader seeds, evaluation index를 사용한다.
 - 학습 context 2개, target 1개; 평가 view는 기존
@@ -73,8 +73,8 @@ CUDA_VISIBLE_DEVICES=0,1,2 OMP_NUM_THREADS=1 python -u -m src.main \
 
 `outputs/exp_regression_readout_re10k/<timestamp>/`와
 `outputs/exp_egf_readout_re10k/<timestamp>/`에 config/checkpoints/logs가 저장된다.
-W&B의 `auto_eval/ckpt_step` 5000/10000에서 Average 및 overlap별
-PSNR/SSIM/LPIPS를 비교한다. 주 비교 시점은 10k로 고정한다.
+W&B의 `auto_eval/ckpt_step` 6000/12000/18000/24000/30000에서 Average 및 overlap별
+PSNR/SSIM/LPIPS를 비교한다. 주 비교 시점은 30k로 고정한다.
 
 ## W&B logging
 
@@ -89,11 +89,11 @@ SSH launcher는 `wandb.mode=online`으로 `WandbLogger`를 사용한다.
 - 학습: `loss/mse`, `loss/lpips`, `train/psnr_probabilistic`, learning rate.
 - 평가: `auto_eval/overall/psnr`, `auto_eval/overall/ssim`, `auto_eval/overall/lpips`.
 - Overlap별 평가: `auto_eval/{small,medium,large}/{psnr,ssim,lpips}`.
-- 평가 그래프 x축: `auto_eval/ckpt_step` (5000, 10000).
+- 평가 그래프 x축: `auto_eval/ckpt_step` (6000, 12000, 18000, 24000, 30000).
 
-평가 결과는 10k 학습 종료 후 해당 학습 run에 기록된다. 이전 checkpoint의
-5000을 W&B의 전역 history step으로 사용하지 않고 별도 metric 축으로 기록하므로,
-이미 10k까지 기록된 학습 로그 때문에 5k 평가값이 누락되지 않는다.
+평가 결과는 30k 학습 종료 후 해당 학습 run에 기록된다. 이전 checkpoint의
+6000 등을 W&B의 전역 history step으로 사용하지 않고 별도 metric 축으로 기록하므로,
+이미 30k까지 기록된 학습 로그 때문에 이전 checkpoint 평가값이 누락되지 않는다.
 온라인 업로드에는 서버의 W&B 인증과 네트워크 연결이 필요하다.
 
 ## Regression and shared appearance

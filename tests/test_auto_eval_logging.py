@@ -156,19 +156,20 @@ class AutoEvalLoggingTests(unittest.TestCase):
         remote.logger.experiment.define_metric.assert_not_called()
         self.namespace["wandb"].log.assert_not_called()
 
-    def test_5k_and_10k_evaluation_log_after_10k_training_on_checkpoint_axis(self):
+    def test_6k_intervals_log_after_30k_training_on_checkpoint_axis(self):
         model = self.model()
-        model.global_step = 10000
-        for step, psnr in ((5000, 24), (10000, 25)):
+        model.global_step = 30000
+        steps = [6000, 12000, 18000, 24000, 30000]
+        for psnr, step in enumerate(steps, start=24):
             model._auto_eval_step = step
             model.on_test_start()
             self.add(model, psnr, .8, .15, "medium")
             self.finish(model)
         calls = self.namespace["wandb"].log.call_args_list
-        self.assertEqual([call.args[0]['auto_eval/ckpt_step'] for call in calls], [5000, 10000])
-        self.assertEqual([call.args[0]['auto_eval/overall/psnr'] for call in calls], [24, 25])
+        self.assertEqual([call.args[0]['auto_eval/ckpt_step'] for call in calls], steps)
+        self.assertEqual([call.args[0]['auto_eval/overall/psnr'] for call in calls], [24, 25, 26, 27, 28])
         self.assertTrue(all('step' not in call.kwargs for call in calls))
-        self.assertEqual(self.namespace["wandb"].run.summary['auto_eval/ckpt_step'], 10000)
+        self.assertEqual(self.namespace["wandb"].run.summary['auto_eval/ckpt_step'], 30000)
 
     def test_empty_disabled_and_no_wandb_run(self):
         model = self.model()
