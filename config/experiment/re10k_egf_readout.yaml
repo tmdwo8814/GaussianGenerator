@@ -1,0 +1,36 @@
+# @package _global_
+
+defaults:
+  - re10k_moment
+  - _self_
+
+wandb:
+  name: egf_readout_re10k
+  tags: [re10k, final_plus, frozen_beam, geometry_readout, egf]
+
+model:
+  encoder:
+    pretrained_weights: /workspace/research/GaussianGenerator/pretrained_weights/Final++_re10k.ckpt
+    moment_decoder:
+      geometry_readout_only: true
+      geometry_mode: egf
+
+dataset:
+  re10k:
+    view_sampler:
+      warm_up_steps: 0  # Same train split; start with the final 45-90 frame gaps.
+
+optimizer:
+  lr: 0.0001
+  warm_up_steps: 500
+
+trainer:
+  max_steps: 10000
+  eval_every_n_steps: 5000
+  auto_eval: true
+  auto_eval_index_path: assets/evaluation_index_re10k.json
+
+checkpointing:
+  load: null  # Weights-only initialization, never resume the Final++ step.
+  every_n_train_steps: 5000
+  save_top_k: -1

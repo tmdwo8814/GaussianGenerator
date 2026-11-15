@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - re10k_egf_readout
+  - _self_
+
+wandb:
+  name: regression_readout_re10k
+  tags: [re10k, final_plus, frozen_beam, geometry_readout, regression]
+
+model:
+  encoder:
+    moment_decoder:
+      geometry_mode: regression
+      regression_evidence_dim: 128
+      regression_hidden_dim: 256
+      regression_init_scale: 0.01

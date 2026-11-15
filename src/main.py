@@ -30,6 +30,7 @@ with install_import_hook(
     from src.loss import get_losses
     from src.misc.LocalLogger import LocalLogger
     from src.misc.step_tracker import StepTracker
+    from src.misc.geometry_readout import initialize_geometry_readout
     from src.misc.wandb_tools import update_checkpoint_path
     from src.model.decoder import get_decoder
     from src.model.encoder import get_encoder
@@ -146,8 +147,13 @@ def train(cfg_dict: DictConfig):
         distiller = get_distiller(cfg.train.distiller)
         distiller = distiller.eval()
 
-    # Load the encoder weights.
-    if cfg.model.encoder.pretrained_weights and cfg.mode == "train":
+    # Geometry readout runs load Final++ weights, then selectively randomize
+    # heads. A genuine experiment resume is restored by Trainer.fit instead.
+    readout_only = (cfg.model.encoder.gs_params_head_type == 'moment'
+                    and cfg.model.encoder.moment_decoder.geometry_readout_only)
+    if readout_only and cfg.mode == 'train' and checkpoint_path is None:
+        initialize_geometry_readout(encoder, cfg.model.encoder.pretrained_weights, cfg_dict.seed)
+    elif not readout_only and cfg.model.encoder.pretrained_weights and cfg.mode == "train":
         weight_path = cfg.model.encoder.pretrained_weights
         ckpt_weights = torch.load(weight_path, map_location='cpu', weights_only=False)
         if 'model' in ckpt_weights:

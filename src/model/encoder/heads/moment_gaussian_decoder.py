@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
+from .geometry_regression_head import GeometryRegressionHead
 from ...types import Gaussians
 from ..common.sparse_knn import build_knn, validate_points
 from ..common.sparse_feature_pool import pool_features
@@ -59,6 +60,11 @@ class MomentDecoderCfg:
     appearance_variance_epsilon: float = 1e-6
     checkpoint_appearance: bool = True  # Recompute one complete capacity scene in backward.
     log_every_n_steps: int = 50  # 0 disables detached diagnostics
+    geometry_readout_only: bool = False  # Freeze encoder, BEAM and appearance.
+    geometry_mode: str = 'egf'  # egf or regression; switches both mean and covariance.
+    regression_evidence_dim: int = 128
+    regression_hidden_dim: int = 256
+    regression_init_scale: float = 0.01  # Cholesky std in scene-normalized coordinates.
 
 
 class MomentGaussianDecoder(nn.Module):
@@ -67,6 +73,15 @@ class MomentGaussianDecoder(nn.Module):
         self.cfg = cfg
         self._image_cache_key = None
         self._image_cache = None
+        if cfg.geometry_mode not in ('egf', 'regression'):
+            raise ValueError('geometry_mode must be egf or regression')
+        if cfg.geometry_mode == 'regression' and not cfg.geometry_readout_only:
+            raise ValueError('Regression requires geometry_readout_only=True')
+        if cfg.geometry_readout_only and not cfg.appearance_capacity:
+            raise ValueError('Geometry readout experiments require the Final++ appearance_capacity path')
+        if (min(cfg.regression_evidence_dim, cfg.regression_hidden_dim) < 1
+                or not isfinite(cfg.regression_init_scale) or not 0 < cfg.regression_init_scale <= 1):
+            raise ValueError('Regression dimensions must be positive and init_scale must be in (0, 1]')
         if cfg.knn_backend not in ('auto', 'cupy', 'scipy'):
             raise ValueError('knn_backend must be auto, cupy or scipy')
         if cfg.knn_query_backend not in ('specialized', 'cupy'):
@@ -159,6 +174,47 @@ class MomentGaussianDecoder(nn.Module):
                     )
                     self.appearance_sh_head = nn.Linear(cfg.appearance_dim, 3 * self.d_sh, bias=False)
                     nn.init.zeros_(self.appearance_sh_head.weight)
+
+        self.regression_head = None
+        if cfg.geometry_mode == 'regression':
+            # Adding this head must not perturb shared Final++ initialization.
+            with torch.random.fork_rng(devices=[]):
+                self.regression_head = GeometryRegressionHead(
+                    cfg.feature_dim, cfg.regression_evidence_dim,
+                    cfg.regression_hidden_dim, cfg.regression_init_scale,
+                )
+        if cfg.geometry_readout_only:
+            self.enable_geometry_readout_training()
+
+    def enable_geometry_readout_training(self):
+        self.requires_grad_(False)
+        self.scale_head.requires_grad_(True)
+        if self.regression_head is not None:
+            self.regression_head.requires_grad_(True)
+        self.train(self.training)
+
+    def reset_geometry_readout(self, seed: int):
+        """Call AFTER loading Final++; shared scale init is identical in both arms."""
+        if not self.cfg.geometry_readout_only:
+            raise ValueError('Selective reset requires geometry_readout_only=True')
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            nn.init.normal_(self.scale_head.weight, std=1e-3)
+            nn.init.constant_(self.scale_head.bias,
+                              log((self.cfg.scale_init - self.cfg.scale_min) /
+                                  (self.cfg.scale_max - self.cfg.scale_init)))
+            if self.regression_head is not None:
+                self.regression_head.reset_parameters()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.cfg.geometry_readout_only:
+            for module in self.children():
+                module.eval()
+            self.scale_head.train(mode)
+            if self.regression_head is not None:
+                self.regression_head.train(mode)
+        return self
 
     def _image_neighbors(self, image_shape, device):
         key = (tuple(image_shape), tuple(self.cfg.appearance_2d_radii), device)
@@ -437,6 +493,9 @@ class MomentGaussianDecoder(nn.Module):
                 raise ValueError("appearance_2d requires context RGB [B,M,3] on the points device")
             image = self._image_neighbors(image_shape, points.device)
 
+        if self.cfg.geometry_readout_only:
+            return self._forward_geometry_readout(points, features, rgb, image, diagnostics)
+
         moments = []
         contexts, statistics, appearance_features = [], [], []
         completed_scenes = []
@@ -537,3 +596,56 @@ class MomentGaussianDecoder(nn.Module):
                         ) * self.sh_mask
                         diagnostics['context_sh_rms'] = extra_sh.square().mean().sqrt()
             return gaussians
+
+    def _forward_geometry_readout(self, points, features, rgb, image, diagnostics):
+        """Only the rendered mean/covariance readout gets gradients.
+
+        The frozen appearance reader ALWAYS uses the original fitted center,
+        even in regression mode. SH and opacity therefore remain identical.
+        """
+        completed, statistics = [], []
+        with torch.autocast(device_type=points.device.type, enabled=False):
+            with torch.no_grad():
+                points, features, rgb = points.detach().float(), features.detach().float(), rgb.detach().float()
+                validate_points(points)
+                scene_scales = points.norm(dim=-1).median(dim=-1).values.clamp_min(self.cfg.scene_epsilon)
+            for scene_points, scene_features, scene_rgb, scene_scale in zip(
+                    points, features, rgb, scene_scales):
+                with torch.no_grad():
+                    neighbors = build_knn(
+                        scene_points, self.cfg.num_neighbors, self.cfg.knn_workers,
+                        self.cfg.knn_backend, check_finite=False,
+                        query_backend=self.cfg.knn_query_backend,
+                    )
+                    normalized = scene_points / scene_scale
+                    q, scores = self.predict_allocation(normalized, scene_features, neighbors,
+                                                        return_appearance=True)
+                    mass, fitted_mean, covariance, pooled, weights = self.aggregate_moments(
+                        normalized, scene_features, neighbors, q, return_weights=True,
+                    )
+                    raw_sh, report = self._capacity_scene(
+                        normalized, scene_features, scene_rgb, fitted_mean, pooled,
+                        weights, scores, neighbors, image, diagnostics is not None,
+                    )
+                means = fitted_mean
+                if self.regression_head is not None:
+                    means, covariance = self.regression_head(
+                        normalized, scene_features, pooled, mass, weights, neighbors,
+                        chunk_size=self.cfg.chunk_size, checkpoint_chunks=self.cfg.checkpoint_chunks,
+                        mass_epsilon=self.cfg.mass_epsilon,
+                    )
+                completed.append(self.build_gaussians(
+                    mass, means, covariance, pooled, scene_scale, appearance_harmonics=raw_sh,
+                ))
+                if report is not None:
+                    statistics.append(report)
+            if diagnostics is not None:
+                for key in statistics[0]:
+                    values = torch.stack([report[key] for report in statistics])
+                    diagnostics[key] = (values.square().mean().sqrt()
+                                        if key in ('base_sh_rms', 'extra_sh_rms', 'feature_std_rms')
+                                        else values.mean())
+            return Gaussians(**{
+                key: torch.cat([getattr(scene, key) for scene in completed], dim=0)
+                for key in ('means', 'covariances', 'harmonics', 'opacities')
+            })

@@ -12,6 +12,7 @@ from .backbone.croco.misc import transpose_to_landscape
 from .heads import head_factory
 from .heads.dpt_feature_head import create_dpt_feature_head
 from .heads.moment_gaussian_decoder import MomentDecoderCfg, MomentGaussianDecoder
+from ...misc.geometry_readout import freeze_geometry_readout
 from ...dataset.shims.bounds_shim import apply_bounds_shim
 from ...dataset.shims.normalize_shim import apply_normalize_shim
 from ...dataset.shims.patch_shim import apply_patch_shim
@@ -85,6 +86,17 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         self.set_center_head(output_mode='pts3d', head_type='dpt', landscape_only=True,
                            depth_mode=('exp', -inf, inf), conf_mode=None,)
         self.set_gs_params_head(cfg, cfg.gs_params_head_type)
+        if cfg.gs_params_head_type == 'moment' and cfg.moment_decoder.geometry_readout_only:
+            freeze_geometry_readout(self)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if (self.gs_params_head_type == 'moment'
+                and self.cfg.moment_decoder.geometry_readout_only):
+            for name, module in self.named_children():
+                if name != 'gaussian_decoder':
+                    module.eval()
+        return self
 
     def set_center_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
