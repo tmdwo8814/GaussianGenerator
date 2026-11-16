@@ -62,30 +62,35 @@ class GeometryReadoutTests(unittest.TestCase):
 
     def initialized(self, mode='regression', **overrides):
         decoder_cfg = cfg(appearance_moments=True, appearance_mlp_depth=2,
-                          geometry_readout_only=True, geometry_mode=mode,
-                          regression_evidence_dim=7, regression_hidden_dim=11, **overrides)
+                          geometry_readout_only=True, geometry_mode=mode, **overrides)
         encoder = tiny_encoder(decoder_cfg)
         with contextlib.redirect_stdout(io.StringIO()):
             initialization.initialize_geometry_readout(encoder, str(self.checkpoint), 111123)
         return encoder
 
-    def test_shared_weights_loaded_exactly_and_scale_reset_matches_both_arms(self):
+    def test_shared_weights_loaded_exactly_and_only_selected_readout_resets(self):
         regression = self.initialized()
         egf = self.initialized('egf')
         for encoder in (regression, egf):
             for key, value in self.source.state_dict().items():
-                if not key.startswith('gaussian_decoder.scale_head.'):
+                if encoder is regression or not key.startswith('gaussian_decoder.scale_head.'):
                     torch.testing.assert_close(encoder.state_dict()[key], value, rtol=0, atol=0)
-        for key, value in egf.gaussian_decoder.scale_head.state_dict().items():
-            torch.testing.assert_close(regression.gaussian_decoder.scale_head.state_dict()[key], value,
-                                       rtol=0, atol=0)
         self.assertFalse(torch.equal(egf.gaussian_decoder.scale_head.weight,
                                      self.source.gaussian_decoder.scale_head.weight))
         trainable = {name for name, p in regression.named_parameters() if p.requires_grad}
         self.assertTrue(trainable)
-        self.assertTrue(all(name.startswith(('gaussian_decoder.regression_head.',
-                                             'gaussian_decoder.scale_head.')) for name in trainable))
+        self.assertEqual(trainable, {'gaussian_decoder.regression_head.readout.weight',
+                                     'gaussian_decoder.regression_head.readout.bias'})
         self.assertEqual(sum(p.numel() for p in egf.parameters() if p.requires_grad), 6)
+
+    def test_production_width_uses_one_linear_and_exactly_2570_trainable_parameters(self):
+        model = Decoder(cfg(feature_dim=256, geometry_readout_only=True, geometry_mode='regression'))
+        linears = [module for module in model.regression_head.modules() if isinstance(module, nn.Linear)]
+        self.assertEqual(len(linears), 1)
+        self.assertEqual((linears[0].in_features, linears[0].out_features), (256, 10))
+        self.assertEqual(sum(p.numel() for p in model.parameters() if p.requires_grad), 2570)
+        self.assertFalse(any(p.requires_grad for p in model.scale_head.parameters()))
+        self.assertFalse(hasattr(model.regression_head, 'evidence_mlp'))
 
     def test_train_eval_transitions_keep_frozen_modules_in_eval(self):
         model = self.initialized()
@@ -97,28 +102,45 @@ class GeometryReadoutTests(unittest.TestCase):
             self.assertFalse(model.gaussian_param_head.training)
             self.assertFalse(model.gaussian_decoder.appearance_reader.training)
             self.assertFalse(model.gaussian_decoder.allocation_head.training)
-            self.assertTrue(model.gaussian_decoder.scale_head.training)
+            self.assertFalse(model.gaussian_decoder.scale_head.training)
             self.assertTrue(model.gaussian_decoder.regression_head.training)
 
-    def test_regression_changes_both_geometry_attributes_but_never_sh_or_opacity(self):
+    def test_regression_changes_geometry_and_opacity_but_preserves_color(self):
         reg = self.initialized().gaussian_decoder
         egf = self.initialized('egf').gaussian_decoder
         with torch.no_grad():
             source = self.source.gaussian_decoder(**self.inputs)
             a, b = reg(**self.inputs), egf(**self.inputs)
             torch.testing.assert_close(b.means, source.means, rtol=0, atol=0)
-            for name in ('harmonics', 'opacities'):
-                torch.testing.assert_close(getattr(a, name), getattr(source, name), rtol=0, atol=0)
-                torch.testing.assert_close(getattr(b, name), getattr(source, name), rtol=0, atol=0)
+            torch.testing.assert_close(a.harmonics, source.harmonics, rtol=0, atol=0)
+            torch.testing.assert_close(b.harmonics, source.harmonics, rtol=0, atol=0)
+            torch.testing.assert_close(b.opacities, source.opacities, rtol=0, atol=0)
             self.assertGreater((a.means - b.means).abs().max().item(), 1e-4)
             self.assertGreater((a.covariances - b.covariances).abs().max().item(), 1e-4)
-            reg.regression_head.readout[-1].bias[0].add_(1.)
+            self.assertGreater((a.opacities - b.opacities).abs().max().item(), 1e-4)
+            reg.regression_head.readout.bias[0].add_(1.)
             changed = reg(**self.inputs)
             torch.testing.assert_close(changed.harmonics, a.harmonics, rtol=0, atol=0)
             torch.testing.assert_close(changed.opacities, a.opacities, rtol=0, atol=0)
             for value in attributes(changed):
                 self.assertTrue(torch.isfinite(value).all())
             self.assertTrue((torch.linalg.eigvalsh(changed.covariances) > 0).all())
+            self.assertTrue(((changed.opacities > 0) & (changed.opacities < 1)).all())
+
+    def test_opacity_has_its_own_learned_output_and_scale_head_is_unused(self):
+        model = self.initialized().gaussian_decoder
+        with torch.no_grad():
+            original = model(**self.inputs)
+            model.regression_head.readout.bias[9].add_(1.)
+            changed = model(**self.inputs)
+            self.assertGreater((changed.opacities - original.opacities).abs().max().item(), .1)
+            for name in ('means', 'covariances', 'harmonics'):
+                torch.testing.assert_close(getattr(changed, name), getattr(original, name), rtol=0, atol=0)
+            model.scale_head.weight.add_(100.)
+            model.scale_head.bias.add_(100.)
+            same = model(**self.inputs)
+            for a, b in zip(attributes(changed), attributes(same)):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
 
     def test_only_geometry_parameters_update_and_inputs_are_detached(self):
         for mode in ('regression', 'egf'):
@@ -129,7 +151,8 @@ class GeometryReadoutTests(unittest.TestCase):
                 inputs = {key: value.clone().requires_grad_() if isinstance(value, torch.Tensor) else value
                           for key, value in self.inputs.items()}
                 result = model(**inputs)
-                loss = result.means.square().mean() + 1000 * result.covariances.square().mean()
+                loss = (result.means.square().mean() + 1000 * result.covariances.square().mean()
+                        + (result.opacities - .2).square().mean())
                 loss.backward()
                 for name, parameter in encoder.named_parameters():
                     if parameter.requires_grad:
@@ -141,30 +164,32 @@ class GeometryReadoutTests(unittest.TestCase):
                 optimizer = torch.optim.AdamW([p for p in encoder.parameters() if p.requires_grad], lr=1e-3)
                 optimizer.step()
                 for name, value in encoder.state_dict().items():
-                    if not name.startswith(('gaussian_decoder.scale_head.', 'gaussian_decoder.regression_head.')):
+                    train_prefix = ('gaussian_decoder.regression_head.' if mode == 'regression'
+                                    else 'gaussian_decoder.scale_head.')
+                    if not name.startswith(train_prefix):
                         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
-                self.assertFalse(torch.equal(model.scale_head.weight, before['gaussian_decoder.scale_head.weight']))
+                changed_name = train_prefix + ('readout.weight' if mode == 'regression' else 'weight')
+                self.assertFalse(torch.equal(encoder.state_dict()[changed_name], before[changed_name]))
+                if mode == 'regression':
+                    self.assertGreater(model.regression_head.readout.weight.grad[9].abs().sum().item(), 0)
 
-    def test_incoming_evidence_matches_dense_reference_even_when_incoming_degree_exceeds_k(self):
+    def test_single_linear_reads_existing_incoming_pool_without_another_feature_encoder(self):
         model = self.initialized().gaussian_decoder
         head = copy.deepcopy(model.regression_head).double()
         points, features = torch.randn(4, 3, dtype=torch.double), torch.randn(4, 5, dtype=torch.double)
         neighbors = torch.tensor([[0, 1], [1, 0], [2, 0], [3, 0]])
         q = torch.tensor([[.2, .8], [.3, .7], [.4, .6], [.5, .5]], dtype=torch.double)
-        mass, _, _, pooled, weights = model.aggregate_moments(points, features, neighbors, q,
-                                                              return_weights=True)
+        _, _, _, pooled, weights = model.aggregate_moments(points, features, neighbors, q,
+                                                          return_weights=True)
         observed = []
         handle = head.readout.register_forward_pre_hook(lambda module, args: observed.append(args[0].detach()))
-        head(points, features, pooled, mass, weights, neighbors, chunk_size=3,
-             checkpoint_chunks=False, mass_epsilon=model.cfg.mass_epsilon)
+        head(points, pooled)
         handle.remove()
         expected = []
         for slot in range(4):
             source, edge = (neighbors == slot).nonzero(as_tuple=True)
-            delta = points[source] - points[slot]
-            values = head.evidence_mlp(torch.cat((features[source], delta, delta.square().sum(-1, keepdim=True)), -1))
-            expected.append((weights[source, edge, None] * values).sum(0))
-        actual = torch.cat(observed)[:, 10:10 + head.evidence_dim]
+            expected.append((weights[source, edge, None] * features[source]).sum(0))
+        actual = torch.cat(observed)
         torch.testing.assert_close(actual, torch.stack(expected), rtol=1e-10, atol=1e-12)
 
     def test_checkpointed_chunks_match_eager_outputs_and_gradients(self):
@@ -175,7 +200,8 @@ class GeometryReadoutTests(unittest.TestCase):
         outputs = []
         for model in (a, b):
             value = model(**self.inputs)
-            (value.means.square().mean() + value.covariances.square().mean()).backward()
+            (value.means.square().mean() + value.covariances.square().mean()
+             + value.opacities.square().mean()).backward()
             outputs.append(value)
         for x, y in zip(attributes(outputs[0]), attributes(outputs[1])):
             torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-7)
@@ -197,8 +223,7 @@ class GeometryReadoutTests(unittest.TestCase):
     def test_saved_regression_checkpoint_replays_without_reset(self):
         model = self.initialized().gaussian_decoder
         with torch.no_grad():
-            model.regression_head.readout[-1].bias.add_(.2)
-            model.scale_head.weight.add_(.3)
+            model.regression_head.readout.bias.add_(.2)
             expected = model(**self.inputs)
         restored = Decoder(copy.deepcopy(model.cfg))
         restored.load_state_dict(model.state_dict(), strict=True)
@@ -225,9 +250,15 @@ class GeometryReadoutTests(unittest.TestCase):
             self.assertEqual(config.data_loader, original.data_loader)
             self.assertEqual(config.test, original.test)
             self.assertEqual(config.loss, original.loss)
-            self.assertEqual(config.trainer.max_steps, 30000)
-            self.assertEqual(config.trainer.eval_every_n_steps, 6000)
-            self.assertEqual(config.checkpointing.every_n_train_steps, 6000)
+            regression = decoder.geometry_mode == 'regression'
+            self.assertEqual(config.trainer.max_steps, 10000 if regression else 30000)
+            self.assertEqual(config.trainer.eval_every_n_steps, 5000 if regression else 6000)
+            self.assertEqual(config.checkpointing.every_n_train_steps, 5000 if regression else 6000)
+            if regression:
+                self.assertEqual(config.trainer.devices, 4)
+                steps = list(range(config.trainer.eval_every_n_steps, config.trainer.max_steps + 1,
+                                   config.trainer.eval_every_n_steps))
+                self.assertEqual(steps, [5000, 10000])
             self.assertIsNone(config.checkpointing.load)
             self.assertEqual(config.trainer.auto_eval_index_path, original.trainer.auto_eval_index_path)
             self.assertEqual(config.dataset.re10k.view_sampler.warm_up_steps, 0)

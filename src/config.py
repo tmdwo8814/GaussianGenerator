@@ -33,6 +33,7 @@ class TrainerCfg:
     val_check_interval: int | float | None
     gradient_clip_val: int | float | None
     num_nodes: int = 1
+    devices: int | str = 'auto'
 
     # auto evaluation during training
     auto_eval: bool = False

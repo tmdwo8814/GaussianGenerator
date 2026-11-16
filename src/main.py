@@ -123,7 +123,7 @@ def train(cfg_dict: DictConfig):
         num_nodes=cfg.trainer.num_nodes,
         accelerator="gpu",
         logger=logger,
-        devices="auto",
+        devices=cfg.trainer.devices,
         strategy=(
             "ddp_find_unused_parameters_true"
             if torch.cuda.device_count() > 1

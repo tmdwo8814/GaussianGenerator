@@ -61,9 +61,7 @@ class MomentDecoderCfg:
     checkpoint_appearance: bool = True  # Recompute one complete capacity scene in backward.
     log_every_n_steps: int = 50  # 0 disables detached diagnostics
     geometry_readout_only: bool = False  # Freeze encoder, BEAM and appearance.
-    geometry_mode: str = 'egf'  # egf or regression; switches both mean and covariance.
-    regression_evidence_dim: int = 128
-    regression_hidden_dim: int = 256
+    geometry_mode: str = 'egf'  # regression replaces mean, covariance AND opacity.
     regression_init_scale: float = 0.01  # Cholesky std in scene-normalized coordinates.
 
 
@@ -79,9 +77,8 @@ class MomentGaussianDecoder(nn.Module):
             raise ValueError('Regression requires geometry_readout_only=True')
         if cfg.geometry_readout_only and not cfg.appearance_capacity:
             raise ValueError('Geometry readout experiments require the Final++ appearance_capacity path')
-        if (min(cfg.regression_evidence_dim, cfg.regression_hidden_dim) < 1
-                or not isfinite(cfg.regression_init_scale) or not 0 < cfg.regression_init_scale <= 1):
-            raise ValueError('Regression dimensions must be positive and init_scale must be in (0, 1]')
+        if not isfinite(cfg.regression_init_scale) or not 0 < cfg.regression_init_scale <= 1:
+            raise ValueError('Regression init_scale must be in (0, 1]')
         if cfg.knn_backend not in ('auto', 'cupy', 'scipy'):
             raise ValueError('knn_backend must be auto, cupy or scipy')
         if cfg.knn_query_backend not in ('specialized', 'cupy'):
@@ -180,40 +177,42 @@ class MomentGaussianDecoder(nn.Module):
             # Adding this head must not perturb shared Final++ initialization.
             with torch.random.fork_rng(devices=[]):
                 self.regression_head = GeometryRegressionHead(
-                    cfg.feature_dim, cfg.regression_evidence_dim,
-                    cfg.regression_hidden_dim, cfg.regression_init_scale,
+                    cfg.feature_dim, cfg.regression_init_scale,
                 )
         if cfg.geometry_readout_only:
             self.enable_geometry_readout_training()
 
     def enable_geometry_readout_training(self):
         self.requires_grad_(False)
-        self.scale_head.requires_grad_(True)
         if self.regression_head is not None:
             self.regression_head.requires_grad_(True)
+        else:
+            self.scale_head.requires_grad_(True)
         self.train(self.training)
 
     def reset_geometry_readout(self, seed: int):
-        """Call AFTER loading Final++; shared scale init is identical in both arms."""
+        """Call AFTER loading Final++; reset only the chosen trainable readout."""
         if not self.cfg.geometry_readout_only:
             raise ValueError('Selective reset requires geometry_readout_only=True')
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(seed)
-            nn.init.normal_(self.scale_head.weight, std=1e-3)
-            nn.init.constant_(self.scale_head.bias,
-                              log((self.cfg.scale_init - self.cfg.scale_min) /
-                                  (self.cfg.scale_max - self.cfg.scale_init)))
             if self.regression_head is not None:
                 self.regression_head.reset_parameters()
+            else:
+                nn.init.normal_(self.scale_head.weight, std=1e-3)
+                nn.init.constant_(self.scale_head.bias,
+                                  log((self.cfg.scale_init - self.cfg.scale_min) /
+                                      (self.cfg.scale_max - self.cfg.scale_init)))
 
     def train(self, mode: bool = True):
         super().train(mode)
         if self.cfg.geometry_readout_only:
             for module in self.children():
                 module.eval()
-            self.scale_head.train(mode)
             if self.regression_head is not None:
                 self.regression_head.train(mode)
+            else:
+                self.scale_head.train(mode)
         return self
 
     def _image_neighbors(self, image_shape, device):
@@ -414,7 +413,7 @@ class MomentGaussianDecoder(nn.Module):
 
     def build_gaussians(self, mass, means, covariance, pooled, scene_scale, appearance_context=None,
                         appearance_pooled=None, diagnostics=None, appearance_harmonics=None,
-                        appearance_std=None):
+                        appearance_std=None, opacities=None):
         # Accept a single scene for inspection/tests, or all scenes for training.
         # Batch the small heads to avoid repeated GEMMs and a final SH concat.
         if means.ndim == 2:
@@ -429,12 +428,15 @@ class MomentGaussianDecoder(nn.Module):
                 appearance_harmonics = appearance_harmonics.unsqueeze(0)
             if appearance_std is not None:
                 appearance_std = appearance_std.unsqueeze(0)
+            if opacities is not None:
+                opacities = opacities.unsqueeze(0)
         scene_scale = scene_scale.reshape(-1, 1, 1)
-        coverage = self.cfg.scale_min + (self.cfg.scale_max - self.cfg.scale_min) * (
-            self.scale_head(pooled).sigmoid()
-        )
+        if self.regression_head is None:
+            coverage = self.cfg.scale_min + (self.cfg.scale_max - self.cfg.scale_min) * (
+                self.scale_head(pooled).sigmoid()
+            )
+            covariance = coverage[..., None].square() * covariance
         eye = torch.eye(3, device=means.device, dtype=means.dtype)
-        covariance = coverage[..., None].square() * covariance
         # A fixed tiny floor can round away for wide/rank-deficient Gaussians.
         # Add a detached FP32 roundoff guard relative to the covariance trace.
         roundoff = 8 * torch.finfo(covariance.dtype).eps * (
@@ -464,7 +466,7 @@ class MomentGaussianDecoder(nn.Module):
             means=means * scene_scale,
             covariances=covariance,
             harmonics=harmonics,
-            opacities=-torch.expm1(-mass),
+            opacities=-torch.expm1(-mass) if opacities is None else opacities,
         )
 
     def forward(self, points: Tensor, features: Tensor, *,
@@ -598,10 +600,10 @@ class MomentGaussianDecoder(nn.Module):
             return gaussians
 
     def _forward_geometry_readout(self, points, features, rgb, image, diagnostics):
-        """Only the rendered mean/covariance readout gets gradients.
+        """Only the rendered mean/covariance/opacity readout gets gradients.
 
         The frozen appearance reader ALWAYS uses the original fitted center,
-        even in regression mode. SH and opacity therefore remain identical.
+        even in regression mode, keeping the SH coefficients identical.
         """
         completed, statistics = [], []
         with torch.autocast(device_type=points.device.type, enabled=False):
@@ -628,14 +630,12 @@ class MomentGaussianDecoder(nn.Module):
                         weights, scores, neighbors, image, diagnostics is not None,
                     )
                 means = fitted_mean
+                opacities = None
                 if self.regression_head is not None:
-                    means, covariance = self.regression_head(
-                        normalized, scene_features, pooled, mass, weights, neighbors,
-                        chunk_size=self.cfg.chunk_size, checkpoint_chunks=self.cfg.checkpoint_chunks,
-                        mass_epsilon=self.cfg.mass_epsilon,
-                    )
+                    means, covariance, opacities = self.regression_head(normalized, pooled)
                 completed.append(self.build_gaussians(
                     mass, means, covariance, pooled, scene_scale, appearance_harmonics=raw_sh,
+                    opacities=opacities,
                 ))
                 if report is not None:
                     statistics.append(report)
