@@ -17,10 +17,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.batch_dir.is_dir():
         parser.error(f'Batch directory does not exist: {args.batch_dir}')
-    print('Model  State         Train step   Evaluated checkpoints')
+    print('Model  GPU  State         Train step   Evaluated checkpoints')
     for row in batch_status(args.batch_dir):
         evaluated = ', '.join(str(step) for step in row['evaluated_steps']) or '-'
-        print(f'{row["variant"]:5}  {row["state"]:12}  {row["train_step"]:5}/10000  {evaluated}')
+        print(f'{row["variant"]:5}  {row["gpu"]:3}  {row["state"]:12}  {row["train_step"]:5}/10000  {evaluated}')
     if args.write_csv:
         print(f'Results CSV: {export_results(args.batch_dir)}')
     if args.require_complete:

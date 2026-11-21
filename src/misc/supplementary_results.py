@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import re
+import tempfile
 
 
 VARIANTS = {
@@ -61,7 +62,14 @@ def batch_status(batch_dir: Path):
         if variant not in VARIANTS:
             raise ValueError(f'Unknown supplementary variant: {variant}')
         run_dir = batch_dir / variant
-        evaluated = [step for step in EVAL_STEPS if read_metrics(run_dir, step) is not None]
+        evaluated = []
+        invalid_results = False
+        for step in EVAL_STEPS:
+            try:
+                if read_metrics(run_dir, step) is not None:
+                    evaluated.append(step)
+            except (OSError, ValueError, KeyError, TypeError):
+                invalid_results = True
         checkpoint_steps = []
         for path in (run_dir / 'checkpoints').glob('*.ckpt'):
             match = re.search(r'step[_=](\d+)', path.name)
@@ -75,7 +83,7 @@ def batch_status(batch_dir: Path):
                 tail = stream.read().decode('utf-8', errors='replace')
         steps = [int(step) for step in re.findall(r'train step (\d+)', tail)] + checkpoint_steps
         progress = max(steps, default=0)
-        if (run_dir / 'FAILED').exists():
+        if (run_dir / 'FAILED').exists() or invalid_results:
             state = 'failed'
         elif (run_dir / 'COMPLETED').exists():
             state = 'complete' if evaluated == list(EVAL_STEPS) else 'incomplete'
@@ -83,7 +91,9 @@ def batch_status(batch_dir: Path):
             state = 'evaluating' if progress >= 10000 or '[PostEval]' in tail else 'training'
         else:
             state = 'pending'
-        rows.append({'variant': variant, 'state': state, 'train_step': progress,
+        gpu_file = run_dir / 'gpu.txt'
+        gpu = gpu_file.read_text(encoding='utf-8').strip() if gpu_file.is_file() else '-'
+        rows.append({'variant': variant, 'gpu': gpu, 'state': state, 'train_step': progress,
                      'evaluated_steps': evaluated, 'run_dir': run_dir})
     return rows
 
@@ -92,8 +102,9 @@ def export_results(batch_dir: Path) -> Path:
     path = batch_dir / 'results.csv'
     fields = ['variant', 'assignment', 'center', 'covariance', 'opacity', 'step',
               'psnr', 'ssim', 'lpips', 'num_samples', 'run_dir']
-    temporary = path.with_suffix('.csv.tmp')
-    with temporary.open('w', encoding='utf-8', newline='') as stream:
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='', dir=batch_dir,
+                                     prefix='.results-', suffix='.csv.tmp', delete=False) as stream:
+        temporary = Path(stream.name)
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for row in batch_status(batch_dir):

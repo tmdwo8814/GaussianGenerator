@@ -189,7 +189,8 @@ class SupplementaryAblationTests(unittest.TestCase):
                 self.assertFalse(decoder.covariance_coverage)
                 self.assertEqual(config.model.encoder.pretrained_weights,
                                  '/workspace/research/GaussianGenerator/pretrained_weights/re10k.ckpt')
-                self.assertEqual(config.trainer.devices, 4)
+                self.assertEqual(config.trainer.devices, 1)
+                self.assertEqual(config.data_loader.train.batch_size, 16)
                 self.assertEqual(config.trainer.max_steps, 10000)
                 self.assertEqual(config.trainer.eval_every_n_steps, 5000)
                 self.assertTrue(config.trainer.auto_eval)
