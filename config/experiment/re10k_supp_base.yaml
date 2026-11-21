@@ -1,0 +1,42 @@
+# @package _global_
+
+defaults:
+  - re10k_moment
+  - _self_
+
+wandb:
+  name: supplementary_re10k
+  tags: [re10k, supplementary, frozen_encoder, fresh_decoder]
+
+model:
+  encoder:
+    pretrained_weights: /workspace/research/GaussianGenerator/pretrained_weights/re10k.ckpt
+    moment_decoder:
+      geometry_readout_only: false
+      frozen_encoder_decoder_only: true
+      geometry_mode: egf
+      assignment_mode: learned
+      attribute_modes: FFF
+      covariance_coverage: false
+
+dataset:
+  re10k:
+    view_sampler:
+      warm_up_steps: 0
+
+optimizer:
+  lr: 0.0001
+  warm_up_steps: 500
+
+trainer:
+  devices: 4
+  max_steps: 10000
+  eval_every_n_steps: 5000
+  auto_eval: true
+  auto_eval_index_path: assets/evaluation_index_re10k.json
+
+checkpointing:
+  load: null
+  every_n_train_steps: 5000
+  save_top_k: -1
+  save_weights_only: false

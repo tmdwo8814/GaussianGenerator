@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - re10k_supp_base
+  - _self_
+
+wandb:
+  name: supp_m7_learned_ffr
+  tags: [re10k, supplementary, m7, learned, FFR, frozen_encoder]
+
+model:
+  encoder:
+    moment_decoder:
+      assignment_mode: learned
+      attribute_modes: FFR

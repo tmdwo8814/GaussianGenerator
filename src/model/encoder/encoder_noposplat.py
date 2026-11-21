@@ -13,6 +13,7 @@ from .heads import head_factory
 from .heads.dpt_feature_head import create_dpt_feature_head
 from .heads.moment_gaussian_decoder import MomentDecoderCfg, MomentGaussianDecoder
 from ...misc.geometry_readout import freeze_geometry_readout
+from ...misc.supplementary_ablation import freeze_scene_encoder
 from ...dataset.shims.bounds_shim import apply_bounds_shim
 from ...dataset.shims.normalize_shim import apply_normalize_shim
 from ...dataset.shims.patch_shim import apply_patch_shim
@@ -88,11 +89,14 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         self.set_gs_params_head(cfg, cfg.gs_params_head_type)
         if cfg.gs_params_head_type == 'moment' and cfg.moment_decoder.geometry_readout_only:
             freeze_geometry_readout(self)
+        elif cfg.gs_params_head_type == 'moment' and cfg.moment_decoder.frozen_encoder_decoder_only:
+            freeze_scene_encoder(self)
 
     def train(self, mode: bool = True):
         super().train(mode)
         if (self.gs_params_head_type == 'moment'
-                and self.cfg.moment_decoder.geometry_readout_only):
+                and (self.cfg.moment_decoder.geometry_readout_only
+                     or self.cfg.moment_decoder.frozen_encoder_decoder_only)):
             for name, module in self.named_children():
                 if name != 'gaussian_decoder':
                     module.eval()

@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - re10k_supp_base
+  - _self_
+
+wandb:
+  name: supp_m1_uniform_rrr
+  tags: [re10k, supplementary, m1, uniform, RRR, frozen_encoder]
+
+model:
+  encoder:
+    moment_decoder:
+      assignment_mode: uniform
+      attribute_modes: RRR

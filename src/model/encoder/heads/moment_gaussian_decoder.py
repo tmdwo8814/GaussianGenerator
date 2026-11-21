@@ -63,6 +63,10 @@ class MomentDecoderCfg:
     geometry_readout_only: bool = False  # Freeze encoder, BEAM and appearance.
     geometry_mode: str = 'egf'  # regression replaces mean, covariance AND opacity.
     regression_init_scale: float = 0.01  # Cholesky std in scene-normalized coordinates.
+    frozen_encoder_decoder_only: bool = False  # Supplementary: BEAM + appearance train jointly.
+    assignment_mode: str = 'learned'  # Only proportions change; budgets/appearance stay learned.
+    attribute_modes: str = 'FFF'  # Center, covariance, opacity; F=fitted, R=regressed.
+    covariance_coverage: bool = True  # False uses the paper's covariance + floor directly.
 
 
 class MomentGaussianDecoder(nn.Module):
@@ -71,10 +75,22 @@ class MomentGaussianDecoder(nn.Module):
         self.cfg = cfg
         self._image_cache_key = None
         self._image_cache = None
+        if cfg.assignment_mode not in ('learned', 'uniform'):
+            raise ValueError('assignment_mode must be learned or uniform')
+        if len(cfg.attribute_modes) != 3 or any(mode not in 'FR' for mode in cfg.attribute_modes):
+            raise ValueError('attribute_modes must contain three F/R letters: center, covariance, opacity')
+        if cfg.frozen_encoder_decoder_only and cfg.geometry_readout_only:
+            raise ValueError('Decoder-only supplementary and frozen-BEAM readout modes are mutually exclusive')
+        if cfg.frozen_encoder_decoder_only and not cfg.appearance_capacity:
+            raise ValueError('Supplementary decoder-only experiments require the shared appearance_capacity path')
         if cfg.geometry_mode not in ('egf', 'regression'):
             raise ValueError('geometry_mode must be egf or regression')
-        if cfg.geometry_mode == 'regression' and not cfg.geometry_readout_only:
+        if cfg.geometry_mode == 'regression' and not (cfg.geometry_readout_only or cfg.frozen_encoder_decoder_only):
             raise ValueError('Regression requires geometry_readout_only=True')
+        if cfg.frozen_encoder_decoder_only and cfg.geometry_mode != 'egf':
+            raise ValueError('Use geometry_mode=egf and attribute_modes for supplementary experiments')
+        if not cfg.frozen_encoder_decoder_only and cfg.attribute_modes != 'FFF':
+            raise ValueError('Attribute-wise selection requires frozen_encoder_decoder_only=True')
         if cfg.geometry_readout_only and not cfg.appearance_capacity:
             raise ValueError('Geometry readout experiments require the Final++ appearance_capacity path')
         if not isfinite(cfg.regression_init_scale) or not 0 < cfg.regression_init_scale <= 1:
@@ -173,14 +189,40 @@ class MomentGaussianDecoder(nn.Module):
                     nn.init.zeros_(self.appearance_sh_head.weight)
 
         self.regression_head = None
-        if cfg.geometry_mode == 'regression':
+        regression_modes = cfg.attribute_modes if cfg.frozen_encoder_decoder_only else 'RRR'
+        if cfg.geometry_mode == 'regression' or (cfg.frozen_encoder_decoder_only and 'R' in regression_modes):
             # Adding this head must not perturb shared Final++ initialization.
             with torch.random.fork_rng(devices=[]):
                 self.regression_head = GeometryRegressionHead(
-                    cfg.feature_dim, cfg.regression_init_scale,
+                    cfg.feature_dim, cfg.regression_init_scale, regression_modes,
                 )
         if cfg.geometry_readout_only:
             self.enable_geometry_readout_training()
+        elif cfg.frozen_encoder_decoder_only:
+            self.enable_supplementary_decoder_training()
+
+    def enable_supplementary_decoder_training(self):
+        """Same decoder architecture; freeze only genuinely unused outputs."""
+        self.requires_grad_(True)
+        self.scale_head.requires_grad_(self.cfg.covariance_coverage and self.cfg.attribute_modes[1] == 'F')
+        self.allocation_head[-1].requires_grad_(self.cfg.assignment_mode == 'learned')
+
+    def select_supplementary_attributes(self, points, mass, fitted_mean, fitted_covariance, pooled):
+        """Select attributes after fitting covariance about the FITTED mean.
+
+        RFF changes the rendered center only, never the covariance's reference
+        center. Appearance also continues to use the fitted center in all arms.
+        """
+        means, covariance, opacity = fitted_mean, fitted_covariance, -torch.expm1(-mass)
+        if self.regression_head is not None:
+            reg_mean, reg_covariance, reg_opacity = self.regression_head(points, pooled)
+            if self.cfg.attribute_modes[0] == 'R':
+                means = reg_mean
+            if self.cfg.attribute_modes[1] == 'R':
+                covariance = reg_covariance
+            if self.cfg.attribute_modes[2] == 'R':
+                opacity = reg_opacity
+        return means, covariance, opacity
 
     def enable_geometry_readout_training(self):
         self.requires_grad_(False)
@@ -248,7 +290,8 @@ class MomentGaussianDecoder(nn.Module):
                   + F.linear(geometry, first.weight[:, 2 * self.cfg.feature_dim:], first.bias))
         hidden = self.allocation_head[1](hidden)
         logits = self.allocation_head[2](hidden).squeeze(-1)
-        allocation = logits.softmax(dim=-1)  # sum_k A[j, k] = 1
+        allocation = (logits.softmax(dim=-1) if self.cfg.assignment_mode == 'learned'
+                      else torch.full_like(logits, 1.0 / neighbors.shape[1]))
         mass = allocation * budget  # q[j, k] = A_ij * b_j
         if return_appearance:
             return mass, self.appearance_head(hidden).squeeze(-1)
@@ -431,7 +474,10 @@ class MomentGaussianDecoder(nn.Module):
             if opacities is not None:
                 opacities = opacities.unsqueeze(0)
         scene_scale = scene_scale.reshape(-1, 1, 1)
-        if self.regression_head is None:
+        covariance_regressed = self.regression_head is not None
+        if self.cfg.frozen_encoder_decoder_only:
+            covariance_regressed = self.cfg.attribute_modes[1] == 'R'
+        if self.cfg.covariance_coverage and not covariance_regressed:
             coverage = self.cfg.scale_min + (self.cfg.scale_max - self.cfg.scale_min) * (
                 self.scale_head(pooled).sigmoid()
             )
@@ -538,14 +584,23 @@ class MomentGaussianDecoder(nn.Module):
                             )
                         else:
                             raw_sh, scene_stats = self._capacity_scene(*args)
+                        output_moments = scene_moments
+                        opacities = None
+                        if self.cfg.frozen_encoder_decoder_only:
+                            mass, fitted_mean, fitted_covariance, pooled = scene_moments
+                            means, covariance, opacities = self.select_supplementary_attributes(
+                                normalized, mass, fitted_mean, fitted_covariance, pooled,
+                            )
+                            output_moments = (mass, means, covariance, pooled)
                         completed_scenes.append(self.build_gaussians(
-                            *scene_moments, scene_scale, appearance_harmonics=raw_sh,
+                            *output_moments, scene_scale, appearance_harmonics=raw_sh,
+                            opacities=opacities,
                         ))
                         if scene_stats is not None:
                             statistics.append(scene_stats)
                         # No Python list of per-scene DPT256/context tensors,
                         # and no full-batch copies of those tensors via stack.
-                        del args, raw_sh, scene_moments, geometry, scores
+                        del args, raw_sh, scene_moments, output_moments, geometry, scores
                         continue
                     selected = appearance_weights(geometry, scores, neighbors)
                     appearance_features.append(pool_features(
