@@ -1,228 +1,258 @@
 #!/usr/bin/env python3
-"""Regenerate the existing RE10K -> ACID budget figure with consistent offsets.
+"""Plot RE10K -> ACID Gaussian control directly from saved evaluation results.
 
-The original plotting source/raw table is not present in this checkout. Read
-the supplied vector PDF instead: preserve all numerical labels, plotted data,
-fonts and layout, changing only the Ours-minus-Merging annotation colors.
+Default input: outputs/gaussian_control/re10k_to_acid/summary.json
+Default outputs: outputs/gaussian_control/figures/re10k_to_acid/
+Paths are relative to this repository, independent of the working directory.
 
-Performance improvement is green, degradation is red, and exactly zero is gray.
-PSNR/SSIM: positive is improvement. LPIPS: negative is improvement.
-There is no tolerance/dead zone for small displayed nonzero offsets.
+Uses overall LightGaussian-style, NanoGS-style and Redistribute results at
+10%, 5%, 1%, plus the shared 100% reference. Offsets and latency ratios are
+computed from the JSON. No PDF, Downloads folder, CUDA or inference is needed.
+Dependency: matplotlib. pypdf and pymupdf are no longer used.
 
-Dependencies: pypdf; pymupdf for PNG/SVG previews (omit with --pdf-only).
+Offset = Ours - Merging. Improvement is green, degradation red, exact zero gray.
+For LPIPS a negative offset means improvement. Small nonzero offsets are colored.
 
 Examples:
     python scripts/plot_gaussian_budget_acid.py
-    python scripts/plot_gaussian_budget_acid.py --input /path/to/fig_budget_latency_re10k_acid.pdf
-    python scripts/plot_gaussian_budget_acid.py --output-dir outputs/paper_figures --dpi 300
+    python scripts/plot_gaussian_budget_acid.py --input outputs/gaussian_control/re10k_to_acid
+    python scripts/plot_gaussian_budget_acid.py --percentages 75 50 25 10 5 1
 """
 
 import argparse
-from dataclasses import dataclass
 from decimal import Decimal
 import hashlib
 import json
+import math
 from pathlib import Path
-import re
 
-from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ContentStream, DecodedStreamObject, FloatObject
-
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.ticker import FuncFormatter, LogLocator, NullLocator
 
 ROOT = Path(__file__).resolve().parents[1]
-GREEN = '#008000'
-RED = '#d62728'
-NEUTRAL = '#555555'
-METRICS = ('PSNR', 'SSIM', 'LPIPS')
-OFFSET = re.compile(r'([+\-\N{MINUS SIGN}]\d+(?:\.\d+)?)(?:\s*dB)?\Z')
+DEFAULT_INPUT = ROOT / 'outputs/gaussian_control/re10k_to_acid/summary.json'
+DEFAULT_OUTPUT = ROOT / 'outputs/gaussian_control/figures/re10k_to_acid'
+GREEN, RED, NEUTRAL = '#008000', '#d62728', '#555555'
+METHODS = ('lightgaussian', 'merge', 'redistribute')
+METRICS = ('psnr', 'ssim', 'lpips')
+COLORS = dict(lightgaussian='#adb5bf', merge='#4d6bff', redistribute='#e65c00')
+LABELS = {'lightgaussian': 'Pruning (LightGaussian-style)',
+          'merge': 'Merging (NanoGS-style)', 'redistribute': 'Redistribute (Ours)'}
+MARKERS = ('o', 's', '^', 'D', 'v', 'P', 'X')
 
 
-@dataclass(frozen=True)
-class Annotation:
-    block: int
-    metric: str
-    label: str
-    delta: Decimal
-
-    @property
-    def color(self):
-        improvement = -self.delta if self.metric == 'LPIPS' else self.delta
-        return GREEN if improvement > 0 else RED if improvement < 0 else NEUTRAL
-
-    def metadata(self):
-        return {'text_block': self.block, 'metric': self.metric, 'label': self.label,
-                'ours_minus_merging': str(self.delta), 'color': self.color}
+def read_json(path):
+    return json.loads(path.read_text(encoding='utf-8-sig'))
 
 
-def rgb(hex_color):
-    return [FloatObject(int(hex_color[i:i+2], 16) / 255) for i in (1, 3, 5)]
+def offset_color(metric, delta):
+    improvement = -delta if metric.lower() == 'lpips' else delta
+    return GREEN if improvement > 0 else RED if improvement < 0 else NEUTRAL
 
 
-def text_blocks(page):
-    """Map decoded Unicode text to PDF BT/ET objects with public callbacks.
-
-    Count BT *after* extraction processes it: BT can flush the preceding object.
-    This avoids interpreting embedded font encodings or rebuilding glyphs.
-    """
-    blocks = []
-    active = [-1]
-    def after(operator, operands, current_matrix, text_matrix):
-        if operator == b'BT':
-            active[0] += 1
-            blocks.append('')
-    def visit(text, current_matrix, text_matrix, font, size):
-        if text.strip() and active[0] >= 0:
-            blocks[active[0]] += text
-    page.extract_text(visitor_operand_after=after, visitor_text=visit)
-    stream = ContentStream(page['/Contents'], page.pdf)
-    count = sum(operator == b'BT' for operands, operator in stream.operations)
-    if count != len(blocks):
-        raise ValueError('Text object mapping failed; refusing to alter the figure')
-    return [text.strip() for text in blocks]
+def offset_label(metric, delta):
+    places = 2 if metric == 'psnr' else 3
+    if delta != 0 and delta.quantize(Decimal(1).scaleb(-places)) == 0:
+        text = f'{delta:+.2E}'
+    else:
+        text = f'{delta:+.{places}f}' if delta else f'{delta:.{places}f}'
+    return text + (' dB' if metric == 'psnr' else '')
 
 
-def annotations(page):
-    """Recognize the existing three-panel Matplotlib figure's signed deltas."""
-    metric = None
-    headers = []
-    result = []
-    for block, text in enumerate(text_blocks(page)):
-        heading = next((name for name in METRICS if text.startswith(name)), None)
-        if heading:
-            metric = heading
-            headers.append(heading)
+def count_label(count):
+    return f'{count / 1000:.2g}k' if count >= 1000 else f'{count:g}'
+
+
+def load_results(source, percentages):
+    source = Path(source).expanduser().resolve()
+    if source.is_dir():
+        source /= 'summary.json'
+    if not source.is_file():
+        raise FileNotFoundError(f'ACID results not found: {source}\n'
+                                'Use --input /path/to/re10k_to_acid/summary.json')
+    if source.suffix.lower() != '.json':
+        raise ValueError('Input must be the evaluation summary.json, not a PDF')
+    raw = read_json(source)
+    if not isinstance(raw, list):
+        raise ValueError('Expected the JSON array written by the ACID evaluation summary')
+    rows = {}
+    for row in raw:
+        if row.get('overlap') != 'overall':
             continue
-        match = OFFSET.fullmatch(text)
-        if match:
-            if metric is None:
-                raise ValueError('Signed text outside a metric panel; ambiguous annotation')
-            result.append(Annotation(block, metric, text,
-                                     Decimal(match[1].replace('\N{MINUS SIGN}', '-'))))
-    if headers != list(METRICS):
-        raise ValueError(f'Expected PSNR, SSIM, LPIPS panels in that order; found {headers}')
-    counts = {name: sum(item.metric == name for item in result) for name in METRICS}
-    if not all(counts.values()) or len(set(counts.values())) != 1:
-        raise ValueError(f'Incomplete or ambiguous performance offsets: {counts}')
-    return result
+        key = row['method'], int(row['percent'])
+        if key in rows:
+            raise ValueError(f'Duplicate overall condition: {key}')
+        rows[key] = row
+    required = [(m, p) for m in METHODS for p in percentages]
+    missing = [key for key in required if key not in rows]
+    if missing:
+        raise ValueError(f'Missing conditions: {missing}. Use combined re10k_to_acid/summary.json, '
+                         'not controls/summary.json')
+    references = [rows[key] for key in [('final', 100), ('redistribute', 100), ('merge', 100),
+                  ('lightgaussian', 100), ('prune', 100)] if key in rows]
+    if not references:
+        raise ValueError('Shared 100% reference is absent from summary.json')
+    baseline = references[0]
+    chosen = [rows[key] for key in required] + references
+    for row in chosen:
+        if int(row['scenes']) < 1 or int(row['scenes']) != row['scenes']:
+            raise ValueError('Each condition needs a positive integer scene count')
+        for key in (*METRICS, 'postprocess_ms', 'gaussians'):
+            if not math.isfinite(float(row[key])):
+                raise ValueError(f'Non-finite {key}: {row["method"]}/{row["percent"]}')
+        if row['gaussians'] <= 0:
+            raise ValueError('Gaussian counts must be positive')
+        if row['percent'] != 100 and row['postprocess_ms'] <= 0:
+            raise ValueError('Control latency must be positive for a logarithmic axis')
+    if len({r['scenes'] for r in chosen}) != 1:
+        raise ValueError('Scene counts differ; regenerate a combined summary on the same completed scenes')
+    for reference in references[1:]:
+        if any(reference[k] != baseline[k] for k in (*METRICS, 'gaussians')):
+            raise ValueError('100% reference values differ between methods')
+    for p in percentages:
+        counts = [rows[m, p]['gaussians'] for m in METHODS]
+        if not all(math.isclose(n, counts[0], rel_tol=1e-9, abs_tol=1e-6) for n in counts):
+            raise ValueError(f'Gaussian counts differ between methods at {p}%')
+    status_path = source.parent / 'summary_status.json'
+    status = read_json(status_path) if status_path.exists() else None
+    if status and status['common_scenes'] != baseline['scenes']:
+        raise ValueError('Summary/status scene counts differ; rerun the report stage and retry')
+    return source, rows, baseline, status
 
 
-def recolor_page(page, changes):
-    """Insert local color wrappers without reserializing original coordinates.
-
-    Matplotlib puts BT/ET on separate lines. Confirm that these line tokens
-    exactly match the parsed text-object sequence before changing any bytes.
-    Keeping the original bytes avoids PDF float-serialization rounding.
-    """
-    original = page.get_contents().get_data()
-    tokens = list(re.finditer(rb'(?m)^[ \t]*(BT|ET)[ \t]*\r?$', original))
-    count = sum(op == b'BT' for operands, op in ContentStream(page['/Contents'], page.pdf).operations)
-    if [match[1] for match in tokens] != [b'BT', b'ET'] * count:
-        raise ValueError('Expected standalone Matplotlib text objects; refusing ambiguous PDF editing')
-    selected = {item.block: item for item in changes}
-    pieces = []
-    block = -1
-    cursor = 0
-    for match in tokens:
-        pieces.append(original[cursor:match.start()])
-        if match[1] == b'BT':
-            block += 1
-            if block in selected:
-                color = ' '.join(format(float(value), '.12g') for value in rgb(selected[block].color))
-                pieces.append(f'q\n{color} rg\n'.encode('ascii'))
-        pieces.append(match[0])
-        if match[1] == b'ET' and block in selected:
-            pieces.append(b'\nQ')
-        cursor = match.end()
-    pieces.append(original[cursor:])
-    stream = DecodedStreamObject()
-    stream.set_data(b''.join(pieces))
-    page.replace_contents(stream)
-
-
-def rebuild(source, output_dir, dpi=300, pdf_only=False):
-    source, output_dir = source.expanduser().resolve(), output_dir.expanduser().resolve()
-    destination = output_dir / 'fig_budget_latency_re10k_acid.pdf'
-    if destination == source:
-        raise ValueError('Use a separate output directory to preserve the original PDF')
+def plot_results(source, output_dir, percentages=(10, 5, 1), dpi=300, pdf_only=False):
+    percentages = list(percentages)
+    if (not percentages or len(set(percentages)) != len(percentages)
+            or any(type(p) is not int or not 1 <= p < 100 for p in percentages)):
+        raise ValueError('Use distinct integer percentages from 1 to 99; 100% is the reference')
     if dpi <= 0:
         raise ValueError('DPI must be positive')
-    reader = PdfReader(source)
-    if len(reader.pages) != 1:
-        raise ValueError('Expected the single-page RE10K -> ACID performance figure')
-    original_text = reader.pages[0].extract_text()
-    changes = annotations(reader.pages[0])
-    original_operations = list(ContentStream(reader.pages[0]['/Contents'], reader).operations)
-    writer = PdfWriter()
-    page = writer.add_page(reader.pages[0])
-    recolor_page(page, changes)
-    # Strip inserted local color wrappers and verify every original operation,
-    # including numerical data/coordinates and font commands, is unchanged.
-    rewritten = ContentStream(page['/Contents'], writer).operations
-    stripped, block, index = [], -1, 0
-    chosen = {item.block for item in changes}
-    while index < len(rewritten):
-        operands, operator = rewritten[index]
-        if (operator == b'q' and index + 2 < len(rewritten)
-                and rewritten[index+1][1] == b'rg' and rewritten[index+2][1] == b'BT'
-                and block + 1 in chosen):
-            index += 2
-            operands, operator = rewritten[index]
-        if operator == b'BT':
-            block += 1
-        stripped.append((operands, operator))
-        index += 1
-        if operator == b'ET' and block in chosen:
-            if rewritten[index][1] != b'Q':
-                raise AssertionError('Missing local graphics-state restoration')
-            index += 1
-    if stripped != original_operations:
-        raise AssertionError('Unexpected changes outside the annotation color wrappers')
-    writer.add_metadata({key: value for key, value in (reader.metadata or {}).items()
-                         if isinstance(value, str)})
-    writer.add_metadata({'/Subject': 'RE10K to ACID; performance offset colors: improvement green, degradation red; numerical data unchanged'})
-    output_dir.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix('.tmp.pdf')
-    with temporary.open('wb') as handle:
-        writer.write(handle)
-    check = PdfReader(temporary)
-    if check.pages[0].extract_text() != original_text or check.pages[0].mediabox != reader.pages[0].mediabox:
-        raise AssertionError('PDF text or page dimensions changed')
-    temporary.replace(destination)
-    outputs = [destination]
-    if not pdf_only:
-        import pymupdf
-        with pymupdf.open(destination) as document:
-            if document.is_repaired:
-                raise AssertionError('Output PDF required structural repair')
-            png = destination.with_suffix('.png')
-            document[0].get_pixmap(dpi=dpi).save(png)
-            svg = destination.with_suffix('.svg')
-            svg.write_text(document[0].get_svg_image(text_as_path=True), encoding='utf-8')
-        outputs.extend([png, svg])
-    metadata = output_dir / 'figure_metadata.json'
-    metadata.write_text(json.dumps({
-        'source_pdf': str(source), 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
-        'evaluation': 'RE10K -> ACID', 'comparison': 'Ours minus Merging',
-        'color_rule': 'performance improvement green; degradation red; exactly zero gray; no nonzero dead zone',
-        'higher_is_better': {'PSNR': True, 'SSIM': True, 'LPIPS': False},
-        'green': GREEN, 'red': RED, 'neutral': NEUTRAL,
-        'numerical_text_unchanged': True, 'original_drawing_operations_preserved': True,
-        'annotations': [item.metadata() for item in changes],
-        'outputs': list(map(str, outputs)),
-    }, ensure_ascii=False, indent=2), encoding='utf-8')
-    return outputs, changes
+    source, rows, baseline, status = load_results(source, percentages)
+    output_dir = Path(output_dir).expanduser().resolve()
+    stem = output_dir / 'fig_budget_latency_re10k_acid'
+    annotations = []
+    speed = {p: rows['merge', p]['postprocess_ms'] / rows['redistribute', p]['postprocess_ms']
+             for p in percentages}
+    low, high = min(speed.values()), max(speed.values())
+    if low > 1:
+        speed_label = f'{low:.0f}\N{EN DASH}{high:.0f}\N{MULTIPLICATION SIGN} faster'
+    elif high < 1:
+        speed_label = f'{1/high:.1f}\N{EN DASH}{1/low:.1f}\N{MULTIPLICATION SIGN} slower'
+    else:
+        speed_label = f'Merging / Ours: {low:.1f}\N{EN DASH}{high:.1f}\N{MULTIPLICATION SIGN}'
+    latencies = [rows[m, p]['postprocess_ms'] for m in METHODS for p in percentages]
+    xmin, xmax = min(latencies) * .6, max(latencies) * 12
+    titles = ('PSNR (dB) \N{UPWARDS ARROW}', 'SSIM \N{UPWARDS ARROW}', 'LPIPS \N{DOWNWARDS ARROW}')
+    style = {'font.family': 'serif', 'font.serif': ['DejaVu Serif'], 'font.size': 10,
+             'axes.titlesize': 12, 'axes.labelsize': 11, 'pdf.fonttype': 42,
+             'ps.fonttype': 42, 'svg.fonttype': 'none'}
+    with plt.rc_context(style):
+        fig, axes = plt.subplots(1, 3, figsize=(11.5, 4.6))
+        try:
+            fig.subplots_adjust(left=.055, right=.985, bottom=.17, top=.77, wspace=.34)
+            for ax, metric, title in zip(axes, METRICS, titles):
+                ax.set_xscale('log')
+                ax.set_xlim(xmin, xmax)
+                ax.xaxis.set_major_locator(LogLocator(base=10))
+                ax.xaxis.set_minor_locator(NullLocator())
+                ax.xaxis.set_major_formatter(FuncFormatter(
+                    lambda x, pos: f'{x/1000:g}k' if x >= 1000 else f'{x:g}'))
+                ax.set_xlabel('control latency (ms, log)')
+                ax.set_title(title)
+                ax.grid(True, color='#e6e6e6', linewidth=.8)
+                ax.set_axisbelow(True)
+                reference = baseline[metric]
+                ax.axhline(reference, color='#222222', linestyle='--', linewidth=1.)
+                ax.annotate('Full (100%)', xy=(.015, reference), xycoords=('axes fraction', 'data'),
+                            xytext=(0, -3), textcoords='offset points', va='top', fontsize=8.5)
+                for i, p in enumerate(percentages):
+                    marker = MARKERS[i % len(MARKERS)]
+                    merging, ours = rows['merge', p], rows['redistribute', p]
+                    ax.annotate('', xy=(ours['postprocess_ms'], ours[metric]),
+                                xytext=(merging['postprocess_ms'], merging[metric]),
+                                arrowprops={'arrowstyle': '->', 'color': '#89929c',
+                                            'linestyle': '--', 'lw': 1.1, 'shrinkA': 5, 'shrinkB': 6}, zorder=2)
+                    for method in METHODS:
+                        row = rows[method, p]
+                        ax.scatter(row['postprocess_ms'], row[metric], s=92 if method == 'redistribute' else 65,
+                                   marker=marker, color=COLORS[method], zorder=4,
+                                   edgecolors='#222222' if method == 'redistribute' else 'white',
+                                   linewidths=1.3 if method == 'redistribute' else .8)
+                    delta = Decimal(str(ours[metric])) - Decimal(str(merging[metric]))
+                    label, color = offset_label(metric, delta), offset_color(metric, delta)
+                    ax.annotate(label, xy=(merging['postprocess_ms'], merging[metric]),
+                                xytext=(7, 0), textcoords='offset points', ha='left', va='center',
+                                fontsize=8.7, color=color, zorder=5)
+                    annotations.append({'metric': metric, 'percent': p, 'ours_minus_merging': str(delta),
+                                        'label': label, 'color': color})
+                values = [rows[m, p][metric] for m in METHODS for p in percentages] + [reference]
+                bottom, top = min(values), max(values)
+                pad = max((top - bottom) * .08, .015 if metric != 'psnr' else .5)
+                if metric == 'lpips':
+                    ax.set_ylim(top + pad, max(0, bottom - pad))
+                elif metric == 'ssim':
+                    ax.set_ylim(min(0, bottom - pad), min(1, top + pad))
+                else:
+                    ax.set_ylim(bottom - pad, top + pad)
+                ax.text(.98, .025, '\N{GREEK CAPITAL LETTER DELTA}: Ours \N{MINUS SIGN} Merging',
+                        transform=ax.transAxes, ha='right', fontsize=8, color='#666666', style='italic')
+            axes[0].annotate('', xy=(.29, .8), xytext=(.64, .8), xycoords='axes fraction',
+                             arrowprops={'arrowstyle': '-|>', 'lw': 1.8, 'color': COLORS['redistribute']})
+            axes[0].text(.465, .835, speed_label, transform=axes[0].transAxes, ha='center',
+                         fontsize=9.5, weight='bold', color=COLORS['redistribute'])
+            method_handles = [Line2D([], [], marker='o', linestyle='', markersize=8,
+                                     color=COLORS[m], markeredgecolor='#222222' if m == 'redistribute' else COLORS[m],
+                                     label=LABELS[m]) for m in METHODS]
+            budget_handles = [Line2D([], [], marker=MARKERS[i % len(MARKERS)], linestyle='', color='#555555',
+                                     markersize=7, label=f'{p}% ({count_label(rows["redistribute", p]["gaussians"])})')
+                              for i, p in enumerate(percentages)]
+            fig.legend(handles=method_handles, loc='upper center', bbox_to_anchor=(.5, 1.0),
+                       ncol=3, frameon=False, fontsize=9.5, columnspacing=1.6, handletextpad=.4)
+            fig.legend(handles=budget_handles, loc='upper center', bbox_to_anchor=(.5, .925),
+                       ncol=min(len(budget_handles), 6), frameon=False, fontsize=9.3, columnspacing=1.8)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            formats = ['pdf'] if pdf_only else ['pdf', 'png', 'svg']
+            outputs = []
+            for extension in formats:
+                destination = stem.with_suffix('.' + extension)
+                options = {'metadata': {'Title': 'RE10K to ACID Gaussian budget adaptation'}} if extension == 'pdf' else {}
+                fig.savefig(destination, format=extension, dpi=dpi, bbox_inches='tight', pad_inches=.04, **options)
+                outputs.append(destination)
+        finally:
+            plt.close(fig)
+    metadata = {'source_summary': str(source), 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+                'evaluation': 'RE10K -> ACID', 'overlap': 'overall', 'scenes': baseline['scenes'],
+                'evaluation_status': status, 'percentages': percentages,
+                'comparison': 'Ours minus Merging', 'higher_is_better': dict(psnr=True, ssim=True, lpips=False),
+                'color_rule': 'performance improvement green; degradation red; only exactly zero neutral',
+                'green': GREEN, 'red': RED, 'neutral': NEUTRAL, 'annotations': annotations,
+                'merging_over_ours_latency_ratio': speed, 'speed_label': speed_label,
+                'baseline': baseline, 'plotted_rows': [rows[m, p] for m in METHODS for p in percentages],
+                'outputs': list(map(str, outputs))}
+    (output_dir / 'figure_metadata.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False, allow_nan=False),
+                                                   encoding='utf-8')
+    return outputs, metadata
 
 
-def main():
+def main(argv=None):
     cli = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    cli.add_argument('--input', type=Path, default=Path.home() / 'Downloads/fig_budget_latency_re10k_acid.pdf')
-    cli.add_argument('--output-dir', type=Path, default=ROOT / 'outputs/gaussian_control/figures/re10k_to_acid')
+    cli.add_argument('--input', '--summary', type=Path, default=DEFAULT_INPUT,
+                     help='Combined ACID summary.json, or its parent directory')
+    cli.add_argument('--output-dir', type=Path, default=DEFAULT_OUTPUT)
+    cli.add_argument('--percentages', type=int, nargs='+', default=[10, 5, 1])
     cli.add_argument('--dpi', type=int, default=300)
     cli.add_argument('--pdf-only', action='store_true')
-    args = cli.parse_args()
-    outputs, changes = rebuild(args.input, args.output_dir, args.dpi, args.pdf_only)
-    for item in changes:
-        print(f'{item.metric:5s} {item.label:10s} -> {item.color}')
+    args = cli.parse_args(argv)
+    outputs, metadata = plot_results(args.input, args.output_dir, args.percentages, args.dpi, args.pdf_only)
+    print(f"[Plot] source={metadata['source_summary']}; same completed scenes={metadata['scenes']}")
+    status = metadata['evaluation_status']
+    if status and not status.get('complete'):
+        print(f"[Plot] Partial common cohort: {status['common_scenes']}/{status['expected_scenes']} scenes")
+    for item in metadata['annotations']:
+        print(f"{item['metric']:5s} {item['percent']:3d}% {item['label']:12s} -> {item['color']}")
     for path in outputs:
         print(path)
 
